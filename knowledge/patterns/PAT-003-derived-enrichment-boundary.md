@@ -37,6 +37,6 @@ Aumenta metadata y lifecycle, pero permite rollback, auditoría y comparación d
 
 ## Ejemplos
 
-- `src/res023_lab/enrichment.py`
-- `src/res023_lab/reporter_contracts.py`
+- `src/ipa/enrichment/enrichment.py`
+- `src/ipa/reporter/reporter_contracts.py`
 - `knowledge/experiments/EXP-001-selective-enrichment.md`.

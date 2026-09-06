@@ -490,7 +490,7 @@ _CUDA_PATH = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 SPECS: dict[str, JobSpec] = {
     "scraper": JobSpec(
         name="scraper",
-        worker_script="scripts/run_web_scrape.py",
+        worker_script="scripts/cli/run_web_scrape.py",
         needs_gpu=False,
         idle_threshold=120.0,
         idle_status=STATUS_STUCK,
@@ -506,7 +506,7 @@ SPECS: dict[str, JobSpec] = {
     ),
     "pipeline": JobSpec(
         name="pipeline",
-        worker_script="scripts/run_continuous_pipeline.py",
+        worker_script="scripts/operations/run_continuous_pipeline.py",
         needs_gpu=False,
         idle_threshold=60.0,
         idle_status=STATUS_IDLE,
@@ -525,7 +525,7 @@ SPECS: dict[str, JobSpec] = {
     ),
     "lancedb": JobSpec(
         name="lancedb",
-        worker_script="scripts/_lancedb_incremental.py",
+        worker_script="scripts/operations/workers/lancedb_incremental.py",
         needs_gpu=True,
         idle_threshold=30.0,
         idle_status=STATUS_STUCK,
@@ -536,7 +536,7 @@ SPECS: dict[str, JobSpec] = {
     ),
     "hammer": JobSpec(
         name="hammer",
-        worker_script="scripts/_hammer_queries.py",
+        worker_script="scripts/operations/workers/hammer_queries.py",
         needs_gpu=True,
         idle_threshold=1e9,  # hammer doesn't use idle/stuck; always running
         idle_status=STATUS_RUNNING,
@@ -545,7 +545,7 @@ SPECS: dict[str, JobSpec] = {
     ),
     "enrichment": JobSpec(
         name="enrichment",
-        worker_script="scripts/_run_enrichment_exl3.py",
+        worker_script="scripts/operations/workers/run_enrichment_exl3.py",
         needs_gpu=True,
         idle_threshold=60.0,
         idle_status=STATUS_STUCK,
@@ -556,7 +556,7 @@ SPECS: dict[str, JobSpec] = {
     ),
     "rechunk": JobSpec(
         name="rechunk",
-        worker_script="scripts/_rechunk_semantic.py",
+        worker_script="scripts/operations/workers/rechunk_semantic.py",
         needs_gpu=True,
         idle_threshold=120.0,
         idle_status=STATUS_STUCK,

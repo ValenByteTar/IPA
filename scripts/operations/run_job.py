@@ -19,6 +19,7 @@ which the orchestrator and dashboard read for health/progress display.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -28,8 +29,9 @@ SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ipa.dashboard.process_runner import run_job  # noqa: E402
+from ipa.dashboard.process_runner import run_job, run_job_with_retry  # noqa: E402
 from ipa.dashboard.process_specs import SPECS, get_spec  # noqa: E402
+from ipa.dashboard.process_state import acquire_slot, release_slot  # noqa: E402
 
 
 def main() -> int:
@@ -47,6 +49,12 @@ def main() -> int:
     parser.add_argument("--idle-timeout", type=float, default=None, help="Pipeline idle timeout.")
     parser.add_argument("--config", default=None, help="Scraper config path.")
     parser.add_argument("--state-dir", default=None, help="Override state directory.")
+    # Resilience (orchestrator-improvements): bounded retries + backoff.
+    parser.add_argument("--retries", type=int, default=1, help="Max attempts (1 = no retry).")
+    parser.add_argument("--backoff", type=float, default=2.0, help="Base backoff seconds between attempts.")
+    # Backpressure: bounded concurrency for a shared resource (e.g. gpu).
+    parser.add_argument("--resource", default=None, help="Resource name for slot-based backpressure (e.g. gpu).")
+    parser.add_argument("--max-concurrent", type=int, default=1, help="Slots for --resource.")
     args = parser.parse_args()
 
     spec = get_spec(args.job)
@@ -75,13 +83,41 @@ def main() -> int:
 
     state_dir = Path(args.state_dir) if args.state_dir else None
 
-    exit_code = run_job(
-        job_name=args.job,
-        project_root=PROJECT_ROOT,
-        state_dir=state_dir,
-        command_overrides=command_overrides,
-    )
-    return exit_code
+    # Backpressure: claim a bounded resource slot before spawning.
+    holder = f"{args.job}:{os.getpid()}"
+    slot_index: int | None = None
+    if args.resource:
+        effective_state_dir = state_dir or (PROJECT_ROOT / "outputs" / "experiments" / "E12-corpus" / "process_state")
+        slot_index = acquire_slot(
+            effective_state_dir, args.resource, max(1, args.max_concurrent), holder,
+        )
+        if slot_index is None:
+            print(
+                f"BACKPRESSURE: resource '{args.resource}' at max concurrency "
+                f"({args.max_concurrent}); job {args.job} not started.",
+                flush=True,
+            )
+            return 75  # EX_TEMPFAIL: caller may re-queue later
+
+    try:
+        if args.retries > 1:
+            return run_job_with_retry(
+                job_name=args.job,
+                project_root=PROJECT_ROOT,
+                state_dir=state_dir,
+                command_overrides=command_overrides,
+                max_attempts=args.retries,
+                backoff_s=args.backoff,
+            )
+        return run_job(
+            job_name=args.job,
+            project_root=PROJECT_ROOT,
+            state_dir=state_dir,
+            command_overrides=command_overrides,
+        )
+    finally:
+        if slot_index is not None:
+            release_slot(effective_state_dir, args.resource, slot_index, holder)
 
 
 if __name__ == "__main__":

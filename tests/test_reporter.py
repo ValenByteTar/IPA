@@ -7,21 +7,21 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "validation"))
 from validate_reporter_contract import SCHEMAS, _registry, validate
 
-from ipa.reporter_claims import validate_claims
-from ipa.reporter_config import ReporterConfig
-from ipa.reporter_contracts import ReporterDecision, ScoreBundle
-from ipa.reporter_ai import ReporterLLM
-from ipa.reporter_curation import curate_documents
-from ipa.reporter_metadata import normalize_article
-from ipa.reporter_pipeline import ReporterPipeline
-from ipa.reporter_promotion import approve_promotion, pending_promotions, queue_promotion
-from ipa.reporter_research import can_execute, create_research_request
-from ipa.reporter_representation import build_representation
-from ipa.reporter_store import ReporterStore
-from ipa.reporter_topics import discover_topics, match_topic_continuity
+from ipa.reporter.reporter_claims import validate_claims
+from ipa.reporter.reporter_config import ReporterConfig
+from ipa.reporter.reporter_contracts import ReporterDecision, ScoreBundle
+from ipa.reporter.reporter_ai import ReporterLLM
+from ipa.reporter.reporter_curation import curate_documents
+from ipa.reporter.reporter_metadata import normalize_article
+from ipa.reporter.reporter_pipeline import ReporterPipeline
+from ipa.reporter.reporter_promotion import approve_promotion, pending_promotions, queue_promotion
+from ipa.reporter.reporter_research import can_execute, create_research_request
+from ipa.reporter.reporter_representation import build_representation
+from ipa.reporter.reporter_store import ReporterStore
+from ipa.reporter.reporter_topics import discover_topics, match_topic_continuity
 
 HASH = "sha256:" + "a" * 64
 PERIOD_START = "2026-08-01T00:00:00Z"
@@ -99,13 +99,13 @@ def test_metadata_normalizes_headers_and_hash(tmp_path):
 def test_llm_label_requires_structured_nonempty_output():
     class Result:
         ok = True
-        text = '{"label":"Tema válido","description":"Descripción con evidencia."}'
+        text = '{"label":"Tema vÃ¡lido","description":"DescripciÃ³n con evidencia."}'
 
     class Provider:
         def generate_chat(self, *_args, **_kwargs):
             return Result()
 
-    assert ReporterLLM(Provider()).label([_doc("doc:one", "photonic processors")])["label"] == "Tema válido"
+    assert ReporterLLM(Provider()).label([_doc("doc:one", "photonic processors")])["label"] == "Tema vÃ¡lido"
 
 
 def test_llm_label_rejects_invalid_output():

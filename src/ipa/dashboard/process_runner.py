@@ -110,6 +110,17 @@ class JobRunner:
         cmd = spec.build_command(self.project_root, self.command_overrides)
         env = spec.build_env()
 
+        # The runner echoes worker lines to its own stdout; when the parent
+        # console uses a legacy codepage (cp1252) Unicode output from workers
+        # (e.g. "→" in progress lines) would crash print(). Force UTF-8 with
+        # replacement so echoing never kills the runner.
+        try:
+            if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
         # Initial state
         initial_metrics: dict[str, Any] = {"command": " ".join(cmd)}
         if spec.name in ("enrichment", "rechunk"):
@@ -153,7 +164,12 @@ class JobRunner:
             if spec.skip_line and spec.skip_line(line):
                 continue
 
-            last_output_time = time.time()
+            # Compute idle BEFORE refreshing the output timestamp so a line
+            # arriving after the idle threshold is classified against the
+            # real silence window (previously idle was always ~0 here).
+            now = time.time()
+            idle = now - last_output_time
+            last_output_time = now
             print(line, flush=True)
 
             # Hammer pause check (between lines, like legacy proc_hammer)
@@ -171,8 +187,8 @@ class JobRunner:
                         if parsed.get("error"):
                             errors.append(line)
 
-            # Compute and write state
-            idle = time.time() - last_output_time
+            # Compute and write state (idle was measured against the previous
+            # output timestamp at the top of the loop).
             status = spec.compute_status(idle, metrics)
             self._write_state(status, {**metrics, "idle_seconds": int(idle)}, errors)
 
@@ -198,3 +214,64 @@ def run_job(
     spec = get_spec(job_name)
     runner = JobRunner(spec, project_root, state_dir, run_id, command_overrides)
     return runner.run()
+
+
+def run_job_with_retry(
+    job_name: str | None = None,
+    project_root: Path | None = None,
+    state_dir: Path | None = None,
+    run_id: str | None = None,
+    command_overrides: dict[str, Any] | None = None,
+    *,
+    spec: "JobSpec | None" = None,
+    max_attempts: int = 3,
+    backoff_s: float = 2.0,
+    backoff_factor: float = 2.0,
+) -> int:
+    """Run a job with bounded retries and exponential backoff.
+
+    Accepts either a registered ``job_name`` or an explicit ``spec``.
+    Only non-zero outcomes are retried; a successful run returns immediately.
+    The attempt count is recorded in the job state metrics. Backoff sleeps
+    ``backoff_s * backoff_factor ** (attempt - 1)`` between attempts.
+    """
+    from .process_specs import get_spec
+    from .process_state import read_state, write_state_atomic
+
+    resolved_spec = spec if spec is not None else get_spec(job_name)  # type: ignore[arg-type]
+    effective_state_dir = Path(state_dir) if state_dir else DEFAULT_STATE_DIR
+    last_code: int | None = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, max(1, max_attempts) + 1):
+        try:
+            runner = JobRunner(resolved_spec, project_root, effective_state_dir, run_id, command_overrides)
+            last_code = runner.run()
+            last_error = None
+        except Exception as exc:  # spawn/IO failures are retryable too
+            last_code = None
+            last_error = exc
+        if last_code == 0:
+            state = read_state(effective_state_dir, resolved_spec.name) or {}
+            metrics = dict(state.get("metrics", {}))
+            metrics["attempts"] = attempt
+            write_state_atomic(
+                state_dir=effective_state_dir, job_name=resolved_spec.name,
+                status=state.get("status", "done"), metrics=metrics,
+                errors=state.get("errors"), run_id=run_id,
+            )
+            return 0
+        if attempt < max_attempts:
+            time.sleep(backoff_s * (backoff_factor ** (attempt - 1)))
+
+    state = read_state(effective_state_dir, resolved_spec.name) or {}
+    metrics = dict(state.get("metrics", {}))
+    metrics["attempts"] = max_attempts
+    if last_error is not None:
+        metrics["retry_exception"] = str(last_error)
+    write_state_atomic(
+        state_dir=effective_state_dir, job_name=resolved_spec.name,
+        status=state.get("status", "error"), metrics=metrics,
+        errors=state.get("errors"), run_id=run_id,
+    )
+    return last_code if last_code is not None else 1

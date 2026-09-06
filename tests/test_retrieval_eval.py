@@ -1,4 +1,4 @@
-"""Tests for E10 retrieval evaluation metrics and query generation.
+﻿"""Tests for E10 retrieval evaluation metrics and query generation.
 
 Validates:
   - IR metrics (recall@k, MRR, nDCG) on known rankings
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ipa.contracts import SearchHit, SourceSpan
-from ipa.retrieval_eval import (
+from ipa.agentic.retrieval_eval import (
     EvalQuery,
     RetrievalMetrics,
     recall_at_k,
@@ -82,7 +82,7 @@ class TestNDCG:
 
     def test_relevant_at_position_2(self):
         ranked = ["c1", "c2", "c3"]
-        # DCG = 1/log2(3) ≈ 0.6309, IDCG = 1.0
+        # DCG = 1/log2(3) â‰ˆ 0.6309, IDCG = 1.0
         expected = 1.0 / (2 * math.log2(3))  # = 1/log2(3)
         # Actually: DCG = 1/log2(2+1) = 1/log2(3), IDCG = 1/log2(2) = 1.0
         result = ndcg_at_k(ranked, "c2", k=3)

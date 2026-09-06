@@ -1,9 +1,9 @@
 ---
 id: PAT-004
 category: pattern
-status: proposed
+status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 author: human
 components: [agentic_runtime, planner, retrieval, context, evaluation]
 tags: [bounded-loop, query-ir, evidence-set, context-package, citations]
@@ -38,4 +38,4 @@ Introduce contratos y adapters, pero permite replay, tests aislados, límites de
 
 ## Estado
 
-Propuesto hasta completar evaluación end-to-end del runtime `agentic_v1`.
+Aceptado (2026-09-06) tras la evaluación end-to-end de EXP-003: calidad de retrieval idéntica al camino legacy, citation map con hash verificado al 100%, overhead de latencia ~7-9% y flag apagado sin filtración del runtime agentivo. Ver `knowledge/experiments/EXP-003-agentic-runtime-incremental.md`.

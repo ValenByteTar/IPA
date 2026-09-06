@@ -1,4 +1,4 @@
-"""Tests for web scraper and OCR adapter (E4 + scraping capability)."""
+﻿"""Tests for web scraper and OCR adapter (E4 + scraping capability)."""
 from __future__ import annotations
 
 import hashlib
@@ -9,8 +9,8 @@ import pytest
 import requests
 
 from ipa import WebScraper, ScrapeSite, ScrapeResult, ScrapeSummary
-from ipa.ocr_adapter import OCRAdapter, OCRResult
-from ipa.web_scraper import PlaywrightBackend, DOCUMENT_EXTENSIONS
+from ipa.acquisition.ocr_adapter import OCRAdapter, OCRResult
+from ipa.acquisition.web_scraper import PlaywrightBackend, DOCUMENT_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class TestWebScraper:
                 html, "https://example.com",
                 url_pattern=r"^/blog/[^/]+/$",
             )
-            # Only /blog/<slug>/  matches — category and tag have 2 path segments
+            # Only /blog/<slug>/  matches â€” category and tag have 2 path segments
             assert "https://example.com/blog/article-1/" in links
             assert "https://example.com/blog/article-2/" in links
             assert not any("category" in l for l in links)
@@ -262,7 +262,7 @@ class TestWebScraper:
             )
             f1 = s.save_article(result)
             f2 = s.save_article(result)
-            assert f1 == f2  # Same URL → same filename
+            assert f1 == f2  # Same URL â†’ same filename
 
     def test_save_article_different_urls_different_files(self, tmp_path):
         with WebScraper(output_dir=tmp_path) as s:
@@ -277,7 +277,7 @@ class TestWebScraper:
         assert not ScrapeResult(url="u", title="", text="", error="failed").success
         assert not ScrapeResult(url="u", title="", text="").success
 
-    @patch("ipa.web_scraper.requests.Session")
+    @patch("ipa.acquisition.web_scraper.requests.Session")
     def test_scrape_site_handles_fetch_failure(self, mock_session_cls, tmp_path):
         """If the listing page can't be fetched, return error summary."""
         mock_session = MagicMock()
@@ -340,7 +340,7 @@ class TestImageClassifier:
 
     def test_tiny_file_skipped(self, tmp_path):
         """Images <2KB should be classified as decorative (icons)."""
-        from ipa.ocr_adapter import ImageClassifier
+        from ipa.acquisition.ocr_adapter import ImageClassifier
         clf = ImageClassifier()
         img_path = tmp_path / "tiny.png"
         img_path.write_bytes(b"\x89PNG\r\n\x01\x00")  # 8 bytes
@@ -350,7 +350,7 @@ class TestImageClassifier:
 
     def test_synthetic_text_image_detected(self, tmp_path):
         """A synthetic image with text should be classified as text-bearing."""
-        from ipa.ocr_adapter import ImageClassifier
+        from ipa.acquisition.ocr_adapter import ImageClassifier
         from PIL import Image, ImageDraw, ImageFont
         clf = ImageClassifier()
         img_path = tmp_path / "text_chart.png"
@@ -367,7 +367,7 @@ class TestImageClassifier:
 
     def test_photograph_skipped(self, tmp_path):
         """A colorful photograph should be classified as decorative."""
-        from ipa.ocr_adapter import ImageClassifier
+        from ipa.acquisition.ocr_adapter import ImageClassifier
         from PIL import Image
         import random
         clf = ImageClassifier()
@@ -383,12 +383,12 @@ class TestImageClassifier:
                                 random.randint(0, 255))
         img.save(img_path)
         should, reason = clf.classify(img_path)
-        # Random noise has many colors — should be classified as photograph
+        # Random noise has many colors â€” should be classified as photograph
         assert not should or "error" in reason, f"Expected decorative, got: {reason}"
 
     def test_very_small_dimensions_skipped(self, tmp_path):
         """Images with dimensions <50px should be skipped."""
-        from ipa.ocr_adapter import ImageClassifier
+        from ipa.acquisition.ocr_adapter import ImageClassifier
         from PIL import Image
         clf = ImageClassifier()
         img_path = tmp_path / "icon.png"
@@ -400,13 +400,13 @@ class TestImageClassifier:
 
     def test_large_file_skipped(self, tmp_path):
         """Images >20MB should be skipped (OOM protection)."""
-        from ipa.ocr_adapter import ImageClassifier
+        from ipa.acquisition.ocr_adapter import ImageClassifier
         from PIL import Image
         import io
         clf = ImageClassifier()
         # Create a large image that exceeds the 20MB limit
         img_path = tmp_path / "huge.png"
-        # 5000x5000 white image with noise → large PNG
+        # 5000x5000 white image with noise â†’ large PNG
         img = Image.new("RGB", (5000, 5000), "white")
         # Add some noise to prevent compression from making it small
         pixels = img.load()
@@ -473,7 +473,7 @@ class TestDownloadDocuments:
         assert ".xlsx" in DOCUMENT_EXTENSIONS
         assert ".txt" in DOCUMENT_EXTENSIONS
         assert ".csv" in DOCUMENT_EXTENSIONS
-        # .md is excluded — repo READMEs/docs are not research documents
+        # .md is excluded â€” repo READMEs/docs are not research documents
         assert ".md" not in DOCUMENT_EXTENSIONS
 
     def test_download_documents_finds_pdf_links(self, tmp_path):

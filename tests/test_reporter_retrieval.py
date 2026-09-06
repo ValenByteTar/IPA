@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ipa.agentic_contracts import EvidenceHit, EvidenceSet, QueryIR
+from ipa.agentic.agentic_contracts import EvidenceHit, EvidenceSet, QueryIR
 from ipa.contracts import DocumentChunk, SearchHit, SourceSpan
-from ipa.reporter_context import ReporterContextBuilder, build_context
-from ipa.reporter_retrieval import ReporterRetriever, retrieve_evidence
+from ipa.agentic.reporter_context import ReporterContextBuilder, build_context
+from ipa.agentic.reporter_retrieval import ReporterRetriever, retrieve_evidence
 
 
 @dataclass

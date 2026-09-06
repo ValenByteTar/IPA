@@ -1,9 +1,23 @@
-"""Dashboard state/config helpers extracted from the HTTP server."""
+"""Dashboard state/config helpers extracted from the HTTP server.
+
+Owns the dashboard path constants; ``server.py`` imports them from here
+(state must never import server — that would be circular).
+"""
 from __future__ import annotations
 
-from . import server as _server
+import json
+import sqlite3
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-globals().update({name: value for name, value in vars(_server).items() if not name.startswith("__")})
+import yaml
+
+ROOT = Path(__file__).resolve().parents[3]
+SOURCES_DB = ROOT / "outputs" / "web_dashboard" / "sources.json"
+STATE_DB = ROOT / "outputs" / "web_dashboard" / "dashboard.db"
+SCRAPE_CONFIG = ROOT / "configs" / "scrape_sites.yaml"
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

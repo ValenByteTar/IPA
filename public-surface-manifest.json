@@ -16,9 +16,9 @@
     "archive": ["local_archive"]
   },
   "compatibility": {
-    "legacy_package": "res023_lab",
+    "legacy_package": null,
     "target_package": "ipa",
-    "migration": "facade-first"
+    "migration": "completed 2026-09-06 (res023_lab facade and root compatibility wrappers retired)"
   },
   "rules": [
     "contracts are authoritative",

@@ -1,4 +1,4 @@
-"""HTTP API handler for the IPA dashboard.
+﻿"""HTTP API handler for the IPA dashboard.
 
 The handler is loaded by :mod:`ipa.dashboard.server` after its shared dashboard
 context has been initialized.
@@ -72,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/deep-dive":
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                from ipa.reporter_deep_dive import deep_dive
+                from ipa.reporter.reporter_deep_dive import deep_dive
                 corpus = Path(query.get("corpus", [""])[0]).expanduser().resolve()
                 if REPORTER_ROOT.resolve() not in corpus.parents:
                     raise PermissionError("deep dive solo puede usar corpus Reporter")
@@ -98,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/deep-dive/stream":
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                from ipa.reporter_deep_dive import deep_dive_prepare, deep_dive_stream, _clean_token
+                from ipa.reporter.reporter_deep_dive import deep_dive_prepare, deep_dive_stream, _clean_token
                 corpus = Path(query.get("corpus", [""])[0]).expanduser().resolve()
                 if REPORTER_ROOT.resolve() not in corpus.parents:
                     raise PermissionError("deep dive solo puede usar corpus Reporter")
@@ -147,12 +147,12 @@ class Handler(BaseHTTPRequestHandler):
                         if chunk.get("done"):
                             break
                     # Clean the final answer
-                    from ipa.reporter_deep_dive import _clean_generated
+                    from ipa.reporter.reporter_deep_dive import _clean_generated
                     cleaned = _clean_generated(full_answer)
                     if not cleaned:
                         cleaned = prep["fallback"]
                     # Validate claims
-                    from ipa.reporter_claims import validate_claims, citation_summary
+                    from ipa.reporter.reporter_claims import validate_claims, citation_summary
                     claims = validate_claims(cleaned, prep["evidence_texts"])
                     sse_send("done", {"answer": cleaned, "claims": claims, "citation_summary": citation_summary(claims)})
                 else:
@@ -286,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
                             found = True
                             break
                     if not found:
-                        # It's a base source — add an override to added list
+                        # It's a base source â€” add an override to added list
                         base = base_sources()
                         base_item = next((b for b in base if b.get("url") == url), None)
                         if base_item:
@@ -307,11 +307,11 @@ class Handler(BaseHTTPRequestHandler):
                 else: raise ValueError("action debe ser add, disable, enable, update_days o update_days_all")
                 save_sources(data); self.send_json({"ok": True, "sources": data})
             elif parsed.path == "/api/scraper/run":
-                config = effective_scrape_config(); command = [VENV_PYTHONW, "-u", "scripts/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto"]
+                config = effective_scrape_config(); command = [VENV_PYTHONW, "-u", "scripts/cli/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto"]
                 self.send_json(spawn_job("scraper", command), 202)
             elif parsed.path == "/api/fastpath/run":
                 reporter_corpus = active_reporter_output() / "corpus"
-                command = [VENV_PYTHONW, "-u", "scripts/run_fast_path.py", "--input", "Landing/web", "--output", str(reporter_corpus)]
+                command = [VENV_PYTHONW, "-u", "scripts/cli/run_fast_path.py", "--input", "Landing/web", "--output", str(reporter_corpus)]
                 self.send_json(spawn_job("pipeline", command), 202)
             elif parsed.path == "/api/lancedb/run":
                 # Re-index LanceDB from existing document_store.db
@@ -325,14 +325,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(spawn_job("lancedb", command), 202)
             elif parsed.path == "/api/reporter/run":
                 period = str(body.get("period", "2026-08")); output = REPORTER_ROOT / "web" / period
-                command = [VENV_PYTHONW, "-u", "scripts/run_reporter.py", "--input", "Landing/web", "--config", "configs/reporter.yaml", "--output", str(output)]
+                command = [VENV_PYTHONW, "-u", "scripts/cli/run_reporter.py", "--input", "Landing/web", "--config", "configs/reporter.yaml", "--output", str(output)]
                 if body.get("embeddings"): command.append("--embeddings")
                 if body.get("llm"): command.append("--llm")
                 self.send_json(spawn_job("reporter", command), 202)
             elif parsed.path == "/api/pipeline/run":
                 with PIPELINE_LOCK:
                     if PIPELINE_THREAD is not None and PIPELINE_THREAD.is_alive():
-                        raise RuntimeError("El pipeline ya está ejecutándose")
+                        raise RuntimeError("El pipeline ya estÃ¡ ejecutÃ¡ndose")
                     period_mode = str(body.get("period_mode", "days"))
                     period_start = str(body.get("period_start", ""))
                     period_end = str(body.get("period_end", ""))
@@ -340,19 +340,19 @@ class Handler(BaseHTTPRequestHandler):
                     thread = threading.Thread(target=run_full_pipeline, args=(period_start, period_end, period_mode, days_back), daemon=True)
                     globals()["PIPELINE_THREAD"] = thread
                     thread.start()
-                self.send_json({"ok": True, "status": "running", "message": "Pipeline iniciado: scraper → reporte rápido → reporte completo"}, 202)
+                self.send_json({"ok": True, "status": "running", "message": "Pipeline iniciado: scraper â†’ reporte rÃ¡pido â†’ reporte completo"}, 202)
             elif parsed.path == "/api/reports/review":
                 report_path = str(body.get("path", ""))
                 status = str(body.get("status", ""))
                 if status not in {"approved", "rejected", "changes_requested"}:
-                    raise ValueError("revisión de corpus inválida")
+                    raise ValueError("revisiÃ³n de corpus invÃ¡lida")
                 # Use provided path or fall back to latest
                 if report_path:
                     report = load_report_by_path(report_path)
                 else:
                     report = latest_report()
                 if not report:
-                    # No report.json found — still clean up the reporter corpus directory
+                    # No report.json found â€” still clean up the reporter corpus directory
                     if status == "rejected":
                         import shutil
                         reporter_output = active_reporter_output()
@@ -379,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = delete_report(report["path"])
                     self.send_json({"ok": True, "report_id": report.get("report_id", ""), "status": "rejected", **result})
                 else:
-                    # changes_requested — just record the review
+                    # changes_requested â€” just record the review
                     with dashboard_connection() as connection:
                         connection.execute("INSERT OR REPLACE INTO report_reviews VALUES (?,?,?,?,?)", (report.get("report_id", ""), status, str(body.get("decided_by", "web-user")), body.get("note"), now()))
                         connection.commit()
@@ -392,7 +392,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **result})
             elif parsed.path == "/api/decisions/review":
                 report = latest_report(); decision_id = str(body.get("decision_id", "")); status = str(body.get("status", ""))
-                if not report or status not in {"approved", "rejected", "changes_requested"}: raise ValueError("revisión inválida")
+                if not report or status not in {"approved", "rejected", "changes_requested"}: raise ValueError("revisiÃ³n invÃ¡lida")
                 db = Path(report["path"]).parent / "reporter.db"
                 approval = {"decision": status, "decided_at": now(), "decided_by": str(body.get("decided_by", "web-user")), "note": body.get("note")}
                 with sqlite3.connect(str(db)) as conn:
@@ -488,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 self.send_json({"ok": True, "cleaned": cleaned})
             elif parsed.path == "/api/corpus/clean":
-                # Clean the REPORTER corpus only — NEVER the main corpus
+                # Clean the REPORTER corpus only â€” NEVER the main corpus
                 # This removes all indices from the current run
                 global _CLEANING_IN_PROGRESS
                 import time as _ctime
@@ -498,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
                     _CLEANING_IN_PROGRESS = True
                     # Wait for any in-flight db_counts() to finish (they hold SQLite handles)
                     _ctime.sleep(1.0)
-                    # Remove ALL reporter runs (history) — this includes corpus + output
+                    # Remove ALL reporter runs (history) â€” this includes corpus + output
                     if REPORTER_ROOT.exists():
                         if _force_rmtree(REPORTER_ROOT):
                             cleaned.append("reporter_root (corpus + output + history)")
@@ -522,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
                 pid = int(body.get("pid", 0))
                 name = str(body.get("name", ""))
                 if pid <= 0:
-                    raise ValueError("pid inválido")
+                    raise ValueError("pid invÃ¡lido")
                 # Kill by PID
                 try:
                     subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0)

@@ -25,7 +25,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install jsonschema  # dev-only
 
 # Environment check
-.venv\Scripts\python.exe scripts\check_environment.py
+.venv\Scripts\python.exe scripts\operations\check_environment.py
 
 # Build landing manifest (append-safe, timestamped by default)
 .venv\Scripts\python.exe scripts\cli\build_landing_manifest.py --input data/sample/input
@@ -64,9 +64,9 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe scripts\cli\run_fast_path.py --input Landing --output outputs/experiments/E11-corpus --trace-db outputs/experiments/E11-corpus/trace.db
 
 # Query trace log (E11 observability)
-.venv\Scripts\python.exe scripts\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --summary
-.venv\Scripts\python.exe scripts\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --artifact sha256:abc123
-.venv\Scripts\python.exe scripts\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --failed
+.venv\Scripts\python.exe scripts\operations\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --summary
+.venv\Scripts\python.exe scripts\operations\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --artifact sha256:abc123
+.venv\Scripts\python.exe scripts\operations\run_trace_query.py --trace-db outputs/experiments/E11-corpus/trace.db --failed
 
 # Run web scraper (E4 OCR + intelligence gathering)
 # Scrape all sites from YAML config (deterministic: url_pattern + exclude_paths)
@@ -88,23 +88,23 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe scripts\cli\run_web_scrape.py --config configs/scrape_sites.yaml --engine auto --output Landing/web
 
 # Reporter Agent — controlled claim/citation evaluation
-.venv\Scripts\python.exe scripts\evaluate_reporter.py
+.venv\Scripts\python.exe scripts\benchmarks\evaluate_reporter.py
 
 # Reporter Agent — generate a domain-agnostic periodic report in an isolated corpus
 .venv\Scripts\python.exe scripts\cli\run_reporter.py --input Landing/web --config configs/reporter.yaml --output outputs/reporter/default/2026-08
 .venv\Scripts\python.exe scripts\cli\run_reporter.py --input data/sample/input --config configs/reporter.yaml --output outputs/reporter/smoke/2026-08
 .venv\Scripts\python.exe scripts\validation\validate_reporter_contract.py ReporterReport outputs\reporter\default\2026-08\report.json
-.venv\Scripts\python.exe scripts\reporter_deep_dive.py --corpus outputs\reporter\default\2026-08\corpus --query "consulta"
-.venv\Scripts\python.exe scripts\reporter_review.py --db outputs\reporter\default\2026-08\reporter.db
+.venv\Scripts\python.exe scripts\cli\reporter_deep_dive.py --corpus outputs\reporter\default\2026-08\corpus --query "consulta"
+.venv\Scripts\python.exe scripts\cli\reporter_review.py --db outputs\reporter\default\2026-08\reporter.db
 
 # Tutor Agent — validate a contract record
 .venv\Scripts\python.exe scripts\validation\validate_tutor_contract.py LearningGoal path\to\goal.json
 .venv\Scripts\python.exe scripts\validation\validate_tutor_contract.py Roadmap path\to\roadmap.json
 
 # Tutor Agent — smoke test del modelo estrella (Qwen3.5-9B EXL3 3.0bpw + MTP)
-.venv\Scripts\python.exe scripts\test_exl3_provider.py
-.venv\Scripts\python.exe scripts\test_exl3_provider.py --interactive
-.venv\Scripts\python.exe scripts\test_exl3_provider.py --all
+.venv\Scripts\python.exe scripts\operations\test_exl3_provider.py
+.venv\Scripts\python.exe scripts\operations\test_exl3_provider.py --interactive
+.venv\Scripts\python.exe scripts\operations\test_exl3_provider.py --all
 
 # Compile ExLlamaV3 native extension (sm_89 / RTX 4050)
 # Only needed after changing ExLlamaV3, Python, PyTorch, CUDA, or GPU.
@@ -159,8 +159,6 @@ src/ipa/
   providers/         ExLlama/Ollama provider adapters
   mcp/               Runtime MCP boundary
   dashboard/         Dashboard server and orchestration migration target
-
-src/res023_lab/      Deprecated compatibility facade only
 ```
 
 Each bounded context has one responsibility. Retrieval, ranking, context building,
@@ -201,20 +199,27 @@ enrichment implementations.
 
 ## Test count
 
-324 tests across 14 files:
+421 tests across 21 files:
 - `test_adaptive_chunker.py` (18) — adaptive merge behavior and invariants
+- `test_agentic_runtime.py` (23) — QueryIR, EvidenceSet, ContextPackage and budget contracts
 - `test_chunkers_alt.py` (17) — recursive, token and semantic chunkers
 - `test_contract_vocabulary.py` (5) — contract authority and identity fields
+- `test_corpus_service.py` (1) — Reporter corpus boundary service
+- `test_eks.py` (5) — EKS metadata and validation
 - `test_experiment_report_schema.py` (21) — schema and integrity validation
 - `test_fast_path.py` (47) — landing, MIME, parsing, chunking, store and BM25
 - `test_index_adapters.py` (16) — Tantivy, embeddings, LanceDB and sqlite-vec
 - `test_manifest_contract.py` (20) — append-safe manifest and integrity checks
 - `test_parsers_alt.py` (9) — Docling, Unstructured and parser consistency
+- `test_process_jobs.py` (48) — JobSpec registry, parsers, process runner and state
+- `test_public_package.py` (2) — public `ipa` surface imports
+- `test_reporter.py` (18) — Reporter metadata, representations, curation, emergent topics,
+  continuity, isolated pipeline, contracts and promotion review
+- `test_reporter_planner.py` (9) — deterministic query planning
+- `test_reporter_retrieval.py` (5) — evidence retrieval adapter
 - `test_retrieval_eval.py` (28) — IR metrics, query generation and hybrid fusion
 - `test_trace_log.py` (21) — observability and FastPath trace integration
 - `test_tutor_contracts.py` (35) — Tutor schemas, provenance, approvals,
   integrity invariants and runtime dataclasses
-- `test_reporter.py` (16) — Reporter metadata, representations, curation, emergent topics,
-  continuity, isolated pipeline, contracts and promotion review
-- `test_web_dashboard.py` (6) — dashboard paths, sources and URL security
+- `test_web_dashboard.py` (8) — dashboard paths, sources and URL security
 - `test_web_scraper.py` (65) — scraping, downloads, RSS, OCR and Playwright

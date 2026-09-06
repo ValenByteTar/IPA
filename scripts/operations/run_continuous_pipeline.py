@@ -1,5 +1,12 @@
-"""Compatibility entrypoint for continuous ingestion."""
-from __future__ import annotations
-import runpy
+"""Public entrypoint for the continuous ingestion pipeline (thin wrapper over ipa)."""
+import sys
 from pathlib import Path
-runpy.run_path(str(Path(__file__).resolve().parents[1] / "run_continuous_pipeline.py"), run_name="__main__")
+
+_SRC = Path(__file__).resolve().parents[2] / "src"
+if _SRC.exists():
+    sys.path.insert(0, str(_SRC))
+
+from ipa.ingestion.continuous_pipeline import main
+
+if __name__ == "__main__":
+    main()

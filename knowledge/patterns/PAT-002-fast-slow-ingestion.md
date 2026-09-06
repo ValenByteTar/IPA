@@ -39,6 +39,6 @@ El sistema puede tener disponibilidad parcial y requiere exponer estados `pendin
 
 ## Ejemplos
 
-- `src/res023_lab/fast_path.py`
-- `scripts/run_continuous_pipeline.py`
-- `src/res023_lab/document_store.py:embedding_jobs`.
+- `src/ipa/ingestion/fast_path.py`
+- `scripts/operations/run_continuous_pipeline.py`
+- `src/ipa/storage/document_store.py:embedding_jobs`.

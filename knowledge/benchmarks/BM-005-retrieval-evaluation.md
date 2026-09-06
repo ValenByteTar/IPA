@@ -3,7 +3,7 @@ id: BM-005
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 author: human
 components: [retrieval, lexical_index, vector_index, evaluation]
 tags: [tantivy, lancedb, hybrid, recall, mrr, rrf]
@@ -12,28 +12,32 @@ supersedes: null
 superseded_by: null
 ---
 
-# BM-005 — Evaluación lexical, vectorial e híbrida
+# BM-005 â€” EvaluaciÃ³n lexical, vectorial e hÃ­brida
 
 ## Objetivo
 
-Medir qué backend funciona mejor según la forma de la consulta y evaluar si la fusión híbrida conserva cobertura.
+Medir quÃ© backend funciona mejor segÃºn la forma de la consulta y evaluar si la fusiÃ³n hÃ­brida conserva cobertura.
 
 ## Entorno
 
 - Dataset: 200 consultas sobre 166k chunks.
 - Artefacto: `outputs/experiments/E10/benchmark_report.json`.
-- Métricas: recall@10, MRR y latencia p50.
+- MÃ©tricas: recall@10, MRR y latencia p50.
 
 ## Resultados
 
-- Tantivy en consultas derivadas de términos: recall@10 98,5%, MRR 0,91 y p50 0 ms.
+- Tantivy en consultas derivadas de tÃ©rminos: recall@10 98,5%, MRR 0,91 y p50 0 ms.
 - LanceDB en consultas cortas: recall@10 58%, MRR 0,37 y p50 78 ms.
-- La fusión híbrida recupera cobertura, aunque puede diluir el MRR lexical.
+- La fusiÃ³n hÃ­brida recupera cobertura, aunque puede diluir el MRR lexical.
 
-## Conclusión
+## ConclusiÃ³n
 
-Tantivy es la opción fuerte para términos exactos, identificadores y nombres propios. Hybrid retrieval es preferible para lenguaje natural donde la coincidencia lexical puede fallar.
+Tantivy es la opciÃ³n fuerte para tÃ©rminos exactos, identificadores y nombres propios. Hybrid retrieval es preferible para lenguaje natural donde la coincidencia lexical puede fallar.
 
 ## Limitaciones
 
-El conjunto de consultas no representa toda interacción futura. Las métricas deben complementarse con evaluación de utilidad, evidencia y citas.
+El conjunto de consultas no representa toda interacciÃ³n futura. Las mÃ©tricas deben complementarse con evaluaciÃ³n de utilidad, evidencia y citas.
+
+## Provenance
+
+Artefacto histÃ³rico (`outputs/experiments/E10/benchmark_report.json`) no disponible localmente (ver PM-002). Conclusiones retenidas; runner reproducible en `scripts/benchmarks/run_retrieval_eval.py`. Relacionado: [PM-002].

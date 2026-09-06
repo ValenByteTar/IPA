@@ -1,4 +1,4 @@
-"""Tests for Stage 3 alternative chunker adapters (E5 competition).
+﻿"""Tests for Stage 3 alternative chunker adapters (E5 competition).
 
 Covers LangChain RecursiveCharacterTextSplitter, TokenTextSplitter, and
 the semantic chunker.  All must produce valid DocumentChunk records
@@ -23,7 +23,7 @@ from ipa import (
     chunk_document_recursive,
     chunk_document_token,
 )
-from ipa.alt_chunkers import chunk_document_semantic
+from ipa.ingestion.alt_chunkers import chunk_document_semantic
 
 
 # ---------------------------------------------------------------------------

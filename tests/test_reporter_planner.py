@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
-from ipa.agentic_contracts import QueryIR
-from ipa.reporter_planner import ReporterPlanner, plan_report_query
+from ipa.agentic.agentic_contracts import QueryIR
+from ipa.agentic.reporter_planner import ReporterPlanner, plan_report_query
 
 
 def test_topic_plan_is_typed_deterministic_and_preserves_scope():
@@ -51,7 +51,7 @@ def test_explicit_document_scope_wins_over_category_scope():
 @pytest.mark.parametrize(
     ("question", "intent", "language"),
     [
-        ("¿Cómo configurar el proceso reproducible?", "procedural", "es"),
+        ("Â¿CÃ³mo configurar el proceso reproducible?", "procedural", "es"),
         ("How many records are in the collection?", "numeric", "en"),
         ("Explain the observed mechanism", "explanation", "en"),
         ("Resume el documento seleccionado", "document_reading", "es"),

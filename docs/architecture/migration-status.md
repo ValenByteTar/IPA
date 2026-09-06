@@ -8,8 +8,11 @@ Current phase:
 - public surface files and GitHub hygiene created;
 - canonical architecture/operations/policy docs created;
 - `ipa` bounded-context implementations are active;
-- `res023_lab` is now a compatibility facade backed by `ipa`;
-- remaining flat compatibility modules are scheduled for retirement after a review window;
+- `res023_lab` facade retired (2026-09-06): all callers, tests, scripts and
+  dashboard modules import bounded `ipa` paths directly;
+- root-level `ipa/*.py` compatibility wrappers removed (2026-09-06);
+- remaining flat `scripts/*.py` entrypoints stay until the dashboard and
+  orchestrator stop spawning them directly (see deletion-candidates.md);
 - full suite remains green.
 
 The migration is intentionally compatibility-first. A bounded context is not

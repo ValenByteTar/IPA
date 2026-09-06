@@ -1,4 +1,4 @@
-"""Local web dashboard for IPA ingestion, Reporter and curation workflows."""
+﻿"""Local web dashboard for IPA ingestion, Reporter and curation workflows."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +20,21 @@ from typing import Any
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[3]
+from .state import (
+    ROOT,
+    SOURCES_DB,
+    STATE_DB,
+    SCRAPE_CONFIG,
+    base_sources,
+    dashboard_connection,
+    effective_scrape_config,
+    load_sources,
+    now,
+    read_json,
+    safe_url,
+    save_sources,
+)
+
 VENV_PYTHON = str(ROOT / ".venv" / "Scripts" / "python.exe")
 VENV_PYTHONW = str(ROOT / ".venv" / "Scripts" / "pythonw.exe")
 if not Path(VENV_PYTHON).exists():
@@ -31,26 +45,20 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 WEB_ROOT = ROOT / "web"
 STATIC_ROOT = WEB_ROOT / "static"
-SOURCES_DB = ROOT / "outputs" / "web_dashboard" / "sources.json"
-STATE_DB = ROOT / "outputs" / "web_dashboard" / "dashboard.db"
 REPORTER_ROOT = ROOT / "outputs" / "reporter"
 REPORTER_PROGRESS = ROOT / "outputs" / "web_dashboard" / "reporter_progress.json"
 PIPELINE_PROGRESS = ROOT / "outputs" / "web_dashboard" / "pipeline_progress.json"
 MAIN_CORPUS = ROOT / "outputs" / "experiments" / "E12-corpus"
-SCRAPE_CONFIG = ROOT / "configs" / "scrape_sites.yaml"
 JOBS: dict[str, subprocess.Popen] = {}
 JOBS_LOCK = threading.Lock()
 DEEP_DIVE_PROVIDER = None
 _CLEANING_LOCK = threading.Lock()
 _CLEANING_IN_PROGRESS = False
-# Active reporter output directory — set by run_full_pipeline, read by dashboard_state
+# Active reporter output directory â€” set by run_full_pipeline, read by dashboard_state
 _ACTIVE_REPORTER_OUTPUT: Path | None = None
 DEEP_DIVE_LOCK = threading.Lock()
 PIPELINE_THREAD = None
 PIPELINE_LOCK = threading.Lock()
-
-
-from .state import base_sources, dashboard_connection, effective_scrape_config, load_sources, now, read_json, safe_url, save_sources
 
 def _force_rmtree(path: Path, max_retries: int = 3) -> bool:
     """Robust rmtree for Windows: retries on PermissionError (SQLite WAL/SHM locks)."""
@@ -260,7 +268,7 @@ def get_deep_dive_provider():
                 return None
         if not llm_status().get("ready"):
             return None
-        from ipa.exl3_provider import create_star_provider
+        from ipa.providers.exl3_provider import create_star_provider
         DEEP_DIVE_PROVIDER = create_star_provider(interactive=True)
         DEEP_DIVE_PROVIDER.load()
         return DEEP_DIVE_PROVIDER
@@ -277,12 +285,12 @@ def process_status() -> dict[str, Any]:
     pipeline_progress = read_json(PIPELINE_PROGRESS, {})
     if pipeline_progress:
         result["rechunk"] = {"status": pipeline_progress.get("status", "running"), "detail": "pipeline completo", "percent": pipeline_progress.get("percent", 0), "stage": pipeline_progress.get("stage", "")}
-    # Dashboard-managed jobs (from pipeline runs) — these are the real live ones
+    # Dashboard-managed jobs (from pipeline runs) â€” these are the real live ones
     with JOBS_LOCK:
         for name in list(JOBS.keys()):
             proc = JOBS[name]
             if proc.poll() is not None:
-                # Process finished — keep status briefly then remove from JOBS
+                # Process finished â€” keep status briefly then remove from JOBS
                 # so it doesn't show as "error" forever
                 status = "done" if proc.returncode == 0 else "error"
                 result[f"web_{name}"] = {"status": status, "pid": proc.pid, "returncode": proc.returncode}
@@ -298,7 +306,7 @@ def process_status() -> dict[str, Any]:
                     if progress:
                         result["web_reporter"].update(progress)
                 elif name == "reporter_fast":
-                    result["rechunk"] = {"status": status, "pid": proc.pid, "detail": "reporter rápido"}
+                    result["rechunk"] = {"status": status, "pid": proc.pid, "detail": "reporter rÃ¡pido"}
                 # Remove finished jobs from JOBS so they don't persist as "error"
                 del JOBS[name]
             else:
@@ -316,7 +324,7 @@ def process_status() -> dict[str, Any]:
                     if progress:
                         result["web_reporter"].update(progress)
                 elif name == "reporter_fast":
-                    result["rechunk"] = {"status": status, "pid": proc.pid, "detail": "reporter rápido"}
+                    result["rechunk"] = {"status": status, "pid": proc.pid, "detail": "reporter rÃ¡pido"}
     return result
 
 
@@ -334,7 +342,7 @@ def process_detail(name: str) -> dict[str, Any]:
     """Return rich detail for a process: state, metrics, errors, log tail."""
     name = str(name).strip()
     if not name or len(name) > 64 or not name.replace("_", "").replace("-", "").isalnum():
-        raise ValueError("nombre de proceso inválido")
+        raise ValueError("nombre de proceso invÃ¡lido")
     state_dir = MAIN_CORPUS / "process_state"
     log_dir = ROOT / "outputs" / "web_dashboard" / "logs"
     detail: dict[str, Any] = {"name": name}
@@ -345,7 +353,7 @@ def process_detail(name: str) -> dict[str, Any]:
         "pipeline": "fast_path.log",
         "lancedb": "lancedb.log",
         "enrichment": "reporter.log",
-        "rechunk": None,  # pipeline completo — combined log below
+        "rechunk": None,  # pipeline completo â€” combined log below
     }
 
     if name.startswith("web_"):
@@ -370,7 +378,7 @@ def process_detail(name: str) -> dict[str, Any]:
         else:
             detail["log"] = []
     elif name == "rechunk":
-        # Pipeline completo — reads from PIPELINE_PROGRESS + combines all logs
+        # Pipeline completo â€” reads from PIPELINE_PROGRESS + combines all logs
         progress = read_json(PIPELINE_PROGRESS, {})
         detail["state"] = progress
         detail["status"] = progress.get("status", "not_started")
@@ -488,7 +496,7 @@ def promote_report_to_main(report_path: str) -> dict[str, Any]:
     """Promote a report's documents and indices to the main corpus.
 
     When a report is approved:
-    1. Copy documents from reporter corpus → main corpus (document_store.db)
+    1. Copy documents from reporter corpus â†’ main corpus (document_store.db)
     2. Copy chunks and index them in main BM25
     3. Copy vector embeddings to main LanceDB
     4. Mark the report as approved in the review table
@@ -512,7 +520,7 @@ def promote_report_to_main(report_path: str) -> dict[str, Any]:
     promoted_chunks = 0
     promoted_vectors = 0
 
-    # 1. Copy documents and chunks from reporter → main using FastPathRunner
+    # 1. Copy documents and chunks from reporter â†’ main using FastPathRunner
     if reporter_store_db.exists():
         import sqlite3 as sql3
         from ipa import DocumentStore, BM25Index
@@ -570,13 +578,13 @@ def promote_report_to_main(report_path: str) -> dict[str, Any]:
             main_store.close()
             main_bm25.close()
 
-    # 2. Copy LanceDB vectors from reporter → main
+    # 2. Copy LanceDB vectors from reporter â†’ main
     if reporter_lancedb.exists() and main_lancedb.parent.exists():
         import shutil
         main_lancedb.parent.mkdir(parents=True, exist_ok=True)
         # Merge: open both LanceDB and copy records
         try:
-            from ipa.lancedb_index import LanceDBIndex
+            from ipa.indexes.lancedb_index import LanceDBIndex
             main_lance = LanceDBIndex(main_lancedb, vector_dim=1024)
             reporter_lance = LanceDBIndex(reporter_lancedb, vector_dim=1024)
             # Get all records from reporter LanceDB
@@ -646,7 +654,7 @@ def promote_report_to_main(report_path: str) -> dict[str, Any]:
                         continue
                     if not src.exists():
                         continue
-                    # Preserve relative structure: Landing/web/<site>/<file> → Archive/web/<site>/<file>
+                    # Preserve relative structure: Landing/web/<site>/<file> â†’ Archive/web/<site>/<file>
                     rel = src_resolved.relative_to(landing_resolved)
                     dst = archive_web / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -688,17 +696,17 @@ def update_latest_topic(body: dict[str, Any]) -> dict[str, Any]:
         raise FileNotFoundError("no hay reporte disponible")
     category_id = str(body.get("category_id", ""))
     if not category_id or len(category_id) > 200:
-        raise ValueError("category_id inválido")
+        raise ValueError("category_id invÃ¡lido")
     allowed = {"label", "description"}
     updates = {key: body[key] for key in allowed if key in body}
     if "label" in updates and (not isinstance(updates["label"], str) or not 1 <= len(updates["label"]) <= 200):
-        raise ValueError("label inválido")
+        raise ValueError("label invÃ¡lido")
     if "description" in updates and (not isinstance(updates["description"], str) or not 1 <= len(updates["description"]) <= 2000):
-        raise ValueError("description inválida")
+        raise ValueError("description invÃ¡lida")
     if "status" in body:
         status = str(body["status"])
         if status not in {"draft", "reviewed", "published"}:
-            raise ValueError("status inválido")
+            raise ValueError("status invÃ¡lido")
         report["status"] = status
     if not updates and "status" not in body:
         raise ValueError("no hay campos editables")
@@ -713,7 +721,7 @@ def update_latest_topic(body: dict[str, Any]) -> dict[str, Any]:
     temp.replace(report_path)
     db = report_path.parent / "reporter.db"
     if db.exists():
-        from ipa.reporter_store import ReporterStore
+        from ipa.reporter.reporter_store import ReporterStore
         with ReporterStore(db) as store:
             if updates and not store.update_topic(category_id, report["report_id"], updates):
                 raise FileNotFoundError(category_id)
@@ -829,14 +837,14 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
     Stage 1: Scraper + Fast Path (parallel)
       - Scraper downloads files to Landing/web
       - Fast Path indexes whatever is already in Landing/web (BM25 + LanceDB)
-        (idempotent — no duplicates on re-run)
+        (idempotent â€” no duplicates on re-run)
     Stage 2: Fast Path (re-run) + Fast Reporter + Full Reporter (parallel)
       - Fast Path picks up new files from the scraper
       - Fast Reporter generates quick report (no embeddings/LLM)
       - Full Reporter generates complete report (BGE-M3 + Qwen)
 
     period_mode:
-      - 'days': use days_back to compute period (today - days_back → today)
+      - 'days': use days_back to compute period (today - days_back â†’ today)
       - 'range': use period_start/period_end directly
     """
     try:
@@ -852,12 +860,12 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
             start_dt = end_dt - timedelta(days=days_back)
             period_start = start_dt.strftime("%Y-%m-%dT00:00:00Z")
             period_end = end_dt.strftime("%Y-%m-%dT23:59:59Z")
-            print(f"  [pipeline] period from days_back={days_back}: {period_start} → {period_end}", flush=True)
+            print(f"  [pipeline] period from days_back={days_back}: {period_start} â†’ {period_end}", flush=True)
         elif period_mode == "range" and period_start and period_end:
-            print(f"  [pipeline] period from range: {period_start} → {period_end}", flush=True)
+            print(f"  [pipeline] period from range: {period_start} â†’ {period_end}", flush=True)
 
         # Compute dynamic output directory based on period label
-        # e.g. period_end="2026-09-30T23:59:59Z" → "optimized-llm-2026-09"
+        # e.g. period_end="2026-09-30T23:59:59Z" â†’ "optimized-llm-2026-09"
         period_label = "unspecified"
         if period_end:
             period_label = period_end[:7]  # YYYY-MM
@@ -884,7 +892,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
 
         # Scraper
         config = effective_scrape_config()
-        scraper_cmd = [VENV_PYTHONW, "-u", "scripts/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto", "--no-images", "--no-ocr"]
+        scraper_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto", "--no-images", "--no-ocr"]
         scraper_log = open(log_dir / "scraper.log", "a", encoding="utf-8")
         scraper_proc = subprocess.Popen(scraper_cmd, cwd=str(ROOT), stdout=scraper_log, stderr=subprocess.STDOUT, env=env, creationflags=no_window)
 
@@ -892,7 +900,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         # The reporter reuses this corpus instead of re-ingesting
         # Only promoted to main corpus when user approves the report
         # reporter_output and reporter_corpus already set above (dynamic)
-        fast_path_cmd = [VENV_PYTHONW, "-u", "scripts/run_fast_path.py", "--input", "Landing/web", "--output", str(reporter_corpus), "--watch", "10"]
+        fast_path_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_fast_path.py", "--input", "Landing/web", "--output", str(reporter_corpus), "--watch", "10"]
         fp_log = open(log_dir / "fast_path.log", "a", encoding="utf-8")
         fp_proc = subprocess.Popen(fast_path_cmd, cwd=str(ROOT), stdout=fp_log, stderr=subprocess.STDOUT, env=env, creationflags=no_window)
 
@@ -904,11 +912,11 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         scraper_proc.wait()
         scraper_log.close()
         if scraper_proc.returncode != 0:
-            _write_pipeline_progress("scraper", "failed", 100, f"Scraper falló (exit {scraper_proc.returncode})")
+            _write_pipeline_progress("scraper", "failed", 100, f"Scraper fallÃ³ (exit {scraper_proc.returncode})")
             fp_proc.terminate()
             fp_log.close()
             return
-        _write_pipeline_progress("scraper", "done", 30, "Scraper completado — esperando indexing final (BM25 + LanceDB)")
+        _write_pipeline_progress("scraper", "done", 30, "Scraper completado â€” esperando indexing final (BM25 + LanceDB)")
 
         # Wait for fast path watch to catch up: poll until BM25 and LanceDB
         # counts match (meaning all files have been ingested AND embedded).
@@ -916,7 +924,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         # for the fast path to process the last batch of files.
         import time as _time
         _write_pipeline_progress("fast_path", "running", 35, "Esperando indexing final (BM25 + LanceDB)")
-        max_wait = 300  # Max 5 minutes — covers slow embedding of large corpora
+        max_wait = 300  # Max 5 minutes â€” covers slow embedding of large corpora
         waited = 0
         while waited < max_wait:
             _time.sleep(10)
@@ -938,7 +946,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
                     pass
                 scraped = scrape_counts()["total_files"]
                 _write_pipeline_progress("fast_path", "running", 35,
-                    f"Indexing: {bm25_chunks} BM25 / {lance_chunks} LanceDB / {scraped} scraped · {waited}s")
+                    f"Indexing: {bm25_chunks} BM25 / {lance_chunks} LanceDB / {scraped} scraped Â· {waited}s")
                 # Done when LanceDB caught up to BM25 AND BM25 docs >= scraped
                 if lance_chunks >= bm25_chunks and bm25_docs >= scraped and lance_chunks > 0:
                     break
@@ -955,13 +963,13 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         except Exception:
             fp_proc.kill()
         fp_log.close()
-        _write_pipeline_progress("fast_path", "done", 40, "Indexing completado (BM25 + LanceDB) — lanzando reporter")
+        _write_pipeline_progress("fast_path", "done", 40, "Indexing completado (BM25 + LanceDB) â€” lanzando reporter")
 
         # --- Stage 2: Full Reporter (BGE-M3 LanceDB + Qwen LLM) ---
         _write_pipeline_progress("parallel", "running", 40, "Generando reporte (BGE-M3 + Qwen LLM)")
 
         full_output = reporter_output  # same as the fast path corpus
-        full_cmd = [VENV_PYTHONW, "-u", "scripts/run_reporter.py", "--input", "Landing/web", "--config", "configs/reporter.yaml", "--output", str(full_output), "--embeddings", "--llm"]
+        full_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_reporter.py", "--input", "Landing/web", "--config", "configs/reporter.yaml", "--output", str(full_output), "--embeddings", "--llm"]
         if period_start:
             full_cmd += ["--period-start", period_start]
         if period_end:
@@ -987,7 +995,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         if full_ok:
             _write_pipeline_progress("reporter_full", "done", 100, "Pipeline completado: Reporter OK (BGE-M3 + Qwen)")
         else:
-            _write_pipeline_progress("error", "failed", 100, f"Reporter falló (exit {full_proc.returncode})")
+            _write_pipeline_progress("error", "failed", 100, f"Reporter fallÃ³ (exit {full_proc.returncode})")
     except Exception as exc:
         _write_pipeline_progress("error", "failed", 100, str(exc))
 

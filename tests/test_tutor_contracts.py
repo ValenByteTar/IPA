@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "validation"))
 from validate_tutor_contract import CONTRACTS, SCHEMAS, load_schema, validate
 
-from ipa.tutor_contracts import (
+from ipa.tutor.tutor_contracts import (
     AssessmentResult,
     AssessmentType,
     GenerationProvenance,
@@ -43,7 +43,7 @@ def _source(source_id: str = "chunk:abc") -> dict:
 
 def _generation() -> dict:
     return {
-        "generator": "ipa.exl3_provider",
+        "generator": "ipa.providers.exl3_provider",
         "generated_at": NOW,
         "input_hash": HASH,
         "model_fingerprint": "Qwen3.5-9B-EXL3-3.0bpw",
@@ -63,10 +63,10 @@ def _approval() -> dict:
 def _goal() -> dict:
     return {
         "goal_id": "goal:hybrid-rag",
-        "title": "Diseñar sistemas Hybrid RAG",
-        "description": "Aprender a diseñar y evaluar recuperación híbrida.",
+        "title": "DiseÃ±ar sistemas Hybrid RAG",
+        "description": "Aprender a diseÃ±ar y evaluar recuperaciÃ³n hÃ­brida.",
         "status": "confirmed",
-        "success_criteria": ["Diseñar una arquitectura justificando lexical y vectorial"],
+        "success_criteria": ["DiseÃ±ar una arquitectura justificando lexical y vectorial"],
         "constraints": ["Usar fuentes primarias"],
         "created_at": NOW,
         "updated_at": LATER,
@@ -84,12 +84,12 @@ def _concept() -> dict:
     return {
         "concept_id": "concept:hybrid-retrieval",
         "title": "Hybrid retrieval",
-        "definition": "Combinación explícita de recuperación lexical y vectorial.",
+        "definition": "CombinaciÃ³n explÃ­cita de recuperaciÃ³n lexical y vectorial.",
         "status": "validated",
         "difficulty": 0.6,
         "prerequisite_ids": ["concept:bm25", "concept:embeddings"],
-        "learning_objectives": ["Explicar cuándo lexical y vectorial se complementan"],
-        "mastery_criteria": ["Diseñar una estrategia de fusión para un caso nuevo"],
+        "learning_objectives": ["Explicar cuÃ¡ndo lexical y vectorial se complementan"],
+        "mastery_criteria": ["DiseÃ±ar una estrategia de fusiÃ³n para un caso nuevo"],
         "common_misconceptions": ["Hybrid significa usar solo dos modelos densos"],
         "source_refs": [_source()],
         "created_at": NOW,
@@ -126,7 +126,7 @@ def _roadmap() -> dict:
         "status": "approved",
         "units": [_unit(1), _unit(2), _unit(3)],
         "assumptions": ["El usuario conoce Python"],
-        "uncertainties": ["Dominio actual de evaluación IR"],
+        "uncertainties": ["Dominio actual de evaluaciÃ³n IR"],
         "change_reason": None,
         "previous_roadmap_id": None,
         "created_at": NOW,
@@ -153,8 +153,8 @@ def _assessment() -> dict:
         "score": 0.82,
         "status": "applied",
         "confidence": 0.78,
-        "strengths": ["Separó lexical y vectorial"],
-        "gaps": ["No explicó reintentos"],
+        "strengths": ["SeparÃ³ lexical y vectorial"],
+        "gaps": ["No explicÃ³ reintentos"],
         "misconceptions": [],
         "evidence": [_source("assessment:attempt-001")],
         "recommended_action": "advance",
@@ -178,7 +178,7 @@ def _research() -> dict:
         "request_id": "research:001",
         "goal_id": "goal:hybrid-rag",
         "concept_id": "concept:bm25",
-        "question": "¿Cuál es la formulación original y vigente de BM25?",
+        "question": "Â¿CuÃ¡l es la formulaciÃ³n original y vigente de BM25?",
         "trigger": "missing_primary_source",
         "gap_evidence": [_source("assessment:gap-001")],
         "allowed_domains": ["dl.acm.org", "microsoft.com"],

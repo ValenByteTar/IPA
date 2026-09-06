@@ -1,4 +1,4 @@
-"""Tests for adaptive re-chunking module.
+﻿"""Tests for adaptive re-chunking module.
 
 Validates:
   - Lexical density computation
@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from ipa import CanonicalDocument, DocumentChunk, SourceSpan
-from ipa.adaptive_chunker import (
+from ipa.ingestion.adaptive_chunker import (
     adaptive_rechunk,
     adaptive_rechunk_batch,
     lexical_density,

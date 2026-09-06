@@ -1,7 +1,48 @@
 # Deletion candidates after MACRO-ORDEN
 
-No path in this list is deleted by the current migration. Each item requires a
-separate review and explicit approval after the compatibility window.
+## Execution record
+
+- 2026-09-06, approved by user: group A completed — `src/res023_lab/` facade
+  (47 modules) and root `src/ipa/*.py` compatibility wrappers (32) plus
+  `ipa/compat.py` deleted after migrating ~78 imports in tests, scripts and
+  dashboard to bounded `ipa` paths; suite green (421 tests).
+- 2026-09-06, approved by user: group B partial — 4 one-off repair scripts,
+  `__check_history.py`, 6 `proc_wrappers/proc_*.py`, 3 superseded
+  `local_archive/experiments` documents and
+  `local_archive/benchmarks/reporter_v1.json` deleted (fixture migrated to
+  `tests/fixtures/reporter_v1.json`).
+- 2026-09-06, approved by user: dashboard-critical root scripts migrated —
+  `run_web_scrape`, `run_fast_path`, `run_reporter`, `run_continuous_pipeline`
+  moved to `ipa.acquisition.scrape_cli`, `ipa.ingestion.fast_path_cli`,
+  `ipa.reporter.reporter_cli` and `ipa.ingestion.continuous_pipeline`;
+  organized entrypoints (`scripts/cli/*`, `scripts/operations/*`) are now
+  thin IPA-direct wrappers; root shims deleted. The 4 orchestrator workers
+  moved from `local_archive/scripts/_*.py` (which still imported the deleted
+  `res023_lab`) to `scripts/operations/workers/` with bounded `ipa` imports;
+  `process_specs.py` updated; archived copies deleted. Root
+  `scripts/orchestrator.py` shim deleted (`scripts/operations/orchestrator.py`
+  is canonical).
+- 2026-09-06, approved by user: group A tail completed — the remaining 22 root
+  scripts moved into `scripts/{benchmarks,validation,cli,operations}` (shims
+  inverted: organized files now hold the implementation); root copies deleted;
+  AGENTS.md and `start_ipa_dashboard.ps1` updated. Exception kept on purpose:
+  `scripts/web_dashboard.py` (live dashboard monolith, direct test imports;
+  parity check against `ipa.dashboard.server` is a separate task).
+- 2026-09-06, approved by user: dashboard monolith migrated — route parity
+  verified (29/29 HTTP routes identical), path constants moved to
+  `ipa/dashboard/state.py` (circular import removed), `test_web_dashboard.py`
+  rewritten against the split modules (8/8), `start_ipa_dashboard.ps1` now
+  launches `scripts/operations/web_dashboard.py`, live smoke passed
+  (health/state/index HTTP 200), monolith `scripts/web_dashboard.py` deleted.
+  **`scripts/` root is now empty — MACRO-ORDEN fully complete.**
+- 2026-09-06, approved by user: group B completed —
+  `local_archive/legacy_res023_lab/` (48 files) and
+  `local_archive/dashboard-pre-split/` (2 files) deleted after confirming zero
+  active references. `local_archive/` now holds only `README.md` and
+  `proc_wrappers/MANIFEST.md` (validation evidence).
+
+No further path in this list is deleted without a separate review and explicit
+approval.
 
 ## Candidate group A — temporary compatibility
 

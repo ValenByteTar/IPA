@@ -9,8 +9,8 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $PythonW = Join-Path $Root ".venv\Scripts\pythonw.exe"
-$Dashboard = Join-Path $Root "scripts\web_dashboard.py"
-$Watchdog = Join-Path $Root "scripts\dashboard_watchdog.py"
+$Dashboard = Join-Path $Root "scripts\operations\web_dashboard.py"
+$Watchdog = Join-Path $Root "scripts\operations\dashboard_watchdog.py"
 $Url = "http://127.0.0.1:$Port"
 
 # Use pythonw.exe (no console window) if available, to prevent accidental closure

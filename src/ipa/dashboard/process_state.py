@@ -145,3 +145,67 @@ def read_state(state_dir: Path, job_name: str) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Resource slots: bounded concurrency (backpressure) for shared resources.
+# ---------------------------------------------------------------------------
+
+def _slot_dir(state_dir: Path) -> Path:
+    return Path(state_dir) / "slots"
+
+
+def acquire_slot(
+    state_dir: Path,
+    resource: str,
+    max_concurrent: int,
+    holder: str,
+    *,
+    stale_s: float = 3600.0,
+) -> int | None:
+    """Claim one of ``max_concurrent`` slot files for a resource.
+
+    Returns the slot index, or None when every slot is held (backpressure
+    signal: the caller must wait or reject).  Slots older than ``stale_s``
+    are considered abandoned and may be stolen.
+    """
+    sdir = _slot_dir(state_dir)
+    sdir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for index in range(max_concurrent):
+        path = sdir / f"{resource}.{index}.lock"
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if now - float(payload.get("acquired_at", 0.0)) > stale_s:
+                    path.unlink(missing_ok=True)
+                    try:
+                        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    except FileExistsError:
+                        continue
+                else:
+                    continue
+            except (OSError, ValueError):
+                continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"holder": holder, "resource": resource, "acquired_at": now}, handle)
+        return index
+    return None
+
+
+def release_slot(state_dir: Path, resource: str, index: int, holder: str) -> bool:
+    """Release a slot previously acquired by ``holder``."""
+    path = _slot_dir(state_dir) / f"{resource}.{index}.lock"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if payload.get("holder") != holder:
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True

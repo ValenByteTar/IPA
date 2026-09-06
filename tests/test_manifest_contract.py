@@ -4,7 +4,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "validation"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "cli"))
 from build_landing_manifest import build_records, main as build_manifest  # noqa: E402
 from validate_contracts import validate_structure, validate_integrity  # noqa: E402
 

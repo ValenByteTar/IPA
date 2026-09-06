@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import replace
 
 import pytest
 
-from ipa.agentic_contracts import (
+from ipa.agentic.agentic_contracts import (
     ContextPackage,
     EvidenceHit,
     EvidenceSet,

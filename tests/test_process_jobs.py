@@ -107,19 +107,18 @@ class TestProcessSpecs:
 
     def test_resolve_worker_path_existing(self, tmp_path):
         spec = SPECS["scraper"]
-        # run_web_scrape.py exists in scripts/
+        # run_web_scrape.py exists in scripts/cli/
         root = Path(__file__).resolve().parents[1]
         path = spec.resolve_worker_path(root)
         assert path.exists()
 
     def test_resolve_worker_path_archive_fallback(self, tmp_path):
-        """lancedb worker is archived; resolve should find it in local_archive."""
+        """lancedb worker lives in scripts/operations/workers/."""
         spec = SPECS["lancedb"]
         root = Path(__file__).resolve().parents[1]
         path = spec.resolve_worker_path(root)
-        # Either scripts/ or local_archive/scripts/ should have it
         assert path.exists()
-        assert "_lancedb_incremental" in path.name
+        assert "lancedb_incremental" in path.name
 
     def test_build_command_basic(self, tmp_path):
         spec = SPECS["scraper"]

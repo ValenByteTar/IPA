@@ -37,6 +37,6 @@ Se requiere reconstrucción de derivados y control de fingerprints, pero se evit
 
 ## Ejemplos
 
-- `src/res023_lab/document_store.py`
+- `src/ipa/storage/document_store.py`
 - `docs/IPA_SYSTEM_OVERVIEW.md`
 - contratos `CanonicalDocument` y `DocumentChunk`.

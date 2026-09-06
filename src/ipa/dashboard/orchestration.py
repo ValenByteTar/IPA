@@ -1,9 +1,9 @@
-"""IPA Orchestrator — unified launch, monitor, and coordinate all IPA processes.
+﻿"""IPA Orchestrator â€” unified launch, monitor, and coordinate all IPA processes.
 
 Runs processes in PARALLEL and shows a unified, readable dashboard:
   - Pipeline (parse + chunk + store + tantivy)
   - LanceDB builder (embed hybrid + index)
-  - Enrichment (ExLlamaV3 summaries) — auto-launched 300s after LanceDB done
+  - Enrichment (ExLlamaV3 summaries) â€” auto-launched 300s after LanceDB done
 
 Features:
   - Live dashboard with progress bars, rates, ETAs
@@ -13,9 +13,9 @@ Features:
   - Clean console output: no raw subprocess spam
 
 Usage:
-    python scripts/orchestrator.py                          # full system
-    python scripts/orchestrator.py --no-scraper --no-hammer # pipeline + lancedb + enrichment
-    python scripts/orchestrator.py --chunker semantic       # use semantic chunker
+    python scripts/operations/orchestrator.py                          # full system
+    python scripts/operations/orchestrator.py --no-scraper --no-hammer # pipeline + lancedb + enrichment
+    python scripts/operations/orchestrator.py --chunker semantic       # use semantic chunker
 """
 from __future__ import annotations
 
@@ -145,14 +145,14 @@ class Orchestrator:
             self.procs[name] = proc
             self.log_handles[name] = log_handle
             self.start_times[name] = time.time()
-            self.log_event(f"{C.BLUE}▶ {name}{C.RESET} launched (pid={proc.pid})")
+            self.log_event(f"{C.BLUE}â–¶ {name}{C.RESET} launched (pid={proc.pid})")
             return True
         except Exception as e:
-            self.log_event(f"{C.RED}✗ {name}{C.RESET} failed to launch: {e}")
+            self.log_event(f"{C.RED}âœ— {name}{C.RESET} failed to launch: {e}")
             return False
 
     def kill_process(self, name: str):
-        """Graceful shutdown: CTRL_BREAK → wait 15s → hard kill."""
+        """Graceful shutdown: CTRL_BREAK â†’ wait 15s â†’ hard kill."""
         if name not in self.procs:
             return
         proc = self.procs[name]
@@ -160,27 +160,27 @@ class Orchestrator:
             # Try graceful shutdown first (allows finally/cleanup to run)
             try:
                 if os.name == "nt":
-                    # CTRL_BREAK_EVENT to the process group — Python handles
+                    # CTRL_BREAK_EVENT to the process group â€” Python handles
                     # this as KeyboardInterrupt, running finally blocks
                     proc.send_signal(subprocess.signal.CTRL_BREAK_EVENT)
                 else:
                     proc.terminate()
                 proc.wait(timeout=15)
-                self.log_event(f"{C.YELLOW}■ {name}{C.RESET} stopped gracefully")
+                self.log_event(f"{C.YELLOW}â–  {name}{C.RESET} stopped gracefully")
             except subprocess.TimeoutExpired:
-                # Graceful shutdown failed — hard kill as last resort
+                # Graceful shutdown failed â€” hard kill as last resort
                 proc.kill()
                 proc.wait()
-                self.log_event(f"{C.RED}■ {name}{C.RESET} hard-killed (cleanup timeout)")
+                self.log_event(f"{C.RED}â–  {name}{C.RESET} hard-killed (cleanup timeout)")
             except Exception:
-                # send_signal not supported — fall back to terminate
+                # send_signal not supported â€” fall back to terminate
                 proc.terminate()
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-                self.log_event(f"{C.RED}■ {name}{C.RESET} terminated")
+                self.log_event(f"{C.RED}â–  {name}{C.RESET} terminated")
         handle = self.log_handles.pop(name, None)
         if handle is not None:
             handle.close()
@@ -189,12 +189,12 @@ class Orchestrator:
     def pause_hammer(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         HAMMER_PAUSE_FILE.touch()
-        self.log_event(f"{C.YELLOW}⏸ hammer{C.RESET} paused (GPU for enrichment)")
+        self.log_event(f"{C.YELLOW}â¸ hammer{C.RESET} paused (GPU for enrichment)")
 
     def resume_hammer(self):
         if HAMMER_PAUSE_FILE.exists():
             HAMMER_PAUSE_FILE.unlink()
-            self.log_event(f"{C.GREEN}▶ hammer{C.RESET} resumed")
+            self.log_event(f"{C.GREEN}â–¶ hammer{C.RESET} resumed")
 
     def read_state(self, name: str) -> dict | None:
         state_file = STATE_DIR / f"{name}.json"
@@ -242,13 +242,13 @@ class Orchestrator:
             self.lancedb_done_time = time.time()
             self.idle_start = time.time()
             self.log_event(
-                f"{C.MAGENTA}◆ enrichment{C.RESET} LanceDB done. "
+                f"{C.MAGENTA}â—† enrichment{C.RESET} LanceDB done. "
                 f"Waiting {self.args.enrichment_idle}s idle..."
             )
         idle_elapsed = time.time() - self.idle_start
         if idle_elapsed >= self.args.enrichment_idle:
             self.log_event(
-                f"{C.MAGENTA}▶ enrichment{C.RESET} launching after "
+                f"{C.MAGENTA}â–¶ enrichment{C.RESET} launching after "
                 f"{self.args.enrichment_idle}s idle"
             )
             if "hammer" in self.procs:
@@ -362,7 +362,7 @@ class Orchestrator:
             f"  chunker={C.CYAN}{self.args.chunker}{C.RESET}"
             f"  corpus={C.GRAY}E12-corpus{C.RESET}"
         )
-        lines.append(f"  {C.GRAY}{'─' * 76}{C.RESET}")
+        lines.append(f"  {C.GRAY}{'â”€' * 76}{C.RESET}")
 
         # Corpus-level availability summary
         pipeline_state = self.read_state("pipeline") or {}
@@ -378,7 +378,7 @@ class Orchestrator:
             f"vector={lm.get('embedded', '?')}/{lm.get('store_count', '?')} "
             f"landing={landing_count}"
         )
-        lines.append(f"  {C.GRAY}{'─' * 76}{C.RESET}")
+        lines.append(f"  {C.GRAY}{'â”€' * 76}{C.RESET}")
 
         # Process rows
         active_names = [n for n in PROCESSES if n in self.procs or self.read_state(n)]
@@ -420,7 +420,7 @@ class Orchestrator:
         for event in self.events[-6:]:
             lines.append(f"    {event}")
 
-        lines.append(f"  {C.GRAY}{'─' * 76}{C.RESET}")
+        lines.append(f"  {C.GRAY}{'â”€' * 76}{C.RESET}")
         lines.append(f"  {C.GRAY}Press Ctrl+C to stop all processes{C.RESET}")
 
         return "\n".join(lines)
@@ -482,7 +482,7 @@ class Orchestrator:
             # Restart stuck scraper
             for name in list(self.procs.keys()):
                 if self.check_health(name) == "stuck" and name == "scraper":
-                    self.log_event(f"{C.YELLOW}↻ {name}{C.RESET} stuck, restarting...")
+                    self.log_event(f"{C.YELLOW}â†» {name}{C.RESET} stuck, restarting...")
                     self.kill_process(name)
                     if not self.args.no_scraper:
                         time.sleep(2)

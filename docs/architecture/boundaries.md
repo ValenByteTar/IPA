@@ -31,5 +31,5 @@ Reporter and Tutor consume materialized knowledge through explicit contracts. Th
 must not silently become alternate ingest pipelines or mutate canonical source
 text. EKS is dev-time only and is exposed through its own read-only MCP server.
 
-The package migration target is `ipa`; `res023_lab` remains a temporary compatibility
-facade while callers migrate.
+The package migration is complete: `ipa` is the only package; the former
+`res023_lab` facade and root compatibility wrappers were retired on 2026-09-06.
