@@ -1,0 +1,39 @@
+lab:
+  id: res023-ingestion-lab
+  schema_version: "1.0"
+  output_root: outputs
+  preserve_inputs: true
+  production_write: false
+
+landing:
+  root: Landing
+  manifest: outputs/manifests/processing.jsonl
+  hash_algorithm: sha256
+
+fast_path:
+  parser: pymupdf
+  lexical_index: sqlite_fts5
+  publish_before_enrichment: true
+
+secondary_indexes:
+  embeddings: pending
+  vector_backend: pending
+  mode: base_plus_deltas
+
+enrichment:
+  enabled: false
+  mode: selective
+  batch_size: 6
+  max_llm_calls: 0
+  on_demand: true
+
+execution:
+  retry_attempts: 3
+  retry_backoff_seconds: 5
+  queue_backpressure_limit: 5000
+  timeout_seconds: 300
+
+experiments:
+  same_corpus_required: true
+  same_questions_required: true
+  isolated_outputs_required: true

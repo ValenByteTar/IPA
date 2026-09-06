@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/reporter_document_decision.schema.json",
+  "title": "ReporterDocumentDecision",
+  "description": "Auditable relevance and curation decision for one Reporter document.",
+  "type": "object", "additionalProperties": false,
+  "required": ["decision_id", "report_id", "document_id", "artifact_id", "decision", "scores", "reason", "evidence", "review_status", "approval", "generation", "field_origins"],
+  "properties": {
+    "decision_id": { "$ref": "reporter_common.schema.json#/$defs/identifier" },
+    "report_id": { "$ref": "reporter_common.schema.json#/$defs/identifier" },
+    "document_id": { "$ref": "reporter_common.schema.json#/$defs/identifier" },
+    "artifact_id": { "type": "string", "minLength": 1 },
+    "decision": { "type": "string", "enum": ["promote", "reporter_only", "defer", "irrelevant", "duplicate", "insufficient_evidence"] },
+    "scores": { "type": "object", "additionalProperties": false, "required": ["relevance", "novelty", "source_quality", "impact"], "properties": { "relevance": { "type": "number", "minimum": 0, "maximum": 1 }, "novelty": { "type": "number", "minimum": 0, "maximum": 1 }, "source_quality": { "type": "number", "minimum": 0, "maximum": 1 }, "impact": { "type": "number", "minimum": 0, "maximum": 1 }, "depth": { "type": "number", "minimum": 0, "maximum": 1 }, "actionability": { "type": "number", "minimum": 0, "maximum": 1 } } },
+    "content_type": { "type": ["string", "null"] },
+    "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "reporter_common.schema.json#/$defs/sourceRef" } },
+    "duplicate_of": { "type": ["string", "null"] },
+    "review_status": { "type": "string", "enum": ["pending", "approved", "rejected", "changes_requested"] },
+    "approval": { "anyOf": [{ "$ref": "reporter_common.schema.json#/$defs/approval" }, { "type": "null" }] },
+    "generation": { "$ref": "reporter_common.schema.json#/$defs/generation" },
+    "field_origins": { "type": "object", "additionalProperties": { "$ref": "reporter_common.schema.json#/$defs/origin" }, "required": ["decision", "scores", "reason", "evidence", "review_status"] }
+  },
+  "allOf": [{ "if": { "properties": { "review_status": { "enum": ["approved", "rejected", "changes_requested"] } }, "required": ["review_status"] }, "then": { "properties": { "approval": { "$ref": "reporter_common.schema.json#/$defs/approval" } } } }]
+}

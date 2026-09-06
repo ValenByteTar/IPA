@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/research_request.schema.json",
+  "title": "ResearchRequest",
+  "description": "Bounded research request created only from an explicit educational gap.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "goal_id", "concept_id", "question", "trigger", "gap_evidence", "allowed_domains", "budget", "status", "created_at", "updated_at", "approval", "generation", "field_origins"],
+  "properties": {
+    "request_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "goal_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "concept_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "question": { "type": "string", "minLength": 10, "maxLength": 2000, "x-field-origin": "generated_or_user" },
+    "trigger": {
+      "type": "string",
+      "enum": ["insufficient_sources", "low_source_quality", "source_contradiction", "missing_primary_source", "stale_information", "user_deepening_request", "unknown_prerequisite", "assessment_gap"],
+      "x-field-origin": "system"
+    },
+    "gap_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+      "x-field-origin": "source"
+    },
+    "allowed_domains": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$" },
+      "x-field-origin": "user_or_system_policy"
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_urls", "max_seconds", "max_bytes", "max_depth"],
+      "properties": {
+        "max_urls": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 10737418240 },
+        "max_depth": { "type": "integer", "minimum": 0, "maximum": 10 }
+      },
+      "x-field-origin": "system_policy"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "pending_approval", "approved", "running", "completed", "failed", "cancelled"],
+      "x-field-origin": "system"
+    },
+    "job_id": {
+      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "default": null,
+      "x-field-origin": "system"
+    },
+    "result_source_refs": {
+      "type": "array",
+      "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+      "default": [],
+      "x-field-origin": "source"
+    },
+    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "updated_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "approval": {
+      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/humanApproval" }, { "type": "null" }],
+      "x-field-origin": "user"
+    },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["question", "trigger", "gap_evidence", "allowed_domains", "budget"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "enum": ["approved", "running", "completed"] } }, "required": ["status"] },
+      "then": { "properties": { "approval": { "$ref": "tutor_common.schema.json#/$defs/humanApproval" } } }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["running", "completed"] } }, "required": ["status"] },
+      "then": {
+        "required": ["job_id"],
+        "properties": { "job_id": { "$ref": "tutor_common.schema.json#/$defs/identifier" } }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "completed" } }, "required": ["status"] },
+      "then": {
+        "required": ["result_source_refs"],
+        "properties": { "result_source_refs": { "minItems": 1 } }
+      }
+    }
+  ]
+}

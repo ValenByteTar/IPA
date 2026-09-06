@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPA Control Room</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar"><div><span class="eyebrow">IPA / LOCAL INTELLIGENCE</span><h1>Control Room</h1></div><div class="top-actions"><span id="connection-status" class="conn-status connecting">Conectando…</span><span id="last-refresh" class="muted"></span><button class="ghost" onclick="refreshAll()">Actualizar</button><button class="ghost" id="restart-btn" onclick="restartSystem()" title="Reinicia el servidor del dashboard">Reiniciar sistema</button></div></header>
+  <main class="shell">
+    <section class="hero"><div><p class="eyebrow">OPERACIONES</p><h2>Conocimiento en movimiento</h2><p>Supervisá scraping, ingestiones, Reporter y curación desde un único panel. Los cambios se aplican en backend y se reflejan con refresh.</p></div><div class="hero-status" id="hero-status">Cargando estado…</div></section>
+    <section class="metrics" id="metrics"></section>
+    <section class="metrics" id="corpus-section"></section>
+    <nav class="tabs"><button class="tab active" data-panel="overview">Resumen</button><button class="tab" data-panel="execution">Ejecución</button><button class="tab" data-panel="reporter">Reporter</button><button class="tab" data-panel="sources">Fuentes</button><button class="tab" data-panel="review">Curación</button></nav>
+
+    <section id="panel-overview" class="panel active"><div class="grid two"><article class="card"><div class="card-head"><div><span class="eyebrow">INGESTIONES</span><h3>Estado de los dos corpus</h3></div><button class="icon-btn" onclick="refreshAll()">↻</button></div><div id="ingestions" class="stack"></div></article><article class="card"><div class="card-head"><div><span class="eyebrow">MODELO</span><h3>Disponibilidad del LLM</h3></div><span id="llm-pill" class="pill">—</span></div><div id="llm-info"></div></article></div><article class="card"><div class="card-head"><div><span class="eyebrow">PROCESOS</span><h3>Actividad del sistema</h3></div><div class="actions"><button class="ghost" onclick="stopAllProcesses()">Detener todo</button><button class="danger" onclick="cleanReporterCorpus()">Limpiar corpus reporter</button></div></div><div id="processes" class="process-list"></div><div id="process-detail" class="process-detail-panel" style="display:none"></div></article></section>
+
+    <section id="panel-reporter" class="panel"><div class="section-title"><div><span class="eyebrow">REPORTER AGENT</span><h2>Panorama emergente</h2><p>Categorías generadas desde el corpus, no desde una taxonomía fija. Aprobar promueve al corpus principal; Denegar elimina todo.</p></div><div class="actions"><button onclick="reviewReport('approved')">Aprobar corpus</button><button class="danger" onclick="reviewReport('rejected')">Denegar corpus</button></div></div><div id="report-meta" class="notice"></div><div id="report-history" class="stack"></div><div id="categories" class="category-grid"></div><div id="topic-review" class="stack"></div></section>
+
+    <section id="panel-execution" class="panel"><div class="section-title"><div><span class="eyebrow">OPERACIONES</span><h2>Ejecución</h2><p>Lanzá scraping y generación de reportes desde aquí.</p></div></div><div id="execution-panel" class="stack"></div></section>
+
+    <section id="panel-sources" class="panel"><div class="section-title"><div><span class="eyebrow">ADQUISICIÓN</span><h2>Fuentes del scraper</h2><p>Agregá o desactivá URLs sin editar archivos ni reiniciar el sistema.</p></div></div><form class="source-form" onsubmit="addSource(event)"><input id="source-url" type="url" placeholder="https://example.com/news" required><input id="source-days" type="number" min="0" value="7" title="Días hacia atrás"><button class="primary">Agregar fuente</button></form><div id="sources" class="source-list"></div></section>
+
+    <section id="panel-review" class="panel"><div class="section-title"><div><span class="eyebrow">HUMAN IN THE LOOP</span><h2>Curación y promoción</h2><p>El sistema recomienda; vos decidís qué conservar o descartar. Podés también explorar todos los documentos del corpus.</p></div><div class="actions"><select id="review-corpus" onchange="loadReviewContent()"><option value="decisions">Decisiones de curación</option><option value="reporter">Todos los documentos (Reporter)</option><option value="main">Todos los documentos (Principal)</option></select></div></div><div id="decisions" class="decision-list"></div><div id="review-documents" class="document-list"></div></section>
+  </main>
+  <dialog id="viewer"><div class="viewer-head"><strong id="viewer-title"></strong><button onclick="viewer.close()">Cerrar</button></div><div id="viewer-body" class="viewer-body"></div></dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=4"></script>
+  <script>
+    // Auto-refresh process detail when open
+    setInterval(() => { if (currentProcess && document.getElementById('process-detail') && document.getElementById('process-detail').dataset.visible === 'true') loadProcessDetail(currentProcess); }, 2000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipa"
+version = "0.1.0"
+description = "Local-first knowledge acquisition and materialization platform for agents"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+dependencies = [
+  "PyYAML>=6.0.1,<7",
+  "rich>=13.7.0,<15",
+  "PyMuPDF>=1.23.0,<2",
+  "rank-bm25>=0.2.2,<1",
+  "numpy>=1.26.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+  "pytest-cov>=5.0,<7",
+  "jsonschema>=4.23,<5",
+  "ruff>=0.6,<1",
+  "build>=1.2,<2",
+]
+retrieval = [
+  "tantivy>=0.22,<1",
+  "lancedb>=0.15,<1",
+  "sqlite-vec>=0.1.1,<1",
+  "sentence-transformers>=2.5,<7",
+  "transformers>=4.57,<5",
+]
+parsers = ["docling>=2.0,<3", "unstructured[pdf]>=0.16,<1"]
+web = [
+  "requests>=2.31,<3",
+  "trafilatura>=1.9,<3",
+  "playwright>=1.45,<2",
+  "easyocr>=1.7,<2",
+]
+mcp = ["mcp>=1.0,<2"]
+tutor = [
+  "torch>=2.13",
+  "exllamav3==1.4.4",
+  "transformers>=4.57,<5",
+  "flash-linear-attention==0.5.2",
+  "huggingface_hub",
+  "safetensors",
+]
+all = [
+  "pytest>=8.0,<9", "pytest-cov>=5.0,<7", "jsonschema>=4.23,<5",
+  "ruff>=0.6,<1", "build>=1.2,<2",
+  "tantivy>=0.22,<1", "lancedb>=0.15,<1", "sqlite-vec>=0.1.1,<1",
+  "sentence-transformers>=2.5,<7", "transformers>=4.57,<5",
+  "docling>=2.0,<3", "unstructured[pdf]>=0.16,<1",
+  "requests>=2.31,<3", "trafilatura>=1.9,<3", "playwright>=1.45,<2",
+  "easyocr>=1.7,<2", "mcp>=1.0,<2",
+  "torch>=2.13", "exllamav3==1.4.4", "flash-linear-attention==0.5.2",
+  "huggingface_hub", "safetensors",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+markers = [
+  "requires_model: needs a local or downloaded model",
+  "requires_ollama: needs Ollama",
+  "requires_gpu: needs CUDA",
+  "slow: long-running experiment",
+]

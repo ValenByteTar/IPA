@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>IPA Deep Dive</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell">
+  <a href="/">← Volver al Control Room</a>
+  <section class="hero">
+    <div>
+      <span class="eyebrow">REPORTER / DEEP DIVE</span>
+      <h2 id="query">Cargando…</h2>
+      <p id="report-info" class="muted"></p>
+    </div>
+  </section>
+  <article class="card">
+    <h3>¿De qué trata este tópico?</h3>
+    <p id="topic-context">Cargando contexto…</p>
+  </article>
+  <article class="card">
+    <h3>Documentos del tópico</h3>
+    <div id="sources" class="document-list">Cargando fuentes…</div>
+  </article>
+  <article class="card">
+    <h3>Explicación</h3>
+    <div id="answer" class="viewer-body">Buscando evidencia…</div>
+    <div class="deep-dive-form" style="margin-top:16px">
+      <input type="text" id="question-input" placeholder="Escribí tu pregunta sobre este tópico…" style="flex:1;min-width:300px">
+      <button class="primary" onclick="rerunDeepDive()">Consultar</button>
+    </div>
+  </article>
+  <article class="card">
+    <h3>Claims y citas verificadas</h3>
+    <div id="claims"></div>
+  </article>
+</main>
+<script>
+const params = new URLSearchParams(location.search);
+const question = params.get('q') || 'Explica este tópico';
+const search = params.get('search') || question;
+const corpus = params.get('corpus') || '';
+const categoryId = params.get('category_id') || '';
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+const cleanToken = text => String(text ?? '').replace(/<\|im_(start|end)\|>/g, '').replace(/<\|endoftext\|>/g, '').replace(/<\/?think>/g, '');
+const sourceLink = document => {
+  const path = encodeURIComponent(document.original_path || '');
+  return path ? '<a href="/api/document/raw?path=' + path + '" target="_blank" rel="noopener">Abrir documento</a>' : '<span class="muted">Ruta no disponible</span>';
+};
+
+async function getJson(url) {
+  const response = await fetch(url, {cache: 'no-store'});
+  const data = await response.json();
+  if (!response.ok || data.error) throw new Error(data.error || ('HTTP ' + response.status));
+  return data;
+}
+
+let topicData = null;
+let documentIds = [];
+let conversation = []; // short conversational memory for this deep-dive session
+let activeAnswer = null;
+let resolvedCategoryId = categoryId;
+
+async function showChunkDetail(encodedChunkId) {
+  const chunkId = decodeURIComponent(encodedChunkId);
+  // Check if modal already exists
+  let modal = document.getElementById('chunk-modal');
+  if (!modal) {
+    modal = document.createElement('dialog');
+    modal.id = 'chunk-modal';
+    modal.style.cssText = 'border:1px solid #273142;border-radius:16px;background:#12161f;color:#edf2f7;padding:0;max-width:80vw;max-height:85vh;width:700px;';
+    modal.innerHTML = '<div style="padding:20px;overflow:auto;max-height:85vh"><div id="chunk-modal-content" class="viewer-body">Cargando…</div><div style="margin-top:16px;text-align:right"><button class="ghost" onclick="document.getElementById(\'chunk-modal\').close()">Cerrar</button></div></div>';
+    document.body.appendChild(modal);
+  }
+  modal.showModal();
+  const content = document.getElementById('chunk-modal-content');
+  content.innerHTML = '<p class="muted">Cargando chunk…</p>';
+  try {
+    const url = '/api/chunk/view?chunk_id=' + encodeURIComponent(chunkId) + '&corpus=' + encodeURIComponent(corpus);
+    const data = await getJson(url);
+    const doc = data.document || {};
+    content.innerHTML =
+      (doc.title ? '<h3>' + escapeHtml(doc.title) + '</h3>' : '') +
+      (doc.source_domain ? '<p class="muted">' + escapeHtml(doc.source_domain) + ' · ' + escapeHtml(doc.published_at || '') + '</p>' : '') +
+      '<div class="doc-reason" style="margin:12px 0">' + escapeHtml(data.text) + '</div>' +
+      (doc.original_path ? '<p><a href="/api/document/raw?path=' + encodeURIComponent(doc.original_path) + '" target="_blank" rel="noopener">Abrir documento completo →</a></p>' : '') +
+      '<p class="muted">chunk_id: ' + escapeHtml(data.chunk_id) + '</p>';
+  } catch (error) {
+    content.innerHTML = '<p class="bad">Error: ' + escapeHtml(error.message) + '</p>';
+  }
+}
+
+async function run() {
+  document.querySelector('#query').textContent = question;
+  const input = document.querySelector('#question-input');
+  if (input) input.value = question;
+  if (!resolvedCategoryId) {
+    const state = await getJson('/api/state');
+    const categories = state.reporter?.report?.categories || [];
+    const terms = question.toLowerCase().split(/[^a-záéíóúñ0-9]+/).filter(term => term.length >= 5);
+    const match = categories.map(topic => ({topic, score: terms.filter(term => String(topic.label || '').toLowerCase().includes(term)).length})).sort((a, b) => b.score - a.score)[0];
+    if (match && match.score > 0) resolvedCategoryId = match.topic.category_id;
+  }
+  if (resolvedCategoryId) {
+    topicData = await getJson('/api/topic?category_id=' + encodeURIComponent(resolvedCategoryId));
+    const topic = topicData.topic || {};
+    documentIds = topic.document_ids || [];
+    // Build a rich topic context: label + description + document titles
+    const documents = topicData.documents || [];
+    const docTitles = documents.map(d => d.title || d.document_id).filter(Boolean);
+    const contextParts = [];
+    if (topic.label) contextParts.push('<strong>' + escapeHtml(topic.label) + '</strong>');
+    if (topic.description && !topic.description.startsWith('Tópico agrupado')) contextParts.push(escapeHtml(topic.description));
+    if (docTitles.length) contextParts.push('<span class="muted">Documentos asociados:</span><ul style="margin:6px 0;padding-left:20px">' + docTitles.map(t => '<li>' + escapeHtml(t) + '</li>').join('') + '</ul>');
+    if (topic.evolution) contextParts.push('<span class="badge">' + escapeHtml(topic.evolution) + '</span> · <span class="badge">' + (topic.document_count || 0) + ' docs</span> · cohesión ' + Number(topic.cohesion || 0).toFixed(2));
+    document.querySelector('#topic-context').innerHTML = contextParts.length ? contextParts.join('<br><br>') : 'El reporte no contiene una descripción para este tópico.';
+    document.querySelector('#report-info').textContent = 'Reporte ' + (topicData.report?.report_id || 'sin ID') + ' · generado ' + (topicData.report?.generated_at || 'sin fecha');
+    document.querySelector('#sources').innerHTML = documents.length ? documents.map(document =>
+      '<div class="notice"><strong>' + escapeHtml(document.title || document.document_id) + '</strong><br>' +
+      '<span class="muted">' + escapeHtml(document.source_domain || 'fuente desconocida') + ' · ' + escapeHtml(document.published_at || 'fecha desconocida') + '</span>' +
+      (document.reason ? '<p class="doc-reason">' + escapeHtml(document.reason) + '</p>' : '') +
+      '<br><span class="muted">' + escapeHtml(document.document_id) + '</span><br>' + sourceLink(document) + '</div>'
+    ).join('') : '<span class="muted">No se encontraron documentos asociados a este tópico.</span>';
+  }
+
+  const retrieval = new URLSearchParams({corpus, query: question, search, agentic: '0'});
+  if (resolvedCategoryId) retrieval.set('category_id', resolvedCategoryId);
+  if (topicData?.report?.report_id) retrieval.set('report_id', topicData.report.report_id);
+  documentIds.forEach(documentId => retrieval.append('document_id', documentId));
+
+  // Use streaming endpoint for the answer
+  const answerEl = document.querySelector('#answer');
+  const claimsEl = document.querySelector('#claims');
+  answerEl.textContent = '';
+  answerEl.classList.add('streaming');
+  let fullAnswer = '';
+  let evidence = [];
+  let sourceDocuments = new Map((topicData?.documents || []).map(document => [document.document_id, document]));
+
+  try {
+    const response = await fetch('/api/deep-dive/stream?' + retrieval.toString(), {cache: 'no-store'});
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      let eventType = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          const data = JSON.parse(line.slice(6));
+          if (eventType === 'evidence') {
+            evidence = data.evidence || [];
+          } else if (eventType === 'token') {
+            fullAnswer += cleanToken(data.text || '');
+            answerEl.textContent = fullAnswer;
+            answerEl.scrollTop = answerEl.scrollHeight;
+          } else if (eventType === 'done') {
+            fullAnswer = data.answer || fullAnswer;
+            activeAnswer = fullAnswer;
+            conversation.push({role: 'user', content: question}, {role: 'assistant', content: fullAnswer});
+            answerEl.textContent = fullAnswer;
+            answerEl.classList.remove('streaming');
+            const claims = data.claims || [];
+            claimsEl.innerHTML = claims.length ? claims.map((claim, claimIdx) => {
+              const citations = (claim.validated_citations || claim.citations || []).map(number => {
+                const hit = evidence[number - 1];
+                const document = hit && sourceDocuments.get(hit.document_id);
+                const chunkId = hit ? hit.chunk_id : '';
+                const source = (hit && hit.source) || document || {};
+                if (source.source_url || source.canonical_url) {
+                  return '<a href="' + escapeHtml(source.source_url || source.canonical_url) + '" target="_blank" rel="noopener">[Doc ' + number + ']</a>';
+                }
+                if (chunkId) {
+                  return '<a href="#" onclick="showChunkDetail(\'' + encodeURIComponent(chunkId) + '\');return false">[Doc ' + number + ']</a>';
+                }
+                return document ? '<a href="/api/document/raw?path=' + encodeURIComponent(document.original_path || '') + '" target="_blank" rel="noopener">[Doc ' + number + ']</a>' : '<span>[Doc ' + number + ']</span>';
+              }).join(' ');
+              const status = claim.support_level || 'unsupported';
+              const firstCitation = (claim.validated_citations || claim.citations || [])[0];
+              const firstHit = firstCitation ? evidence[firstCitation - 1] : null;
+              const clickable = firstHit && firstHit.chunk_id ? ' style="cursor:pointer" onclick="showChunkDetail(\'' + encodeURIComponent(firstHit.chunk_id) + '\')"' : '';
+              return '<div class="status-row"' + clickable + '><span>' + escapeHtml(claim.text) + (citations ? ' <small>' + citations + '</small>' : '') + '</span><strong class="' + (status === 'supported' ? 'ok' : status === 'partial' ? 'warning' : 'bad') + '">' + escapeHtml(status) + '</strong></div>';
+            }).join('') : '<span class="muted">No se pudieron extraer claims verificables.</span>';
+          } else if (eventType === 'error') {
+            answerEl.textContent = 'Error: ' + (data.error || 'desconocido');
+            answerEl.classList.remove('streaming');
+          }
+        }
+      }
+    }
+  } catch (streamError) {
+    answerEl.classList.remove('streaming');
+    answerEl.textContent = 'No se pudo generar el deep dive: ' + streamError.message;
+  }
+}
+
+async function rerunDeepDive() {
+  const input = document.querySelector('#question-input');
+  if (!input || !input.value.trim()) return;
+  const newQuestion = input.value.trim();
+  document.querySelector('#query').textContent = newQuestion;
+  const answerElement = document.querySelector('#answer');
+  const previousAnswer = activeAnswer || '';
+  if (previousAnswer.trim()) conversation.push({role: 'assistant', content: previousAnswer});
+  answerElement.innerHTML = previousAnswer ? '<div class="chat-history">' + escapeHtml(previousAnswer) + '</div><hr><strong>Ahora:</strong> ' : '';
+  answerElement.classList.add('streaming');
+  document.querySelector('#claims').innerHTML = '';
+  let fullAnswer = '';
+  const sourceDocuments = new Map((topicData?.documents || []).map(document => [document.document_id, document]));
+  let evidence = [];
+  try {
+    const retrieval = new URLSearchParams({corpus, query: newQuestion, search, agentic: '0', history: JSON.stringify(conversation.slice(-6))});
+    if (resolvedCategoryId) retrieval.set('category_id', resolvedCategoryId);
+    if (topicData?.report?.report_id) retrieval.set('report_id', topicData.report.report_id);
+    documentIds.forEach(documentId => retrieval.append('document_id', documentId));
+    const response = await fetch('/api/deep-dive/stream?' + retrieval.toString(), {cache: 'no-store'});
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      let eventType = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          const data = JSON.parse(line.slice(6));
+          if (eventType === 'evidence') {
+            evidence = data.evidence || [];
+          } else if (eventType === 'token') {
+            fullAnswer += cleanToken(data.text || '');
+            answerElement.innerHTML = (previousAnswer ? '<div class="chat-history">' + escapeHtml(previousAnswer) + '</div><hr><strong>Ahora:</strong> ' : '') + escapeHtml(fullAnswer);
+          } else if (eventType === 'done') {
+            fullAnswer = data.answer || fullAnswer;
+            activeAnswer = fullAnswer;
+            conversation.push({role: 'user', content: newQuestion}, {role: 'assistant', content: fullAnswer});
+            answerElement.innerHTML = (previousAnswer ? '<div class="chat-history">' + escapeHtml(previousAnswer) + '</div><hr><strong>Ahora:</strong> ' : '') + escapeHtml(fullAnswer);
+            answerElement.classList.remove('streaming');
+            const claims = data.claims || [];
+            document.querySelector('#claims').innerHTML = claims.length ? claims.map(claim => {
+              const citations = (claim.validated_citations || claim.citations || []).map(number => {
+                const hit = evidence[number - 1];
+                const chunkId = hit ? hit.chunk_id : '';
+                const document = hit && sourceDocuments.get(hit.document_id);
+                const source = (hit && hit.source) || document || {};
+                if (source.source_url || source.canonical_url) {
+                  return '<a href="' + escapeHtml(source.source_url || source.canonical_url) + '" target="_blank" rel="noopener">[Doc ' + number + ']</a>';
+                }
+                if (chunkId) {
+                  return '<a href="#" onclick="showChunkDetail(\'' + encodeURIComponent(chunkId) + '\');return false">[Doc ' + number + ']</a>';
+                }
+                return document ? '<a href="/api/document/raw?path=' + encodeURIComponent(document.original_path || '') + '" target="_blank" rel="noopener">[Doc ' + number + ']</a>' : '<span>[Doc ' + number + ']</span>';
+              }).join(' ');
+              const status = claim.support_level || 'unsupported';
+              const firstCitation = (claim.validated_citations || claim.citations || [])[0];
+              const firstHit = firstCitation ? evidence[firstCitation - 1] : null;
+              const clickable = firstHit && firstHit.chunk_id ? ' style="cursor:pointer" onclick="showChunkDetail(\'' + encodeURIComponent(firstHit.chunk_id) + '\')"' : '';
+              return '<div class="status-row"' + clickable + '><span>' + escapeHtml(claim.text) + (citations ? ' <small>' + citations + '</small>' : '') + '</span><strong class="' + (status === 'supported' ? 'ok' : status === 'partial' ? 'warning' : 'bad') + '">' + escapeHtml(status) + '</strong></div>';
+            }).join('') : '<span class="muted">No se pudieron extraer claims verificables.</span>';
+          } else if (eventType === 'error') {
+            document.querySelector('#answer').textContent = 'Error: ' + (data.error || 'desconocido');
+            document.querySelector('#answer').classList.remove('streaming');
+          }
+        }
+      }
+    }
+  } catch (error) {
+    document.querySelector('#answer').textContent = 'Error: ' + error.message;
+    document.querySelector('#answer').classList.remove('streaming');
+  }
+}
+
+// Allow Enter key in the input
+document.addEventListener('DOMContentLoaded', () => {
+  const input = document.querySelector('#question-input');
+  if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') rerunDeepDive(); });
+});
+
+run().catch(error => {
+  document.querySelector('#sources').textContent = 'No se pudieron cargar las fuentes: ' + error.message;
+  document.querySelector('#answer').textContent = 'No se pudo generar el deep dive: ' + error.message;
+});
+</script>
+</body>
+</html>

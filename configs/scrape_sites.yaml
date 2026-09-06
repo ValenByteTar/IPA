@@ -1,0 +1,266 @@
+# Scrape sites configuration — deterministic article link extraction.
+#
+# Each site defines:
+#   url:             listing page URL
+#   days_back:       only scrape articles from last N days (0 = no filter)
+#   max_articles:    max articles to scrape per run (0 = unlimited)
+#   delay_seconds:   politeness delay between requests
+#   article_selector: CSS selector for article links (optional)
+#   url_pattern:     regex that article URL paths must match (optional)
+#   exclude_paths:   list of URL substrings to exclude (optional)
+#   rss_feed:        RSS/Atom feed URL for article discovery (optional)
+#   allowed_domains: additional domains to accept article links from
+#   paginate:        follow additional pages (default: false)
+#   max_pages:       max pages to fetch when paginating (default: 50)
+#   paginate_url_template: custom pagination URL with {n} placeholder
+#   trust_article_dates: use trafilatura dates for filtering (default: true)
+#
+# Strategy priority:
+#   1. rss_feed — parse feed for URLs with dates (best for date filtering)
+#   2. json_api_url — discover articles via JSON API (SPA sites)
+#   3. sitemap_url — parse sitemap for URLs
+#   4. article_selector (CSS) — most precise
+#   5. url_pattern (regex) — filters by URL structure
+#   6. exclude_paths — removes known non-article paths
+#   7. If none set → generic heuristics (less deterministic)
+
+sites:
+  # --- NVIDIA Developer Blog ---
+  - url: https://developer.nvidia.com/blog
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    rss_feed: "https://developer.nvidia.com/blog/feed"
+    url_pattern: "^/blog/[^/]+/?$"
+    exclude_paths:
+      - "/blog/category/"
+      - "/blog/tag/"
+      - "/blog/recent-posts/"
+
+  # --- OpenAI (RSS-first discovery) — TEMPORARILY DISABLED: hangs on HTTP request ---
+  # - url: https://openai.com/blog
+  #   days_back: 61
+  #   max_articles: 0
+  #   delay_seconds: 2.0
+  #   rss_feed: "https://openai.com/news/rss.xml"
+  #   url_pattern: "^/index/[^/]+/?$"
+  #   exclude_paths:
+  #     - "/research/index/publication/"
+  #     - "/research/index/conclusion/"
+  #     - "/research/index/milestone/"
+  #     - "/research/index/release/"
+
+  # --- Anthropic (no RSS, listing crawl) ---
+  - url: https://www.anthropic.com/news
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/(news|research)/[^/]+$"
+    trust_article_dates: false
+    exclude_paths:
+      - "/research/team/"
+      - "/claude/"
+      - "/solutions/"
+      - "/product/"
+      - "/legal/"
+      - "/partners/"
+      - "/company/"
+      - "/policy/"
+
+  # --- Anthropic Research (separate listing) ---
+  - url: https://www.anthropic.com/research
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/research/[^/]+$"
+    trust_article_dates: false
+    exclude_paths:
+      - "/research/team/"
+
+  # --- Claude Blog ---
+  - url: https://claude.com/blog
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/blog/[^/]+/?$"
+    exclude_paths:
+      - "/blog-category/"
+
+  # --- Google Blog (RSS-first) ---
+  - url: https://blog.google/rss/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    rss_feed: "https://blog.google/rss/"
+    url_pattern: "^/(innovation-and-ai|products-and-platforms|company-news|perspectives)/[^/]+/[^/]+/[^/]+/?$"
+
+  # --- vLLM Blog ---
+  - url: https://vllm.ai/blog
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 1.5
+    url_pattern: "^/blog/\\d{4}-\\d{2}-\\d{2}-[^/]+/?$"
+    exclude_paths:
+      - "/blog/tags/"
+      - "/blog/rss.xml"
+
+  # --- Emergent Mind (arxiv paper wrappers) ---
+  - url: https://www.emergentmind.com/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 1.5
+    url_pattern: "^/papers/[^/]+$"
+
+  # --- Microsoft Research Blog (paginated listing) ---
+  - url: https://www.microsoft.com/en-us/research/blog/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/en-us/research/blog/[^/]+/?$"
+    paginate: true
+    max_pages: 5
+    trust_article_dates: true
+
+  # --- Qwen AI (SPA — JSON API discovery) ---
+  - url: https://qwen.ai/blog
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    json_api_url: "https://qwen.ai/api/page_config?code=research.research-list"
+    json_api_id_field: "id"
+    json_api_url_template: "https://qwen.ai/blog?id={id}"
+    trust_article_dates: true
+
+  # --- The Hacker News (Blogger pagination, URL date filter) ---
+  - url: https://thehackernews.com/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 1.5
+    # Filter by URL: only September 2026 articles
+    url_pattern: "^/2026/09/[^/]+\\.html$"
+    trust_article_dates: false
+    paginate: true
+    max_pages: 10
+    paginate_url_template: "blogger"
+
+  # --- LabLab.ai (sitemap discovery) ---
+  # Sitemap lists ALL historical articles. trust_article_dates: false
+  # disables date filtering, so max_articles caps the scrape to avoid
+  # pulling the entire archive.
+  - url: https://lablab.ai/ai-tutorials
+    days_back: 1
+    max_articles: 50
+    delay_seconds: 1.5
+    sitemap_url: "https://lablab.ai/sitemap.xml"
+    url_pattern: "^/(ai-tutorials|ai-articles|blog)/[^/]+$"
+    trust_article_dates: false
+
+  # --- BleepingComputer (Cloudflare-protected) ---
+  - url: https://www.bleepingcomputer.com/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 1.5
+    url_pattern: "^/news/[^/]+/$"
+    engine: playwright
+    trust_article_dates: false
+
+  # --- CISA Cybersecurity Advisories (paginated ?page=N) ---
+  - url: https://www.cisa.gov/news-events/cybersecurity-advisories
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/news-events/cybersecurity-advisories/[a-z0-9-]+"
+    exclude_paths:
+      - "/news-events/cybersecurity-advisories/all"
+      - "/news-events/cybersecurity-advisories/page/"
+    trust_article_dates: true
+    paginate: true
+    max_pages: 5
+
+  # --- CISA News & Events (general site) ---
+  - url: https://www.cisa.gov/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/news-events/[^/]+/[a-z0-9-]+"
+    exclude_paths:
+      - "/news-events/news"
+      - "/news-events/cybersecurity-advisories/all"
+      - "/news-events/cybersecurity-advisories/page/"
+      - "/news-events/events"
+    trust_article_dates: false
+
+  # --- Meta AI Research ---
+  - url: https://ai.meta.com/research/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/blog/[^/]+/?$"
+    allowed_domains:
+      - "research.meta.ai"
+    exclude_paths:
+      - "/static-resource/"
+
+  # --- OffSec Blog (paginated /blog/N/) ---
+  - url: https://www.offsec.com/blog/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/blog/[a-z][a-z0-9-]+/?$"
+    paginate: true
+    max_pages: 5
+    paginate_url_template: "https://www.offsec.com/blog/{n}/"
+    trust_article_dates: true
+
+  # --- NetSPI Blog (executive + technical, no pagination) ---
+  - url: https://www.netspi.com/blog/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/blog/(executive-blog|technical-blog)/[^/]+/[^/]+/?$"
+    trust_article_dates: false
+
+  # --- NetSPI Podcast (episodes, no pagination) ---
+  - url: https://www.netspi.com/podcast/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/podcast/[^/]+/?$"
+    trust_article_dates: false
+
+  # --- NetSPI Newsroom (press releases + news, no pagination) ---
+  - url: https://www.netspi.com/newsroom/
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/newsroom/(netspi-in-the-news|press-release)/[^/]+/?$"
+    trust_article_dates: false
+
+  # --- Cobalt Blog (paginated /blog/page/N/) ---
+  - url: https://www.cobalt.io/blog
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/blog/[a-z][a-z0-9-]+/?$"
+    exclude_paths:
+      - "/blog/page/"
+      - "/blog/author/"
+      - "/blog/category/"
+      - "/blog/rss.xml"
+    paginate: true
+    max_pages: 5
+    paginate_url_template: "https://www.cobalt.io/blog/page/{n}"
+    trust_article_dates: true
+
+  # --- Internet Security Auditors Blog (ISEC) ---
+  - url: https://blog.isecauditors.com/en
+    days_back: 1
+    max_articles: 0
+    delay_seconds: 2.0
+    # Articles: /en/<slug> — exclude archive, author, tag paths
+    url_pattern: "^/en/[a-z0-9][a-z0-9-]+/?$"
+    exclude_paths:
+      - "/en/archive/"
+      - "/en/author/"
+      - "/en/tag/"
+    trust_article_dates: false

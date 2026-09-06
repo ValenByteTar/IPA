@@ -1,0 +1,51 @@
+# RES-023 lab core; Python 3.12 recommended
+PyYAML>=6.0.1,<7
+rich>=13.7.0,<15
+pytest>=8.0,<9
+pytest-cov>=5.0,<7
+
+# Fast local document path
+PyMuPDF>=1.23.0,<2
+rank-bm25>=0.2.2,<1
+numpy>=1.26.0,<3
+
+# Optional adapters: install only for the experiment being run
+# E6: lexical index competition
+tantivy>=0.22,<1
+
+# E7: vector index competition
+lancedb>=0.15,<1
+sqlite-vec>=0.1.1,<1
+sentence-transformers>=2.5,<7
+
+# E3: parser competition
+docling>=2.0,<3
+unstructured[pdf]>=0.16,<1
+
+# E5: chunker competition
+langchain-text-splitters>=0.3,<1
+tiktoken>=0.7,<1
+
+# Future experiments (not yet installed)
+# chromadb>=0.4.22,<2
+# qdrant-client>=1.9,<2
+# ollama>=0.1,<1
+# rapidfuzz>=3.6,<4
+# spacy>=3.7,<4
+# faster-whisper>=1.0,<2
+# crawl4ai>=0.4,<1
+# opentelemetry-api>=1.25,<2
+# opentelemetry-sdk>=1.25,<2
+
+# Tutor Agent — modelo estrella Qwen3.5-9B EXL3 3.0bpw + MTP
+# Instalar con index-url específico para CUDA:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# La extensión exllamav3_ext se compila localmente (ver exllamav3-dev/).
+# Versiones probadas: torch 2.13.0+cu126, exllamav3 1.4.4, transformers 4.57.6,
+# flash-linear-attention 0.5.2.
+torch>=2.13.0
+exllamav3==1.4.4
+transformers>=4.57,<5
+flash-linear-attention==0.5.2
+huggingface_hub
+safetensors

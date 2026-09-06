@@ -1,0 +1,7 @@
+{
+  "fixture": true,
+  "source": "res023-lab-synthetic",
+  "description": "Generated JSON sample for MIME routing and structured parsing tests.",
+  "stages": ["landing", "parsing", "chunking", "indexing"],
+  "counts": {"pages": 2, "chunks": 8, "tokens": 350}
+}

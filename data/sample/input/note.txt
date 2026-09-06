@@ -1,0 +1,18 @@
+RES-023 Lab — Synthetic Text Fixture
+=====================================
+
+This file is a generated sample for testing the ingestion pipeline.
+It contains no personal data, secrets, or copyrighted content.
+
+Section A: Purpose
+The fast path must produce a canonical document and BM25 availability
+before any embedding or enrichment runs.
+
+Section B: Lifecycle
+received -> accepted -> parsing -> chunked -> indexed -> published
+
+Section C: Invariants
+- original_artifact_is_immutable
+- every_derived_record_has_input_hash
+- every_search_hit_has_provenance
+- base_lexical_index_can_exist_without_embeddings

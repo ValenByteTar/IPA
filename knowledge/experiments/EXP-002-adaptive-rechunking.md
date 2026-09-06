@@ -1,0 +1,37 @@
+---
+id: EXP-002
+category: experiment
+status: accepted
+created: 2026-09-05
+updated: 2026-09-05
+author: human
+components: [chunking, retrieval, ingestion]
+tags: [adaptive, rechunking, lexical-density, fallback]
+related: [BM-004, PAT-002]
+supersedes: null
+superseded_by: null
+---
+
+# EXP-002 — Adaptive rechunking
+
+## Hipótesis
+
+Reagrupar sólo documentos con baja densidad lexical puede reducir chunks problemáticos sin degradar recall documental.
+
+## Configuración
+
+- Corpus analizado: 720 documentos.
+- Activación: más del 30% de chunks de un documento con lexical density menor que 0,4.
+- Estrategia: merge adyacente y fallback recursive cuando fuese necesario.
+- Artefacto: `outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json`.
+
+## Resultados
+
+- 30 documentos activaron el proceso.
+- Se realizaron 181 merges y se generaron 97 chunks de fallback.
+- El delta total fue de -153 chunks.
+- Recall documental@10 se mantuvo en 1,0 para el corpus activado.
+
+## Conclusión
+
+La estrategia es segura para el corpus probado y puede usarse como operación derivada selectiva. No debe reemplazar automáticamente el baseline fixed-window en todo el corpus.

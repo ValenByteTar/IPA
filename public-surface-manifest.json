@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "project": "ipa",
+  "public": {
+    "package": "src/ipa",
+    "contracts": "contracts",
+    "tests": "tests",
+    "fixtures": "data/sample",
+    "documentation": ["README.md", "docs", "knowledge"],
+    "entrypoints": ["scripts", "tools"]
+  },
+  "local_externalized": {
+    "corpus": ["Landing", "Archive"],
+    "models": ["models", "exllamav3-dev"],
+    "generated": ["outputs", ".pytest_cache"],
+    "archive": ["local_archive"]
+  },
+  "compatibility": {
+    "legacy_package": "res023_lab",
+    "target_package": "ipa",
+    "migration": "facade-first"
+  },
+  "rules": [
+    "contracts are authoritative",
+    "tools are adapters",
+    "generated artifacts are never runtime authority",
+    "local corpus and models are not committed",
+    "deletions require explicit review"
+  ]
+}

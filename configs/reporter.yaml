@@ -1,0 +1,26 @@
+reporter:
+  corpus_id: default
+  period:
+    start: "2026-08-01T00:00:00Z"
+    end: "2026-09-01T00:00:00Z"
+    label: "2026-08"
+  interests: []
+  quality_threshold: 0.25
+  category_generation:
+    min_documents: 2
+    allow_singleton_topics: false
+    max_hierarchy_depth: 2
+    similarity_threshold: 0.35
+  ranking:
+    novelty: 0.25
+    source_quality: 0.20
+    source_diversity: 0.20
+    potential_impact: 0.20
+    user_interest: 0.15
+  research:
+    enabled: true
+    require_approval: true
+    max_urls: 20
+    max_seconds: 600
+    max_bytes: 50000000
+    max_depth: 2

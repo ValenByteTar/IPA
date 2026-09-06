@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/assessment_result.schema.json",
+  "title": "AssessmentResult",
+  "description": "Structured, auditable evaluation of a learner response against an explicit rubric.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["assessment_id", "session_id", "concept_id", "assessment_type", "answer_hash", "rubric_id", "score", "status", "strengths", "gaps", "misconceptions", "evidence", "recommended_action", "created_at", "generation", "field_origins"],
+  "properties": {
+    "assessment_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "session_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "concept_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "assessment_type": {
+      "type": "string",
+      "enum": ["retrieval", "explanation", "application", "critique", "transfer", "misconception_correction"],
+      "x-field-origin": "system"
+    },
+    "answer_hash": { "$ref": "tutor_common.schema.json#/$defs/hash", "x-field-origin": "user" },
+    "rubric_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "score": { "type": "number", "minimum": 0, "maximum": 1, "x-field-origin": "generated" },
+    "status": { "$ref": "tutor_common.schema.json#/$defs/masteryStatus", "x-field-origin": "generated" },
+    "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "x-field-origin": "system" },
+    "strengths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "x-field-origin": "generated"
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "x-field-origin": "generated"
+    },
+    "misconceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "correction", "evidence"],
+        "properties": {
+          "claim": { "type": "string", "minLength": 1 },
+          "correction": { "type": "string", "minLength": 1 },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" }
+          }
+        }
+      },
+      "x-field-origin": "generated"
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+      "x-field-origin": "source"
+    },
+    "recommended_action": {
+      "type": "string",
+      "enum": ["advance", "guided_retry", "practical_retry", "review_prerequisite", "correct_misconception", "research_gap", "human_review"],
+      "x-field-origin": "generated"
+    },
+    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["answer_hash", "score", "status", "strengths", "gaps", "misconceptions", "evidence", "recommended_action"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "misconception" } }, "required": ["status"] },
+      "then": { "properties": { "misconceptions": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "recommended_action": { "const": "advance" } }, "required": ["recommended_action"] },
+      "then": { "properties": { "score": { "minimum": 0.7 } } }
+    }
+  ]
+}

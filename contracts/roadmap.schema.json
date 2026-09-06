@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/roadmap.schema.json",
+  "title": "Roadmap",
+  "description": "Versioned 3-7 unit learning roadmap that requires explicit human approval before activation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["roadmap_id", "goal_id", "version", "status", "units", "assumptions", "uncertainties", "change_reason", "previous_roadmap_id", "created_at", "approval", "generation", "field_origins"],
+  "properties": {
+    "roadmap_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "goal_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "user" },
+    "version": { "type": "integer", "minimum": 1, "x-field-origin": "system" },
+    "status": { "type": "string", "enum": ["proposed", "approved", "active", "completed", "superseded", "rejected"], "x-field-origin": "system" },
+    "units": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unit_id", "order", "concept_id", "reason", "estimated_effort_minutes", "source_refs", "assessment_types"],
+        "properties": {
+          "unit_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+          "order": { "type": "integer", "minimum": 1, "x-field-origin": "system" },
+          "concept_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "source" },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 1000, "x-field-origin": "generated" },
+          "estimated_effort_minutes": { "type": "integer", "minimum": 5, "maximum": 1440, "x-field-origin": "generated" },
+          "source_refs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+            "x-field-origin": "source"
+          },
+          "assessment_types": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": ["retrieval", "explanation", "application", "critique", "transfer", "misconception_correction"]
+            },
+            "x-field-origin": "generated"
+          }
+        }
+      },
+      "x-field-origin": "generated"
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "x-field-origin": "generated"
+    },
+    "uncertainties": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "x-field-origin": "generated"
+    },
+    "change_reason": { "type": ["string", "null"], "maxLength": 2000, "x-field-origin": "user_or_generated" },
+    "previous_roadmap_id": {
+      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "x-field-origin": "system"
+    },
+    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "approval": {
+      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/humanApproval" }, { "type": "null" }],
+      "x-field-origin": "user"
+    },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["goal_id", "units", "assumptions", "uncertainties", "change_reason"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "enum": ["approved", "active", "completed", "superseded"] } }, "required": ["status"] },
+      "then": { "properties": { "approval": { "$ref": "tutor_common.schema.json#/$defs/humanApproval" } } }
+    },
+    {
+      "if": { "properties": { "version": { "minimum": 2 } }, "required": ["version"] },
+      "then": {
+        "properties": {
+          "previous_roadmap_id": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+          "change_reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      }
+    }
+  ]
+}

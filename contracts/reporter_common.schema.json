@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/reporter_common.schema.json",
+  "title": "ReporterCommonDefinitions",
+  "type": "object",
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$" },
+    "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sourceRef": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_id", "source_type"],
+      "properties": {
+        "source_id": { "$ref": "#/$defs/identifier" },
+        "source_type": { "type": "string", "enum": ["artifact", "document", "chunk", "url"] },
+        "content_hash": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] }
+      }
+    },
+    "generation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generator", "generated_at", "input_hash", "model_fingerprint"],
+      "properties": {
+        "generator": { "type": "string", "minLength": 1 },
+        "generated_at": { "$ref": "#/$defs/timestamp" },
+        "input_hash": { "$ref": "#/$defs/hash" },
+        "model_fingerprint": { "type": "string", "minLength": 1 },
+        "prompt_fingerprint": { "type": ["string", "null"] }
+      }
+    },
+    "approval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decision", "decided_at", "decided_by"],
+      "properties": {
+        "decision": { "type": "string", "enum": ["approved", "rejected", "changes_requested"] },
+        "decided_at": { "$ref": "#/$defs/timestamp" },
+        "decided_by": { "type": "string", "minLength": 1 },
+        "note": { "type": ["string", "null"] }
+      }
+    },
+    "origin": { "type": "string", "enum": ["source", "user", "generated", "system", "mixed"] }
+  }
+}

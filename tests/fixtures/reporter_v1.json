@@ -1,0 +1,11 @@
+{
+  "benchmark_id": "reporter-v1",
+  "description": "Controlled claim and citation checks for Reporter deep dives.",
+  "cases": [
+    {"id": "supported", "answer": "PagedAttention uses dynamic blocks [1].", "evidence": ["PagedAttention uses dynamic blocks for KV cache."], "expected": "supported"},
+    {"id": "unreferenced", "answer": "The system is universally faster.", "evidence": ["The system improved throughput in one workload."], "expected": "unsupported"},
+    {"id": "overclaim", "answer": "The system reaches 4x throughput [1].", "evidence": ["The system reaches 2x throughput in one benchmark."], "expected": "partial"},
+    {"id": "partial", "answer": "KV cache creates memory pressure [1].", "evidence": ["KV cache can limit batch size for long requests."], "expected": "partial"},
+    {"id": "bad_citation", "answer": "This is a claim [9].", "evidence": ["A source exists."], "expected": "unsupported"}
+  ]
+}

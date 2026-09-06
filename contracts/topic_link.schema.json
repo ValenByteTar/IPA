@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/topic_link.schema.json",
+  "title": "TopicLink",
+  "description": "Auditable continuity relation between categories in different Reporter periods.",
+  "type": "object", "additionalProperties": false,
+  "required": ["current_category_id", "previous_category_id", "relation", "score", "evidence", "reason", "review_status", "generation", "field_origins"],
+  "properties": {
+    "current_category_id": { "$ref": "reporter_common.schema.json#/$defs/identifier" },
+    "previous_category_id": { "anyOf": [{ "$ref": "reporter_common.schema.json#/$defs/identifier" }, { "type": "null" }] },
+    "relation": { "type": "string", "enum": ["new", "stable", "growing", "declining", "split", "merged", "disappeared", "ambiguous"] },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "reporter_common.schema.json#/$defs/sourceRef" } },
+    "reason": { "type": "string", "minLength": 1 },
+    "review_status": { "type": "string", "enum": ["pending", "reviewed"] },
+    "generation": { "$ref": "reporter_common.schema.json#/$defs/generation" },
+    "field_origins": { "type": "object", "additionalProperties": { "$ref": "reporter_common.schema.json#/$defs/origin" }, "required": ["relation", "score", "reason"] }
+  }
+}

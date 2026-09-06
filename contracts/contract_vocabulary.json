@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.1",
+  "records": {
+    "ArtifactRef": ["artifact_id", "content_hash", "source_uri", "mime_type", "original_filename", "byte_size", "received_at"],
+    "ProcessingManifest": ["artifact_id", "stages", "status", "attempts"],
+    "ParserResult": ["artifact_id", "parser_id", "status", "canonical_document"],
+    "CanonicalDocument": ["document_id", "pages", "elements", "source_spans"],
+    "DocumentChunk": ["chunk_id", "document_id", "content_hash", "text", "metadata"],
+    "SourceSpan": ["artifact_id", "page", "offset_start", "offset_end"],
+    "EmbeddingRecord": ["chunk_id", "embedding_fingerprint", "vector", "status"],
+    "SearchHit": ["chunk_id", "score", "source_span", "retrieval_backend"],
+    "KnowledgeDelta": ["delta_id", "input_hashes", "claims", "validation"],
+    "KnowledgeState": ["state_version", "deltas", "promoted_at"],
+    "LearningGoal": ["goal_id", "title", "description", "status", "success_criteria", "approval", "field_origins"],
+    "Concept": ["concept_id", "title", "definition", "status", "prerequisite_ids", "source_refs", "generation", "field_origins"],
+    "Roadmap": ["roadmap_id", "goal_id", "version", "status", "units", "approval", "generation", "field_origins"],
+    "AssessmentResult": ["assessment_id", "session_id", "concept_id", "answer_hash", "rubric_id", "score", "status", "evidence", "generation", "field_origins"],
+    "ResearchRequest": ["request_id", "goal_id", "concept_id", "question", "trigger", "gap_evidence", "allowed_domains", "budget", "status", "approval", "generation", "field_origins"],
+    "ReporterReport": ["report_id", "corpus_id", "period", "status", "categories", "source_refs", "generation", "field_origins"],
+    "ReporterDocumentDecision": ["decision_id", "report_id", "document_id", "artifact_id", "decision", "scores", "evidence", "review_status", "generation", "field_origins"],
+    "TopicLink": ["current_category_id", "previous_category_id", "relation", "score", "evidence", "generation", "field_origins"]
+  },
+  "invariants": [
+    "original_artifact_is_immutable",
+    "every_derived_record_has_input_hash",
+    "every_search_hit_has_provenance",
+    "external_tools_do_not_write_authoritative_state",
+    "base_lexical_index_can_exist_without_embeddings",
+    "generated_tutor_fields_have_generation_provenance",
+    "source_backed_tutor_fields_have_source_references",
+    "confirmed_goals_require_human_approval",
+    "active_roadmaps_require_human_approval",
+    "research_execution_requires_human_approval",
+    "mastery_is_supported_by_assessment_evidence",
+    "reporter_categories_are_emergent",
+    "reporter_rejections_do_not_delete_artifacts",
+    "reporter_promotion_requires_human_approval",
+    "reporter_reports_are_corpus_fingerprinted"
+  ]
+}

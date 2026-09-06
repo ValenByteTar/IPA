@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/experiment_report.schema.json",
+  "title": "ExperimentReport",
+  "description": "Machine-readable report for a single experiment run. Mirrors experiments/EXPERIMENT_TEMPLATE.md and the common protocol in EXPERIMENT_MATRIX.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "experiment_id", "candidate_id", "capability", "adapter_version",
+    "tool_version", "hardware", "input_manifest_hash",
+    "configuration_fingerprint", "output_hash", "started_at", "finished_at",
+    "status", "controls", "results", "decision"
+  ],
+  "properties": {
+    "experiment_id": {
+      "type": "string",
+      "description": "Matches the E0-E11 identifier from EXPERIMENT_MATRIX.md, optionally suffixed with a run index.",
+      "pattern": "^E(\\d+)(\\.[A-Za-z0-9_-]+)?$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "description": "Identifier of the candidate tool/adapter under test."
+    },
+    "capability": {
+      "type": "string",
+      "enum": [
+        "contract_compliance", "intake_landing", "mime_routing", "pdf_parsing",
+        "ocr", "chunking", "lexical_index", "vector_index", "queue_workflow",
+        "semantic_enrichment", "end_to_end", "observability"
+      ]
+    },
+    "adapter_version": { "type": "string" },
+    "tool_version": { "type": "string" },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "ram_gb"],
+      "properties": {
+        "cpu": { "type": "string" },
+        "ram_gb": { "type": "number", "minimum": 0 },
+        "gpu": { "type": ["string", "null"] },
+        "disk_gb": { "type": ["number", "null"] }
+      }
+    },
+    "input_manifest_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the input manifest JSONL, prefixed with sha256:.",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "configuration_fingerprint": {
+      "type": "string",
+      "description": "Hash of the exact configuration used for this run."
+    },
+    "output_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the primary output artifact, prefixed with sha256:."
+    },
+    "output_uri": {
+      "type": ["string", "null"],
+      "description": "Path or URI of the primary output artifact whose hash is output_hash. Null when the run produced no artifact."
+    },
+    "output_artifacts": {
+      "type": "array",
+      "description": "All output artifacts produced by this run with their individual hashes.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "hash"],
+        "properties": {
+          "path": { "type": "string" },
+          "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "status": {
+      "type": "string",
+      "enum": ["running", "completed", "failed", "aborted"]
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "errors": { "type": "array", "items": { "type": "string" } },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["same_input_manifest", "same_contract_version", "same_ground_truth", "isolated_output_namespace", "no_production_writes"],
+      "properties": {
+        "same_input_manifest": { "type": "boolean" },
+        "same_contract_version": { "type": "boolean" },
+        "same_ground_truth": { "type": "boolean" },
+        "same_hardware": { "type": "boolean" },
+        "isolated_output_namespace": { "type": "boolean" },
+        "no_production_writes": { "type": "boolean" }
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quality": { "type": ["string", "null"] },
+        "throughput": { "type": ["number", "null"] },
+        "latency_p50_ms": { "type": ["number", "null"] },
+        "latency_p95_ms": { "type": ["number", "null"] },
+        "memory_mb": { "type": ["number", "null"] },
+        "recovery": { "type": ["string", "null"] },
+        "backpressure": { "type": ["string", "null"] },
+        "privacy_licensing": { "type": ["string", "null"] },
+        "custom": {
+          "type": "object",
+          "description": "Capability-specific metrics (e.g. CER for OCR, recall@k for retrieval).",
+          "additionalProperties": { "type": ["number", "string", "boolean", "null"] }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "rationale"],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["negative", "observed", "experimental", "candidate", "preferred", "production"]
+        },
+        "rationale": { "type": "string" },
+        "applicable_workloads": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
