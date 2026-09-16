@@ -68,7 +68,7 @@
     },
     "fieldOrigin": {
       "type": "string",
-      "enum": ["source", "user", "generated", "system", "mixed"]
+      "enum": ["source", "user", "generated", "system", "mixed", "user_or_generated", "user_or_system_policy", "system_policy", "generated_or_user"]
     }
   }
 }

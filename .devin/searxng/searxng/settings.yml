@@ -1,0 +1,30 @@
+use_default_settings: true
+
+server:
+  bind_address: 0.0.0.0
+  port: 8080
+  secret_key: ipa-local-searxng-development-key-change-me
+  base_url: http://127.0.0.1:8888/
+  image_proxy: false
+  limiter: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: arxiv
+    disabled: false

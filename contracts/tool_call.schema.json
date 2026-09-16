@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/tool_call.schema.json",
+  "title": "ToolCall",
+  "description": "Deterministic tool invocation record: one call from an agent episode with bounded arguments. Tools never reason or call an LLM; they receive arguments, query stores, and return structured results (Fase 1, DEC-002).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tool_call_id", "session_id", "episode_id", "tool_name", "arguments", "called_at", "status"],
+  "properties": {
+    "tool_call_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "session_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "episode_id": {
+      "$ref": "agent_common.schema.json#/$defs/identifier",
+      "description": "Episode that triggered this call. May differ from the episode that records the result when the call spans multiple turns."
+    },
+    "tool_name": {
+      "type": "string",
+      "enum": ["search_corpus", "list_topics", "get_topic_info", "recall_conversation", "research_topic"],
+      "description": "Deterministic tool. New tools extend this enum by superseding the schema."
+    },
+    "arguments": {
+      "type": "object",
+      "description": "Bounded input arguments for the tool. Schema varies per tool_name; validated at runtime by the tool implementation.",
+      "minProperties": 0
+    },
+    "called_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "completed", "failed"]
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Error message when status is failed; null otherwise."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["pending", "running", "completed"] } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "null" } } }
+    }
+  ]
+}

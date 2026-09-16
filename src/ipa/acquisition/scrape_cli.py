@@ -96,6 +96,9 @@ def main() -> None:
                         default="auto", help="Fetch engine: requests (fast), playwright (JS-rendered), auto (try requests then playwright)")
     parser.add_argument("--headed", action="store_true", help="Show browser window (Playwright, for debugging)")
     parser.add_argument("--report", default=None, help="Save JSON report to this path")
+    parser.add_argument("--clear-history", action="store_true",
+                        help="Clear scrape_history.db before scraping (re-scrape everything). "
+                             "Use when you want to re-discover articles that were already scraped.")
     args = parser.parse_args()
 
     # Build site list
@@ -148,6 +151,27 @@ def main() -> None:
 
     # Scrape
     output_dir = Path(args.output)
+    # Clear history if requested (re-scrape everything).
+    # Limpiar las tablas en vez de borrar el archivo: si lo borramos,
+    # 5 workers paralelos intentan recrearlo simultáneamente y SQLite
+    # tira "database is locked" (race condition del 2026-09-08).
+    if args.clear_history:
+        history_db = output_dir / "scrape_history.db"
+        if history_db.exists():
+            import sqlite3
+            conn = sqlite3.connect(str(history_db), timeout=30)
+            try:
+                conn.execute("DELETE FROM scraped_urls")
+                conn.execute("DELETE FROM scrape_jobs")
+                conn.commit()
+                print(f"  [scraper] Cleared scrape history: {history_db}")
+            except Exception:
+                # Si las tablas no existen, borrar y recrear
+                conn.close()
+                history_db.unlink()
+                print(f"  [scraper] Cleared scrape history (file): {history_db}")
+            else:
+                conn.close()
     all_results = []
     total_articles = 0
     total_images = 0

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/agent_common.schema.json",
+  "title": "AgentCommonDefinitions",
+  "type": "object",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["general", "tutor"],
+      "description": "Active agent role. New roles extend this enum by superseding the schema (DEC-002)."
+    },
+    "interface": {
+      "type": "string",
+      "enum": ["cli", "dashboard"],
+      "description": "Surface that opened the session. New surfaces extend the enum by superseding the schema."
+    },
+    "turnRole": {
+      "type": "string",
+      "enum": ["user", "assistant", "tool"]
+    },
+    "identityHash": {
+      "$ref": "#/$defs/hash",
+      "description": "sha256 of the active agent_identity.yaml content when the record was written."
+    },
+    "sessionStatus": {
+      "type": "string",
+      "enum": ["active", "closed"]
+    }
+  }
+}

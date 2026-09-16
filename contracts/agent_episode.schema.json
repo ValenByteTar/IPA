@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/agent_episode.schema.json",
+  "title": "AgentEpisode",
+  "description": "Append-only episodic memory record: one turn of one session. Canonical flat record; any vector index over episodes is a derived representation rebuilt from the flat store (DEC-002).",
+  "type": "object", "additionalProperties": false,
+  "required": ["episode_id", "session_id", "interface", "role", "turn_role", "content", "content_hash", "identity_hash", "created_at"],
+  "properties": {
+    "episode_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "session_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "interface": { "$ref": "agent_common.schema.json#/$defs/interface" },
+    "role": { "$ref": "agent_common.schema.json#/$defs/role" },
+    "turn_role": { "$ref": "agent_common.schema.json#/$defs/turnRole" },
+    "content": { "type": "string", "minLength": 1 },
+    "content_hash": { "$ref": "agent_common.schema.json#/$defs/hash" },
+    "identity_hash": { "$ref": "agent_common.schema.json#/$defs/identityHash" },
+    "topic_cluster_id": {
+      "anyOf": [{ "$ref": "agent_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "description": "Nullable until Fase 3 links episodes to the topic hierarchy."
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+      "description": "Tool call identifiers executed during this turn (tool_call contracts arrive in Fase 1)."
+    },
+    "created_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" }
+  }
+}

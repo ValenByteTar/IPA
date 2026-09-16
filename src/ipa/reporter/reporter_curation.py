@@ -1,14 +1,152 @@
-﻿"""Deterministic curation and deduplication for Reporter documents."""
+"""Deterministic curation and deduplication for Reporter documents."""
 from __future__ import annotations
 
 import hashlib
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from ipa.reporter.reporter_contracts import ReporterDecision, ReporterDocumentDecision, ReviewStatus, ScoreBundle, generation_provenance
+
+
+# ---------------------------------------------------------------------------
+# Tiered curation (ranking-based, not absolute-threshold-based).
+#
+# The legacy promotion_score() + auto_promotion_eligible() path uses fixed
+# absolute thresholds (relevance>=0.80, score>=0.78, etc.). Those thresholds
+# were never calibrated against ground truth, so using them as hard gates is
+# fragile: a doc with score 0.77 is treated very differently from 0.78 even
+# though the score is not calibrated.
+#
+# NOTE: auto_promotion_eligible() is still used by curate_documents() to mark
+# curation decisions as review_status=approved/pending (metadata only).
+# Physical promotion to the main corpus is now decided by
+# ipa.agentic.promotion_policy, which uses provenance (configured_scrape vs
+# agent_research) + score thresholds, independent of the report.
+#
+# The tiered path ranks documents WITHIN the current batch and assigns tiers
+# by percentile. This is robust to score-scale drift and does not require
+# calibration. The LLM judge (curation_judge.py) only sees the gray tier.
+# ---------------------------------------------------------------------------
+
+# Default tier boundaries (percentiles within the batch of PROMOTE-eligible
+# candidates after dedup/period/quality gates). Tunable via calibration.
+DEFAULT_AUTO_PROMOTE_PERCENTILE = 0.80  # top 20% of ranked candidates
+DEFAULT_AUTO_REJECT_PERCENTILE = 0.40   # bottom 60% → auto-reject
+# Between 0.40 and 0.80 = gray tier → LLM judge
+
+
+@dataclass(frozen=True)
+class CurationTier:
+    """Resultado de la clasificación por ranking de un documento.
+
+    El tier indica qué camino sigue el documento en la cascada:
+      - auto_promote: pasa directo (top del ranking, sin LLM)
+      - auto_reject: rechazado (bottom del ranking, sin LLM)
+      - gray: zona gris → LLM judge con think_mode
+      - hard_reject: rechazado por gate duro (duplicado, fuera de período,
+        sin texto, quality gate del scraper) — no depende del ranking
+    """
+    document_id: str
+    tier: str  # "auto_promote" | "auto_reject" | "gray" | "hard_reject"
+    rank: int  # 1-based rank within the batch (1 = best)
+    percentile: float  # 0.0 (worst) .. 1.0 (best) within the batch
+    score: float  # promotion_score value (for transparency/debugging)
+    reason: str
+    scores: ScoreBundle
+    decision: ReporterDecision  # the underlying ReporterDecision
+    duplicate_of: str | None
+
+
+def _percentile_rank(values: list[float]) -> list[float]:
+    """Convierte scores absolutos a percentiles dentro del lote.
+
+    Devuelve, para cada valor, su posición relativa en [0.0, 1.0].
+    1.0 = el mejor del lote, 0.0 = el peor. Empates se resuelven por orden
+    de aparición (estable).
+    """
+    if not values:
+        return []
+    sorted_vals = sorted(values, reverse=True)
+    n = len(values)
+    out: list[float] = []
+    for v in values:
+        # Posición del valor en el ranking descendente, normalizada.
+        rank_pos = sorted_vals.index(v)
+        out.append(1.0 - (rank_pos / max(n - 1, 1)))
+    return out
+
+
+def classify_tiers(
+    decisions: list[ReporterDocumentDecision],
+    *,
+    auto_promote_percentile: float = DEFAULT_AUTO_PROMOTE_PERCENTILE,
+    auto_reject_percentile: float = DEFAULT_AUTO_REJECT_PERCENTILE,
+) -> list[CurationTier]:
+    """Clasifica decisiones de curación en tiers por ranking del lote.
+
+    Solo los documentos con decision=PROMOTE y sin duplicate_of entran al
+    ranking. Los demás (DUPLICATE, DEFER, IRRELEVANT, INSUFFICIENT_EVIDENCE,
+    REPORTER_ONLY) son hard_reject — no dependen del ranking.
+
+    Args:
+        decisions: lista de ReporterDocumentDecision (salida de curate_documents).
+        auto_promote_percentile: percentil mínimo para auto_promote (0.80 = top 20%).
+        auto_reject_percentile: percentil máximo para auto_reject (0.40 = bottom 60%).
+
+    Returns:
+        Lista de CurationTier en el mismo orden que `decisions`.
+    """
+    # 1. Identificar candidatos al ranking: PROMOTE, no duplicado, en período.
+    candidate_indices = [
+        i for i, d in enumerate(decisions)
+        if d.decision == ReporterDecision.PROMOTE and d.duplicate_of is None
+    ]
+    # 2. Calcular scores y percentiles solo sobre candidatos.
+    candidate_scores = [promotion_score(decisions[i].scores) for i in candidate_indices]
+    candidate_percentiles = _percentile_rank(candidate_scores)
+
+    # 3. Asignar tier por percentil.
+    tiers: list[CurationTier] = []
+    cand_pos = 0
+    for i, d in enumerate(decisions):
+        if i in candidate_indices:
+            pct = candidate_percentiles[cand_pos]
+            # rank es 1-based dentro de los candidatos (1 = mejor score)
+            rank = sorted(range(len(candidate_scores)),
+                          key=lambda k: -candidate_scores[k]).index(cand_pos) + 1
+            score = candidate_scores[cand_pos]
+            if pct >= auto_promote_percentile:
+                tier = "auto_promote"
+                reason = f"Top del ranking (percentil {pct:.2f}, score {score:.2f})."
+            elif pct < auto_reject_percentile:
+                tier = "auto_reject"
+                reason = f"Bottom del ranking (percentil {pct:.2f}, score {score:.2f})."
+            else:
+                tier = "gray"
+                reason = f"Zona gris (percentil {pct:.2f}, score {score:.2f}) → LLM judge."
+            tiers.append(CurationTier(
+                document_id=d.document_id, tier=tier, rank=rank,
+                percentile=round(pct, 4), score=round(score, 4),
+                reason=reason, scores=d.scores,
+                decision=d.decision, duplicate_of=d.duplicate_of,
+            ))
+            cand_pos += 1
+        else:
+            # hard_reject: gate duro, no depende del ranking
+            reason = f"Gate duro: {d.decision.value}"
+            if d.duplicate_of:
+                reason += f" (duplicado de {d.duplicate_of})"
+            tiers.append(CurationTier(
+                document_id=d.document_id, tier="hard_reject", rank=0,
+                percentile=0.0, score=promotion_score(d.scores),
+                reason=reason, scores=d.scores,
+                decision=d.decision, duplicate_of=d.duplicate_of,
+            ))
+    return tiers
 
 
 def promotion_score(scores: ScoreBundle) -> float:
@@ -83,13 +221,44 @@ def curate_documents(
     document_embeddings: dict[str, list[float]] | None = None,
     interest_embeddings: list[list[float]] | None = None,
     historical_embeddings: list[list[float]] | None = None,
+    known_url_hashes: dict[str, str] | None = None,
 ) -> list[ReporterDocumentDecision]:
     historical_documents = historical_documents or []
     document_embeddings = document_embeddings or {}
     interest_embeddings = interest_embeddings or []
     historical_embeddings = historical_embeddings or []
+    # Main-corpus URL → normalized content hash. Used to detect identical
+    # re-downloads deterministically. A same-URL document with DIFFERENT
+    # content is NOT a duplicate: it may be a new study or an updated
+    # version — both carry value, so it flows to the normal decision path.
+    known_url_hashes = known_url_hashes or {}
     by_url: dict[str, str] = {}
     by_hash: dict[str, str] = {}
+
+    # Pre-normalize embedding matrices once — the per-doc loop used to
+    # recompute pure-Python cosines for every (doc, historical) pair
+    # (~1.5G interpreted ops per corpus). Vectorized this is milliseconds.
+    import numpy as _np
+
+    def _norm_rows(embs: list[list[float]]) -> "_np.ndarray | None":
+        if not embs:
+            return None
+        m = _np.asarray(embs, dtype=_np.float32)
+        norms = _np.linalg.norm(m, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-12
+        return m / norms
+
+    _hist_mat = _norm_rows(historical_embeddings)
+    _interest_mat = _norm_rows(interest_embeddings)
+
+    def _max_cosine(emb: list[float], mat: "_np.ndarray | None") -> float:
+        if mat is None:
+            return 0.0
+        d = _np.asarray(emb, dtype=_np.float32)
+        n = _np.linalg.norm(d)
+        if n == 0:
+            return 0.0
+        return float((mat @ (d / n)).max())
     decisions: list[ReporterDocumentDecision] = []
     llm_progress_callback = None
     if progress_callback is not None:
@@ -108,16 +277,18 @@ def curate_documents(
         doc_emb = document_embeddings.get(document_id)
 
         # --- Relevance: cosine similarity with interest embeddings (semantic) ---
-        if doc_emb and interest_embeddings:
-            relevance = max(_cosine_similarity(doc_emb, ie) for ie in interest_embeddings)
+        if doc_emb and _interest_mat is not None:
+            # Clamp: floating-point cosine can exceed [0,1] by epsilon and
+            # one out-of-range score aborts the whole curation batch.
+            relevance = max(0.0, min(1.0, _max_cosine(doc_emb, _interest_mat)))
         elif not interests:
             relevance = 0.5
         else:
             relevance = min(1.0, 0.3 + 0.2 * sum(1 for term in interests if term.lower() in (document.get("title", "") + " " + text).lower()))
 
         # --- Novelty: cosine distance to historical embeddings (semantic) ---
-        if doc_emb and historical_embeddings:
-            novelty = 1.0 - max(_cosine_similarity(doc_emb, he) for he in historical_embeddings)
+        if doc_emb and _hist_mat is not None:
+            novelty = max(0.0, min(1.0, 1.0 - _max_cosine(doc_emb, _hist_mat)))
         else:
             novelty = 1.0 - max((_lexical_similarity(text, old.get("text", "")) for old in historical_documents), default=0.0)
 
@@ -149,14 +320,30 @@ def curate_documents(
             decision, reason = ReporterDecision.INSUFFICIENT_EVIDENCE, "El documento no contiene texto utilizable."
         elif score and score < quality_threshold:
             decision, reason = ReporterDecision.IRRELEVANT, "El quality gate del scraper estÃ¡ por debajo del umbral."
+        elif url and url in known_url_hashes and content_hash == known_url_hashes[url]:
+            # Identical re-download: same canonical URL AND same normalized
+            # content as an already-approved main document. Only this exact
+            # case is a duplicate — a same-URL document with different
+            # content may be a new study or an updated version and must
+            # survive curation.
+            decision, duplicate_of, reason = (
+                ReporterDecision.DUPLICATE, "__main__",
+                "Re-descarga idÃ©ntica de un documento ya aprobado en main.")
         elif url and url in by_url:
-            decision, duplicate_of, reason = ReporterDecision.DUPLICATE, by_url[url], "Canonical URL duplicada."
+            decision, duplicate_of, reason = (
+                ReporterDecision.DUPLICATE, by_url[url],
+                "Canonical URL duplicada.")
         elif content_hash in by_hash:
             decision, duplicate_of, reason = ReporterDecision.DUPLICATE, by_hash[content_hash], "Content hash duplicado."
         elif relevance < 0.3:
             decision, reason = ReporterDecision.REPORTER_ONLY, "Relevancia baja para los intereses configurados; se conserva para anÃ¡lisis neutral."
-        elif novelty < 0.2:
-            decision, reason = ReporterDecision.DUPLICATE, None, "Contenido muy similar al corpus histÃ³rico."
+        elif novelty < 0.05:
+            # Near-identical content (>0.95 cosine to a historical document):
+            # a re-download with cosmetic differences. Distinct articles of
+            # the same domain routinely reach 0.8+ similarity (shared
+            # boilerplate) — flagging those as duplicates discarded genuine
+            # new content at scale, so the gate only fires near-identical.
+            decision, reason = ReporterDecision.DUPLICATE, "Contenido casi idÃ©ntico al corpus histÃ³rico."
         else:
             decision = ReporterDecision.PROMOTE
             reason = "Contenido relevante y suficientemente novedoso; requiere revisiÃ³n humana para promociÃ³n."
@@ -164,7 +351,12 @@ def curate_documents(
         by_hash[content_hash] = document_id
         semantic = batch_results[index] if index < len(batch_results) else (classifier(document) if classifier else {})
         if semantic:
-            values = {key: max(0.0, min(1.0, float(semantic.get(key, value)))) for key, value in {
+            def _safe_float(raw, fallback):
+                try:
+                    return max(0.0, min(1.0, float(raw)))
+                except (TypeError, ValueError):
+                    return fallback
+            values = {key: _safe_float(semantic.get(key, value), value) for key, value in {
                 "relevance": relevance, "novelty": novelty, "source_quality": source_quality, "impact": impact,
                 "depth": depth, "actionability": actionability,
             }.items()}

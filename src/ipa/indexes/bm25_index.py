@@ -64,9 +64,10 @@ class BM25Index:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA busy_timeout = 30000")
         self._conn.execute("PRAGMA temp_store = MEMORY")
         self._conn.executescript(_SCHEMA)
         # Disable FTS5 auto-merge to avoid O(n^2) degradation during bulk insert.
@@ -127,11 +128,31 @@ class BM25Index:
         if not chunks:
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        # Delete existing entries (for re-indexing idempotency).
-        self._conn.executemany(
-            "DELETE FROM chunks_fts WHERE chunk_id = ?",
-            [(chunk.chunk_id,) for chunk in chunks],
-        )
+        # Delete existing entries (for re-indexing idempotency). A blind
+        # delete is O(N x index size): FTS5 cannot index the UNINDEXED
+        # chunk_id column, so each DELETE scans the whole FTS table
+        # (~80ms per row at 80k rows — the promotion bottleneck). chunks_meta
+        # has a PK on chunk_id, so look up which ids actually exist first and
+        # delete only those. Freshly indexed chunks (the common case) skip
+        # the delete entirely.
+        chunk_ids = [chunk.chunk_id for chunk in chunks]
+        existing: set[str] = set()
+        # SQLite caps bound variables (~32k); large batches exceed it, so
+        # query the PK membership check in chunks.
+        for i in range(0, len(chunk_ids), 900):
+            group = chunk_ids[i:i + 900]
+            placeholders = ",".join("?" * len(group))
+            existing.update(
+                row[0] for row in self._conn.execute(
+                    f"SELECT chunk_id FROM chunks_meta WHERE chunk_id IN ({placeholders})",
+                    group,
+                )
+            )
+        if existing:
+            self._conn.executemany(
+                "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                [(chunk_id,) for chunk_id in existing],
+            )
         # Insert into FTS.
         self._conn.executemany(
             "INSERT INTO chunks_fts (chunk_id, document_id, content_hash, text, span_json) "
@@ -167,15 +188,39 @@ class BM25Index:
         )
         self._conn.commit()
 
+    def remove_document(self, document_id: str, commit: bool = True) -> int:
+        """Tombstone every chunk of a document: drop from FTS, mark meta.
+
+        Returns the number of chunks affected. Used to purge promoted
+        documents from a staging corpus once the main corpus holds them.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id IN "
+            "(SELECT chunk_id FROM chunks_meta WHERE document_id = ?)",
+            (document_id,),
+        )
+        self._conn.execute(
+            "UPDATE chunks_meta SET tombstoned = 1 WHERE document_id = ?",
+            (document_id,),
+        )
+        if commit:
+            self._conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     def search(self, query: str, limit: int = 10) -> list[SearchHit]:
-        """Search using FTS5 BM25 ranking.  Returns SearchHit records."""
+        """Search using FTS5 BM25 ranking.  Returns SearchHit records.
+
+        Uses OR semantics between terms so natural language queries return
+        results ranked by relevance even when not all terms appear in a chunk.
+        """
         if limit <= 0:
             raise ValueError("limit must be positive")
         terms = re.findall(r"[\w]+", query, flags=re.UNICODE)
         if not terms:
             return []
         # Quote individual terms so user punctuation cannot become FTS5 syntax.
-        safe_query = " ".join(f'"{term}"' for term in terms)
+        # Use OR so chunks matching any term are returned, ranked by BM25.
+        safe_query = " OR ".join(f'"{term}"' for term in terms)
         # FTS5 MATCH with BM25 ranking (lower score = better match in FTS5,
         # so we negate to get higher = better).
         rows = self._conn.execute(

@@ -18,7 +18,15 @@
     "ResearchRequest": ["request_id", "goal_id", "concept_id", "question", "trigger", "gap_evidence", "allowed_domains", "budget", "status", "approval", "generation", "field_origins"],
     "ReporterReport": ["report_id", "corpus_id", "period", "status", "categories", "source_refs", "generation", "field_origins"],
     "ReporterDocumentDecision": ["decision_id", "report_id", "document_id", "artifact_id", "decision", "scores", "evidence", "review_status", "generation", "field_origins"],
-    "TopicLink": ["current_category_id", "previous_category_id", "relation", "score", "evidence", "generation", "field_origins"]
+    "TopicLink": ["current_category_id", "previous_category_id", "relation", "score", "evidence", "generation", "field_origins"],
+    "AgentSession": ["session_id", "interface", "role", "status", "started_at", "last_active_at", "identity_hash", "episode_count"],
+    "AgentEpisode": ["episode_id", "session_id", "interface", "role", "turn_role", "content", "content_hash", "identity_hash", "created_at"],
+    "ToolCall": ["tool_call_id", "session_id", "episode_id", "tool_name", "arguments", "called_at", "status"],
+    "ToolResult": ["tool_result_id", "tool_call_id", "session_id", "tool_name", "result", "result_hash", "source_refs", "started_at", "completed_at", "elapsed_ms", "status"],
+    "WebSource": ["web_source_id", "source_url", "fetched_at", "content_hash", "trust_label", "fetch_method", "content_type", "byte_size"],
+    "UserTopicRecord": ["record_id", "topic_id", "mastery_status", "mastery_score", "attempts", "last_assessment_id", "evidence_ids", "updated_at", "created_at", "generation", "field_origins"],
+    "UserEvidence": ["evidence_id", "topic_id", "evidence_type", "observation", "observed_at", "recorded_at", "source_refs", "generation", "field_origins"],
+    "TopicCluster": ["cluster_id", "label", "description", "member_document_ids", "member_concept_ids", "parent_cluster_id", "coherence_score", "representative_chunk_id", "created_at", "generation", "field_origins"]
   },
   "invariants": [
     "original_artifact_is_immutable",
@@ -32,9 +40,21 @@
     "active_roadmaps_require_human_approval",
     "research_execution_requires_human_approval",
     "mastery_is_supported_by_assessment_evidence",
+    "user_topic_records_require_evidence_for_mastery",
+    "user_evidence_is_append_only",
+    "topic_clusters_are_emergent",
+    "topic_clusters_are_derived_not_authoritative",
+    "memory_consolidation_requires_human_approval",
     "reporter_categories_are_emergent",
     "reporter_rejections_do_not_delete_artifacts",
     "reporter_promotion_requires_human_approval",
-    "reporter_reports_are_corpus_fingerprinted"
+    "reporter_reports_are_corpus_fingerprinted",
+    "agent_episodes_are_append_only",
+    "agent_memory_lives_outside_any_corpus",
+    "agent_episodes_record_active_identity_hash",
+    "tool_calls_are_deterministic",
+    "tool_results_record_content_hash",
+    "web_sources_never_become_canonical",
+    "web_sources_require_trust_label"
   ]
 }

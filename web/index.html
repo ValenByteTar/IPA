@@ -7,29 +7,136 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="topbar"><div><span class="eyebrow">IPA / LOCAL INTELLIGENCE</span><h1>Control Room</h1></div><div class="top-actions"><span id="connection-status" class="conn-status connecting">Conectando…</span><span id="last-refresh" class="muted"></span><button class="ghost" onclick="refreshAll()">Actualizar</button><button class="ghost" id="restart-btn" onclick="restartSystem()" title="Reinicia el servidor del dashboard">Reiniciar sistema</button></div></header>
-  <main class="shell">
-    <section class="hero"><div><p class="eyebrow">OPERACIONES</p><h2>Conocimiento en movimiento</h2><p>Supervisá scraping, ingestiones, Reporter y curación desde un único panel. Los cambios se aplican en backend y se reflejan con refresh.</p></div><div class="hero-status" id="hero-status">Cargando estado…</div></section>
-    <section class="metrics" id="metrics"></section>
-    <section class="metrics" id="corpus-section"></section>
-    <nav class="tabs"><button class="tab active" data-panel="overview">Resumen</button><button class="tab" data-panel="execution">Ejecución</button><button class="tab" data-panel="reporter">Reporter</button><button class="tab" data-panel="sources">Fuentes</button><button class="tab" data-panel="review">Curación</button></nav>
+  <button id="topbar-restore" class="topbar-restore" style="display:none" onclick="toggleTopbar()" title="Mostrar barra superior">▾</button>
+  <header class="topbar">
+    <div class="brand"><span class="eyebrow">IPA / LOCAL INTELLIGENCE</span><h1>Control Room</h1></div>
+    <div class="agent-badge" id="agent-badge" title="El agente es omnipresente: misma identidad y memoria en CLI, dashboard y futuras superficies (DEC-002)">
+      <span class="agent-avatar">🧠</span>
+      <div class="agent-meta"><strong id="agent-name">RA</strong><span id="agent-role" class="muted">omnipresente · memoria compartida</span></div>
+    </div>
+    <div class="top-actions">
+      <span id="connection-status" class="conn-status connecting">Conectando…</span>
+      <span id="last-refresh" class="muted"></span>
+      <button class="ghost" onclick="refreshAll()">Actualizar</button>
+      <button class="ghost" id="restart-btn" onclick="restartSystem()" title="Reinicia el servidor del dashboard">Reiniciar</button>
+      <button class="ghost" onclick="toggleTopbar()" title="Ocultar barra superior">⇡</button>
+    </div>
+  </header>
+  <div class="shell">
+    <nav class="sidebar" id="sidebar">
+      <button class="nav-item active" data-panel="overview" title="Resumen"><span class="nav-icon">🏠</span><span class="nav-label">Resumen</span></button>
+      <button class="nav-item" data-panel="agent" title="Agente"><span class="nav-icon">🧠</span><span class="nav-label">Agente</span></button>
+      <button class="nav-item" data-panel="approvals" id="nav-approvals" title="Aprobaciones"><span class="nav-icon">✅</span><span class="nav-label">Aprobaciones</span><span id="nav-approvals-badge" class="nav-badge" style="display:none">0</span></button>
+      <button class="nav-item" data-panel="acquisition" title="Adquisición"><span class="nav-icon">📥</span><span class="nav-label">Adquisición</span></button>
+      <button class="nav-item" data-panel="knowledge" title="Conocimiento"><span class="nav-icon">📚</span><span class="nav-label">Conocimiento</span></button>
+      <button class="nav-item" data-panel="reporter" title="Reporter"><span class="nav-icon">📰</span><span class="nav-label">Reporter</span></button>
+      <button class="nav-item" data-panel="system" title="Sistema"><span class="nav-icon">⚙️</span><span class="nav-label">Sistema</span></button>
+      <button class="sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Colapsar menú">‹</button>
+    </nav>
+    <main class="panel-area">
+      <!-- ═══ RESUMEN ═══ -->
+      <section id="panel-overview" class="panel active">
+        <section class="hero"><div><p class="eyebrow">OPERACIONES</p><h2>Conocimiento en movimiento</h2><p>Supervisá scraping, ingestiones, Reporter y curación desde un único panel.</p></div><div class="hero-status" id="hero-status">Cargando estado…</div></section>
+        <section class="metrics" id="metrics"></section>
+        <section class="metrics" id="corpus-section"></section>
+        <article class="card"><div class="card-head"><div><span class="eyebrow">INGESTIONES</span><h3>Estado de los dos corpus</h3></div><button class="icon-btn" onclick="refreshAll()">↻</button></div><div id="ingestions" class="stack"></div></article>
+        <article class="card"><div class="card-head"><div><span class="eyebrow">PROCESOS</span><h3>Actividad del sistema</h3></div></div><div id="processes" class="process-list"></div><div id="process-detail" class="process-detail-panel" style="display:none"></div></article>
+        <article class="card"><div class="card-head"><div><span class="eyebrow">MODELO</span><h3>Disponibilidad del LLM</h3></div><span id="llm-pill" class="pill">—</span></div><div id="llm-info"></div></article>
+      </section>
 
-    <section id="panel-overview" class="panel active"><div class="grid two"><article class="card"><div class="card-head"><div><span class="eyebrow">INGESTIONES</span><h3>Estado de los dos corpus</h3></div><button class="icon-btn" onclick="refreshAll()">↻</button></div><div id="ingestions" class="stack"></div></article><article class="card"><div class="card-head"><div><span class="eyebrow">MODELO</span><h3>Disponibilidad del LLM</h3></div><span id="llm-pill" class="pill">—</span></div><div id="llm-info"></div></article></div><article class="card"><div class="card-head"><div><span class="eyebrow">PROCESOS</span><h3>Actividad del sistema</h3></div><div class="actions"><button class="ghost" onclick="stopAllProcesses()">Detener todo</button><button class="danger" onclick="cleanReporterCorpus()">Limpiar corpus reporter</button></div></div><div id="processes" class="process-list"></div><div id="process-detail" class="process-detail-panel" style="display:none"></div></article></section>
+      <!-- ═══ AGENTE (chat + tutor + sesiones) ═══ -->
+      <section id="panel-agent" class="panel">
+        <div class="agent-layout">
+          <aside class="agent-sessions-panel">
+            <div class="section-title-sm" style="display:flex;justify-content:space-between;align-items:center"><span class="eyebrow">SESIONES</span><button class="ghost small" onclick="newAgentSession()">+ Nueva</button></div>
+            <div id="agent-sessions-list" class="session-list"></div>
+            <div class="section-title-sm" style="margin-top:16px"><span class="eyebrow">ROADMAP TUTOR</span></div>
+            <div id="tutor-roadmaps" class="tutor-roadmaps"></div>
+          </aside>
+          <div class="sess-resizer" id="sess-resizer" title="Arrastrá para ajustar el ancho"></div>
+          <div class="chat-container">
+            <div id="research-indicator" class="research-indicator" style="display:none">
+              <span class="research-spinner"></span>
+              <span id="research-indicator-text">Investigación en curso…</span>
+            </div>
+            <div id="chat-messages" class="chat-messages">Escribí un mensaje para empezar.</div>
+            <div id="dd-chip" class="dd-chip" style="display:none"></div>
+            <form class="chat-input" onsubmit="sendAgentMessage(event)">
+              <div class="chat-role" id="chat-role">
+                <button type="button" class="role-btn active" data-role="general" onclick="setChatRole('general')">General</button>
+                <button type="button" class="role-btn" data-role="tutor" onclick="setChatRole('tutor')">Tutor</button>
+              </div>
+              <input id="agent-chat-input" type="text" placeholder="Escribí tu mensaje…" autocomplete="off">
+              <button class="primary">Enviar</button>
+            </form>
+          </div>
+        </div>
+      </section>
 
-    <section id="panel-reporter" class="panel"><div class="section-title"><div><span class="eyebrow">REPORTER AGENT</span><h2>Panorama emergente</h2><p>Categorías generadas desde el corpus, no desde una taxonomía fija. Aprobar promueve al corpus principal; Denegar elimina todo.</p></div><div class="actions"><button onclick="reviewReport('approved')">Aprobar corpus</button><button class="danger" onclick="reviewReport('rejected')">Denegar corpus</button></div></div><div id="report-meta" class="notice"></div><div id="report-history" class="stack"></div><div id="categories" class="category-grid"></div><div id="topic-review" class="stack"></div></section>
+      <!-- ═══ APROBACIONES (cola unificada) ═══ -->
+      <section id="panel-approvals" class="panel">
+        <div class="section-title"><div><span class="eyebrow">HUMAN IN THE LOOP</span><h2>Aprobaciones</h2><p>Todo lo que espera tu decisión: curación del Reporter, roadmaps del Tutor, research requests, consolidaciones.</p></div>
+          <div class="actions"><select id="approvals-filter" onchange="loadApprovals()"><option value="pending">Pendientes</option><option value="all">Todas</option></select></div>
+        </div>
+        <div id="approvals-queue" class="approvals-queue">Cargando…</div>
+      </section>
 
-    <section id="panel-execution" class="panel"><div class="section-title"><div><span class="eyebrow">OPERACIONES</span><h2>Ejecución</h2><p>Lanzá scraping y generación de reportes desde aquí.</p></div></div><div id="execution-panel" class="stack"></div></section>
+      <!-- ═══ ADQUISICIÓN (fuentes + scraper + fastpath) ═══ -->
+      <section id="panel-acquisition" class="panel">
+        <div class="section-title"><div><span class="eyebrow">ADQUISICIÓN</span><h2>Alimentar el corpus</h2><p>Fuentes del scraper, ejecución de scraping e ingestión FastPath.</p></div></div>
+        <form class="source-form" onsubmit="addSource(event)"><input id="source-url" type="url" placeholder="https://example.com/news" required><input id="source-days" type="number" min="0" value="7" title="Días hacia atrás"><button class="primary">Agregar fuente</button></form>
+        <div id="sources" class="source-list"></div>
+        <div class="section-title" style="margin-top:24px"><div><span class="eyebrow">EJECUCIÓN</span><h2>Lanzar procesos</h2><p>Scraping, ingestión, LanceDB y pipeline completo.</p></div></div>
+        <div id="execution-panel" class="stack"></div>
+      </section>
 
-    <section id="panel-sources" class="panel"><div class="section-title"><div><span class="eyebrow">ADQUISICIÓN</span><h2>Fuentes del scraper</h2><p>Agregá o desactivá URLs sin editar archivos ni reiniciar el sistema.</p></div></div><form class="source-form" onsubmit="addSource(event)"><input id="source-url" type="url" placeholder="https://example.com/news" required><input id="source-days" type="number" min="0" value="7" title="Días hacia atrás"><button class="primary">Agregar fuente</button></form><div id="sources" class="source-list"></div></section>
+      <!-- ═══ CONOCIMIENTO (corpus + documentos + chunks) ═══ -->
+      <section id="panel-knowledge" class="panel">
+        <div class="section-title"><div><span class="eyebrow">CONOCIMIENTO</span><h2>Corpus y documentos</h2><p>Explorá documentos y chunks de ambos corpus.</p></div>
+          <div class="actions"><select id="knowledge-corpus" onchange="loadKnowledge()"><option value="reporter">Reporter</option><option value="main">Principal</option></select></div>
+        </div>
+        <div id="knowledge-documents" class="document-list">Cargando…</div>
+      </section>
 
-    <section id="panel-review" class="panel"><div class="section-title"><div><span class="eyebrow">HUMAN IN THE LOOP</span><h2>Curación y promoción</h2><p>El sistema recomienda; vos decidís qué conservar o descartar. Podés también explorar todos los documentos del corpus.</p></div><div class="actions"><select id="review-corpus" onchange="loadReviewContent()"><option value="decisions">Decisiones de curación</option><option value="reporter">Todos los documentos (Reporter)</option><option value="main">Todos los documentos (Principal)</option></select></div></div><div id="decisions" class="decision-list"></div><div id="review-documents" class="document-list"></div></section>
-  </main>
+      <!-- ═══ REPORTER (panorama) ═══ -->
+      <section id="panel-reporter" class="panel">
+        <div class="section-title"><div><span class="eyebrow">REPORTER AGENT</span><h2>Panorama emergente</h2><p>Categorías generadas desde el corpus. La acción de curación vive en Aprobaciones.</p></div>
+          <div class="actions"><button onclick="runReporter()">Generar reporte</button></div>
+        </div>
+        <div id="report-meta" class="notice"></div>
+        <div id="report-history" class="stack"></div>
+        <div id="categories" class="category-grid"></div>
+        <div id="topic-review" class="stack"></div>
+      </section>
+
+      <!-- ═══ APROBACIONES (cola unificada) ═══ -->
+      <section id="panel-approvals" class="panel">
+        <div class="section-title"><div><span class="eyebrow">HUMAN IN THE LOOP</span><h2>Aprobaciones</h2><p>Todo lo que espera tu decisión: curación del Reporter, roadmaps del Tutor, research requests, consolidaciones de memoria.</p></div>
+          <div class="actions"><select id="approvals-filter" onchange="loadApprovals()"><option value="pending">Pendientes</option><option value="all">Todas</option></select></div>
+        </div>
+        <div id="approvals-queue" class="approvals-queue">Cargando…</div>
+      </section>
+
+      <!-- ═══ SISTEMA (procesos, logs, mantenimiento) ═══ -->
+      <section id="panel-system" class="panel">
+        <div class="section-title"><div><span class="eyebrow">SISTEMA</span><h2>Procesos y mantenimiento</h2><p>Actividad, logs y operaciones de mantenimiento.</p></div>
+          <div class="actions"><button class="ghost" onclick="stopAllProcesses()">Detener todo</button></div>
+        </div>
+        <div id="processes" class="process-list"></div>
+        <div id="process-detail" class="process-detail-panel" style="display:none"></div>
+        <div class="grid two" style="margin-top:20px">
+          <article class="card"><div class="card-head"><div><span class="eyebrow">MANTENIMIENTO</span><h3>Landing</h3></div></div><button class="ghost" onclick="cleanLanding()">Limpiar Landing procesado</button></article>
+          <article class="card"><div class="card-head"><div><span class="eyebrow">PELIGROSO</span><h3>Corpus Reporter</h3></div></div><button class="danger" onclick="cleanReporterCorpus()">Limpiar corpus reporter</button></article>
+        </div>
+      </section>
+    </main>
+  </div>
+
   <dialog id="viewer"><div class="viewer-head"><strong id="viewer-title"></strong><button onclick="viewer.close()">Cerrar</button></div><div id="viewer-body" class="viewer-body"></div></dialog>
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=5"></script>
   <script>
-    // Auto-refresh process detail when open
-    setInterval(() => { if (currentProcess && document.getElementById('process-detail') && document.getElementById('process-detail').dataset.visible === 'true') loadProcessDetail(currentProcess); }, 2000);
+    setInterval(() => { if (currentProcess && document.getElementById('process-detail')?.dataset.visible === 'true') loadProcessDetail(currentProcess); }, 2000);
   </script>
 </body>
 </html>

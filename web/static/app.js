@@ -1,5 +1,65 @@
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ── Mini renderizador Markdown (local-first, XSS-safe) ──────────────────
+// Escape-first: todo pasa por esc() antes de las transformaciones, así el
+// output del modelo nunca inyecta HTML. Soporta: code blocks, inline code,
+// headers, bold, italic, listas, blockquotes, hr, links y math ($ / $$).
+function renderMarkdown(src){
+  if(!src)return '';
+  const codeBlocks=[];
+  // 1. Extraer code blocks ```...``` antes de escapar (preservar contenido crudo)
+  let text=String(src??'').replace(/```(\w*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
+    codeBlocks.push({lang:lang.trim(),code});
+    return `\u0000CODE${codeBlocks.length-1}\u0000`;
+  });
+  // 2. Escape HTML del resto
+  text=esc(text);
+  // 3. Math: $$...$$ (display) y $...$ (inline) → spans estilizados
+  const mathSpans=[];
+  text=text.replace(/\$\$([\s\S]+?)\$\$/g,(m,math)=>{
+    mathSpans.push(math.trim());
+    return `\u0000MATH${mathSpans.length-1}\u0000`;
+  });
+  text=text.replace(/\$([^\$\n]+?)\$/g,(m,math)=>{
+    mathSpans.push(math);
+    return `\u0000MATH${mathSpans.length-1}\u0000`;
+  });
+  // 4. Inline code
+  text=text.replace(/`([^`\n]+)`/g,'<code class="md-code">$1</code>');
+  // 5. Bold / italic
+  text=text.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  text=text.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  // 6. Links [text](url)
+  text=text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // 7. Líneas: headers, listas, quotes, hr — línea por línea
+  // (el texto ya está escapado globalmente; NO re-escapar acá o destruiría
+  //  los tags insertados en los pasos 4-6)
+  const lines=text.split('\n');
+  let html='',inUl=false,inOl=false;
+  const closeLists=()=>{if(inUl){html+='</ul>';inUl=false}if(inOl){html+='</ol>';inOl=false}};
+  for(const line of lines){
+    const trimmed=line.trim();
+    const h=trimmed.match(/^(#{1,4})\s+(.*)$/);
+    const ul=trimmed.match(/^[-*]\s+(.*)$/);
+    const ol=trimmed.match(/^\d+[.)]\s+(.*)$/);
+    const bq=trimmed.match(/^&gt;\s?(.*)$/);
+    if(/^(-{3,}|\*{3,})$/.test(trimmed)){closeLists();html+='<hr class="md-hr">';continue}
+    if(h){closeLists();const l=h[1].length;html+=`<h${l+2} class="md-h">${h[2]}</h${l+2}>`;continue}
+    if(ul){if(!inUl){closeLists();html+='<ul class="md-list">';inUl=true}html+=`<li>${ul[1]}</li>`;continue}
+    if(ol){if(!inOl){closeLists();html+='<ol class="md-list">';inOl=true}html+=`<li>${ol[1]}</li>`;continue}
+    if(trimmed.startsWith('&gt;')){closeLists();html+=`<blockquote class="md-quote">${trimmed.replace(/^&gt;\s?/,'')}</blockquote>`;continue}
+    closeLists();
+    if(trimmed==='')continue;
+    html+=`<p class="md-p">${trimmed}</p>`;
+  }
+  closeLists();
+  // 8. Restaurar math y code blocks
+  html=html.replace(/\u0000MATH(\d+)\u0000/g,(m,i)=>`<span class="md-math">${mathSpans[Number(i)]}</span>`);
+  html=html.replace(/\u0000CODE(\d+)\u0000/g,(m,i)=>{const b=codeBlocks[Number(i)];return `<pre class="md-pre${b.lang?` lang-${esc(b.lang)}`:''}"><code>${esc(b.code)}</code></pre>`});
+  return html;
+}
+
 let state={};
 let viewer=$('#viewer');
 let selectedReport=null;
@@ -8,7 +68,7 @@ let selectedReportPath=null;
 let connectionState='connecting'; // 'connected' | 'connecting' | 'disconnected'
 let retryCount=0;
 let retryTimer=null;
-const processLabels={'scraper':'Scraper','pipeline':'Fast Path','lancedb':'LanceDB','enrichment':'Reporter','rechunk':'Pipeline completo'};
+const processLabels={'scraper':'Scraper','pipeline':'Fast Path','lancedb':'LanceDB','rechunk':'Pipeline completo'};
 
 function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2800)}
 async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const data=await r.json();if(!r.ok||data.error)throw Error(data.error||`HTTP ${r.status}`);return data}
@@ -121,47 +181,65 @@ async function restartSystem(){
 }
 
 function renderState(){
-  const m=state.main_ingestion||{},r=state.reporter_ingestion||{},llm=state.llm||{};
+  const m=state.main_ingestion||{},llm=state.llm||{};
   const sc=state.scrape_counts||{total_files:0,sites:0};
   const ac=state.archive_counts||{total_files:0};
+  const tc=state.transit_counts||{total_files:0};
   const mv=state.main_vector||{};
   const si=state.staging_ingestion||{};
   const sv=state.staging_vector||{};
   const pipeline=state.pipeline||{};
-  const rp=state.reporter_progress||{};
   const pipelineActive=pipeline.status==='running';
   $('#hero-status').innerHTML=`<span class="${llm.ready?'ok':'warning'}">●</span> ${llm.ready?'Sistema operativo':'Revisión requerida'}`;
   // Metrics: staging corpus (where fast path indexes) for chunks, main corpus for approved docs
   const scrapedFiles=sc.total_files||0;
   const archivedFiles=ac.total_files||0;
+  const transitFiles=tc.total_files||0;
   const mainDocs=m.documents||0;
   const mainChunks=m.chunks||0;
   const mainLanceChunks=mv.files||mv.chunks||0;
   const stagingDocs=si.documents||0;
   const stagingChunks=si.chunks||0;
-  const lanceChunks=sv.files||sv.chunks||mv.files||mv.chunks||0;
-  const reporterDocs=r.documents||0;
-  const llmModel='Qwen3.5-9B EXL3';
+  const lanceChunks=(sv.files??sv.chunks??0)||0;
+  const llmModel=llm.model_name||'—';
+  const llmProvider=llm.provider||'—';
   const gpuName=(llm.gpu||'local').replace('NVIDIA GeForce RTX 4050 Laptop GPU','NVIDIA RTX');
   // Tooltips with detailed info
   const scraperProc=state.processes?.scraper||{};
   const pipelineProc=state.processes?.pipeline||{};
-  const reporterProc=state.processes?.web_reporter||{};
-  const tipScraped=`Documentos en Landing/web\nScraper: ${scraperProc.status||'—'}${scraperProc.pid?' · PID '+scraperProc.pid:''}${scraperProc.detail?'\n'+scraperProc.detail:''}`;
-  const tipChunks=`Chunks en Tantivy + BM25 (corpus reporter)\nFast Path: ${pipelineProc.status||'—'}${pipelineProc.pid?' · PID '+pipelineProc.pid:''}${pipelineProc.detail?'\n'+pipelineProc.detail:''}\nDocumentos: ${stagingDocs}`;
-  const tipLance=`Chunks vectoriales en LanceDB (corpus reporter)\nLanceDB: ${lanceChunks} vectores\nDense: BGE-M3 1024 dims + Sparse`;
-  const tipReporter=`Corpus Reporter\nReporter: ${reporterProc.status||'—'}${reporterProc.pid?' · PID '+reporterProc.pid:''}${rp.stage?'\nEtapa: '+rp.stage:''}${rp.detail?'\n'+rp.detail:''}${rp.percent!=null?'\nProgreso: '+rp.percent+'%':''}`;
+  const tipScraped=`Archivos sin procesar en Landing/web (zona de paso)\nScraper: ${scraperProc.status||'—'}${scraperProc.pid?' · PID '+scraperProc.pid:''}${scraperProc.detail?'\n'+scraperProc.detail:''}`;
+  const tipTransit=`Procesados en Transit/ — pendientes de confirmación para el corpus principal\nTotal: ${transitFiles} archivos`;
+  const tipChunks=`Chunks en Tantivy + BM25 (corpus staging)\nFast Path: ${pipelineProc.status||'—'}${pipelineProc.pid?' · PID '+pipelineProc.pid:''}${pipelineProc.detail?'\n'+pipelineProc.detail:''}\nDocumentos: ${stagingDocs}`;
+  const tipLance=`Chunks vectoriales en LanceDB (corpus staging)\nLanceDB: ${lanceChunks} vectores\nDense: BGE-M3 1024 dims + Sparse`;
   const tipGPU=`GPU: ${llm.gpu||'—'}\nCUDA: ${llm.cuda_available?'Disponible':'No disponible'}\nExtensión: ${llm.extension_present?'Encontrada':'Faltante'}`;
-  const tipLLM=`Modelo: Qwen3.5-9B EXL3 3.0bpw + MTP\nEstado: ${llm.ready?'Listo':'No listo'}\nProvider: ExLlamaV3`;
+  const tipLLM=`Modelo: ${llmModel}\nEstado: ${llm.ready?'Listo':'No listo'}\nProvider: ${llmProvider}`;
   const tipMain=`Corpus principal (aprobado)\nDocumentos: ${mainDocs}\nChunks BM25: ${mainChunks}\nChunks LanceDB: ${mainLanceChunks}\nSolo se llena al aprobar un reporte`;
   const tipArchive=`Documentos archivados en Archive/\nTotal: ${archivedFiles} archivos`;
+  // Research indicator — show when agent is doing web research
+  const agentResearch=state.agent_research||{};
+  const ri=$('#research-indicator');
+  if(agentResearch.status==='running'){
+    ri.style.display='flex';
+    const q=agentResearch.query||'';
+    const maxU=agentResearch.max_urls||'?';
+    const started=agentResearch.started_at||'';
+    ri.querySelector('#research-indicator-text').textContent=`Investigación en curso: "${q}" (${maxU} fuentes máx.) — iniciada ${started}`;
+  }else if(pipelineActive){
+    // Ingesta en curso — visible también desde el chat, no solo en Resumen.
+    ri.style.display='flex';
+    const stageLabels={'scraper':'Scraping','fast_path':'Ingestando (BM25 + LanceDB)','reporter_fast':'Reporte rápido','reporter_full':'Reporte (BGE-M3 + Qwen)','parallel':'Generando reporte (BGE-M3 + Qwen)','ingestion':'Ingesta'};
+    const stage=stageLabels[pipeline.stage]||pipeline.stage||'';
+    ri.querySelector('#research-indicator-text').textContent=`Ingesta en curso: ${stage} · ${pipeline.percent||0}% — ${pipeline.detail||''}`;
+  }else{
+    ri.style.display='none';
+  }
   $('#metrics').innerHTML=[
-    {l:'Documentos scrapeados',v:format(scrapedFiles),s:'en Landing/web',t:tipScraped,ctx:'landing'},
-    {l:'Chunks indexados',v:format(stagingChunks),s:'en Tantivy + BM25 (reporter)',t:tipChunks},
-    {l:'chunks vectoriales',v:format(lanceChunks),s:'en LanceDB (reporter)',t:tipLance},
-    {l:'Corpus Reporter',v:format(reporterDocs),s:'documentos',t:tipReporter},
+    {l:'Pendientes en Landing',v:format(scrapedFiles),s:'sin procesar',t:tipScraped,ctx:'landing'},
+    {l:'En Transit',v:format(transitFiles),s:'esperan confirmación',t:tipTransit},
+    {l:'Chunks indexados',v:format(stagingChunks),s:'en Tantivy + BM25 (staging)',t:tipChunks},
+    {l:'chunks vectoriales',v:format(lanceChunks),s:'en LanceDB (staging)',t:tipLance},
     {l:'GPU',v:llm.ready?'Listo':'No listo',s:gpuName,t:tipGPU},
-    {l:'LLM',v:llmModel,s:'EXL3 3.0bpw',t:tipLLM},
+    {l:'LLM',v:llmModel,s:llmProvider,t:tipLLM},
   ].map(x=>`<div class="metric"${x.ctx?` data-ctx="${x.ctx}"`:''} title="${esc(x.t)}"><div class="label">${x.l}</div><div class="value">${x.v}</div><div class="label">${x.s}</div></div>`).join('');
   // Separate section for Corpus principal and Documentos archivados
   $('#corpus-section').innerHTML=[
@@ -183,25 +261,32 @@ function renderState(){
         <div class="kv"><span class="muted">Docs corpus</span><strong>${format(mainDocs)}</strong></div>
         <div class="kv"><span class="muted">Chunks</span><strong>${format(stagingChunks)}</strong></div>
         <div class="kv"><span class="muted">LanceDB</span><strong>${format(lanceChunks)}</strong></div>
-        <div class="kv"><span class="muted">Reporter</span><strong>${format(reporterDocs)}</strong></div>
-      </div></div>`+ingestion('Principal',m,state.main_vector)+ingestion('Reporter',r,state.reporter?.report);
+      </div></div>`+ingestion('Principal',m,state.main_vector);
   }else{
-    $('#ingestions').innerHTML=ingestion('Principal',m,state.main_vector)+ingestion('Reporter',r,state.reporter?.report);
+    $('#ingestions').innerHTML=ingestion('Principal',m,state.main_vector);
   }
   $('#llm-pill').textContent=llm.ready?'LISTO':'NO DISPONIBLE';
   $('#llm-pill').className='pill '+(llm.ready?'ok':'bad');
-  $('#llm-info').innerHTML=`<p class="muted">Modelo: Qwen3.5-9B EXL3 3.0bpw + MTP</p><p>CUDA: <strong class="${llm.cuda_available?'ok':'warning'}">${llm.cuda_available?'Disponible':'No disponible'}</strong></p><p>Extensión nativa: <strong class="${llm.extension_present?'ok':'bad'}">${llm.extension_present?'Encontrada':'Faltante'}</strong></p><p class="muted">${esc(llm.gpu||'Sin GPU detectada')}</p>`;
-  const processActions={'scraper':'/api/scraper/run','pipeline':'/api/fastpath/run','lancedb':'/api/lancedb/run','enrichment':'/api/reporter/run','rechunk':'/api/pipeline/run'};
-  // Only show the 5 canonical processes — skip web_* duplicates
-  const processOrder=['scraper','pipeline','lancedb','enrichment','rechunk'];
+  $('#llm-info').innerHTML=`<p class="muted">Modelo: ${esc(llmModel)}</p><p>Provider: <strong>${esc(llmProvider)}</strong></p><p>CUDA: <strong class="${llm.cuda_available?'ok':'warning'}">${llm.cuda_available?'Disponible':'No disponible'}</strong></p><p class="muted">${esc(llm.gpu||'Sin GPU detectada')}</p>`;
+  const processActions={'scraper':'/api/scraper/run','pipeline':'/api/fastpath/run','lancedb':'/api/lancedb/run','rechunk':'/api/pipeline/run'};
+  // Only show the 4 canonical processes — skip web_* duplicates
+  const processOrder=['scraper','pipeline','lancedb','rechunk'];
+  const processDescriptions={
+    scraper:'Trae contenido desde las fuentes configuradas',
+    pipeline:'Parsea, chunkifica e ingesta en FastPath',
+    lancedb:'Construye embeddings e índice vectorial',
+    rechunk:'Ejecuta el pipeline completo de punta a punta'
+  };
+  const processIcons={scraper:'↓',pipeline:'⚡',lancedb:'◈',rechunk:'↻'};
   $('#processes').innerHTML=processOrder.map(k=>{
     const v=(state.processes||{})[k]||{status:'not_started'};
     const pct=v.percent!=null?` · ${v.percent}%`:'';const stage=v.stage?` · ${esc(v.stage)}`:'';
     const isRunning=v.status==='running';
     const label=processLabels[k]||k;
     const action=processActions[k];
-    const btn=action&&!isRunning?`<button class="ghost small" onclick="event.stopPropagation();startProcess('${esc(k)}','${action}')">Iniciar</button>`:'';
-    return `<div class="process-row clickable" onclick="showProcess('${esc(k)}')"><div><strong>${esc(label)}</strong><span class="muted"> ${v.pid?`PID ${v.pid}`:''}${stage}${pct}</span></div><span class="${statusClass(v.status)}">${esc(v.status||'unknown')}</span>${btn}</div>`;
+    const statusLabel=isRunning?'Ejecutando':v.status==='done'?'Completado':v.status==='failed'?'Falló':'Listo';
+    const btn=action&&!isRunning?`<button class="process-action" onclick="event.stopPropagation();startProcess('${esc(k)}','${action}')"><span>Ejecutar</span><span class="process-action-icon">▶</span></button>`:'';
+    return `<div class="process-card" onclick="showProcess('${esc(k)}')"><div class="process-icon">${processIcons[k]}</div><div class="process-card-main"><div class="process-card-title"><strong>${esc(label)}</strong><span class="process-status ${statusClass(v.status)}">${statusLabel}${stage}${pct}</span></div><span class="process-description">${processDescriptions[k]}</span>${v.pid?`<span class="process-meta">PID ${v.pid}</span>`:''}</div>${btn}</div>`;
   }).join('')||'<span class="muted">No hay procesos registrados.</span>';
   renderSources();
   renderExecution();
@@ -218,7 +303,7 @@ function renderSources(){
   const s=state.sources||{base:[],added:[],disabled:[]};
   const disabled=new Set(s.disabled);
   const rows=[...s.base.map(x=>({...x,active:!disabled.has(x.url),base:true})),...s.added.map(x=>({...x,active:!disabled.has(x.url)})),...s.disabled.filter(url=>!s.base.some(x=>x.url===url)&&!s.added.some(x=>x.url===url)).map(url=>({url,active:false}))];
-  $('#sources').innerHTML=rows.map(x=>`<div class="source-row"><div><div class="source-url">${esc(x.url)}</div><span class="muted">${x.active?'Activa':'Desactivada'}</span></div><button onclick="toggleSource('${encodeURIComponent(x.url)}',${x.active},${!!x.base})">${x.active?'Desactivar':'Activar'}</button></div>`).join('')||'<div class="notice">No hay overrides. Se utilizan las fuentes base del config.</div>';
+  $('#sources').innerHTML=rows.map(x=>`<div class="source-row"><div><div class="source-url">${esc(x.url)}</div><span class="muted">${x.active?'Activa':'Desactivada'}</span></div><button class="ghost small" onclick="toggleSource('${encodeURIComponent(x.url)}',${x.active},${!!x.base})">${x.active?'Desactivar':'Activar'}</button></div>`).join('')||'<div class="notice">No hay overrides. Se utilizan las fuentes base del config.</div>';
 }
 
 function renderExecution(){
@@ -328,7 +413,7 @@ function renderExecution(){
       </label>
     </div>
     <div id="period-input-days" class="period-inputs" style="display:${daysDisplay}">
-      <label>Días hacia atrás (global): </label><input id="exec-days-global" type="number" min="0" max="365" value="${avgDays}" style="width:80px"><button onclick="updateAllDays()">Aplicar a todas</button>
+      <label>Días hacia atrás (global): </label><input id="exec-days-global" type="number" min="0" max="365" value="${avgDays}" style="width:80px"><button class="ghost small" onclick="updateAllDays()">Aplicar a todas</button>
     </div>
     <div id="period-input-range" class="period-inputs" style="display:${rangeDisplay}">
       <label>Desde: </label><input id="exec-period-start" type="date" style="width:140px">
@@ -499,8 +584,8 @@ function renderCategories(report){
     </div>
     ${Object.keys(curation).length?`<div class="curation-bar"><span class="eyebrow">CURACIÓN</span>${Object.entries(curation).map(([k,v])=>`<span class="badge">${esc(k)}: ${format(v)}</span>`).join('')}</div>`:''}
     <div class="report-actions">
-      <button onclick="reviewReport('approved')">Aprobar</button>
-      <button onclick="reviewReport('rejected')">Denegar</button>
+      <button class="approve-btn" onclick="reviewReport('approved')">Aprobar</button>
+      <button class="reject-btn" onclick="reviewReport('rejected')">Denegar</button>
       ${selectedReportPath?`<button class="ghost" onclick="clearSelectedReport()">Volver al último</button>`:''}
     </div>`;
   // Parent categories with subtopics
@@ -526,7 +611,7 @@ function renderCategories(report){
         </div>
         <details class="subtopics-list"><summary>Ver ${subs.length} subtópicos</summary><div class="subtopics-grid">${subsHtml}</div></details>
         <div class="category-actions">
-          <button onclick="deepDive('${esc(p.category_id)}')">Profundizar categoría</button>
+          <button class="ghost small" onclick="deepDive('${esc(p.category_id)}')">Profundizar categoría</button>
         </div>
       </article>`;
     }).join('');
@@ -542,7 +627,7 @@ function renderCategories(report){
         <span class="badge">novedad ${Number(c.novelty).toFixed(2)}</span>
       </div>
       <div class="category-actions">
-        <button onclick="deepDive('${esc(c.category_id)}')">Profundizar</button>
+        <button class="ghost small" onclick="deepDive('${esc(c.category_id)}')">Profundizar</button>
         <button class="ghost" onclick="renameTopic('${encodeURIComponent(c.category_id)}')">Renombrar</button>
       </div>
     </article>`).join('')||'<div class="notice">No se detectaron categorías.</div>';
@@ -589,8 +674,8 @@ async function renderTopicReview(){
           ${c.description?`<p class="tc-desc">${esc(c.description)}</p>`:''}
           <div class="tc-docs" id="tc-docs-${esc(c.category_id)}"><span class="muted">Cargando documentos...</span></div>
           <div class="tc-actions">
-            <button onclick="event.stopPropagation();deepDive('${esc(c.category_id)}')">Profundizar</button>
-            <button onclick="event.stopPropagation();renameTopic('${encodeURIComponent(c.category_id)}')">Renombrar</button>
+            <button class="ghost small" onclick="event.stopPropagation();deepDive('${esc(c.category_id)}')">Profundizar</button>
+            <button class="ghost small" onclick="event.stopPropagation();renameTopic('${encodeURIComponent(c.category_id)}')">Renombrar</button>
           </div>
         </div>
       </div>`;
@@ -685,9 +770,9 @@ function renderDecisions(decEl,ds,filter){
   const rows=shown.map(d=>{
     const isPending=['pending','changes_requested'].includes(d.review_status||'pending');
     const actions=isPending
-      ?`<button onclick="review('${encodeURIComponent(d.decision_id)}','approved')">Aprobar</button><button onclick="review('${encodeURIComponent(d.decision_id)}','rejected')">Denegar</button>`
+      ?`<button class="approve-btn" onclick="review('${encodeURIComponent(d.decision_id)}','approved')">Aprobar</button><button class="reject-btn" onclick="review('${encodeURIComponent(d.decision_id)}','rejected')">Denegar</button>`
       :`<span class="muted">${esc(d.review_status||'')}</span>`;
-    return `<div class="decision-row"><div class="decision-main"><strong>${esc(d.title||d.document_id)}</strong><div class="muted">${esc(d.reason||'')} · ${esc(d.review_status||'pending')}</div><div class="score">score promoción ${Number(d.promotion_score||0).toFixed(2)} · relevancia ${Number(d.scores?.relevance||0).toFixed(2)} · novedad ${Number(d.scores?.novelty||0).toFixed(2)} · impacto ${Number(d.scores?.impact||0).toFixed(2)} · calidad ${Number(d.scores?.source_quality||0).toFixed(2)}</div></div><div class="decision-actions">${actions}<button onclick="viewDoc('${encodeURIComponent(d.original_path||'')}')">Ver</button></div></div>`;
+    return `<div class="decision-row"><div class="decision-main"><strong>${esc(d.title||d.document_id)}</strong><div class="muted">${esc(d.reason||'')} · ${esc(d.review_status||'pending')}</div><div class="score">score promoción ${Number(d.promotion_score||0).toFixed(2)} · relevancia ${Number(d.scores?.relevance||0).toFixed(2)} · novedad ${Number(d.scores?.novelty||0).toFixed(2)} · impacto ${Number(d.scores?.impact||0).toFixed(2)} · calidad ${Number(d.scores?.source_quality||0).toFixed(2)}</div></div><div class="decision-actions">${actions}<button class="ghost small" onclick="viewDoc('${encodeURIComponent(d.original_path||'')}')">Ver</button></div></div>`;
   }).join('');
   decEl.innerHTML=triage+(rows||'<div class="notice">No hay decisiones en esta categoría.</div>');
 }
@@ -790,9 +875,32 @@ function deepDive(categoryId){
   const corpus=report?.path?report.path.replace(/\\report\.json$/,'\\corpus'):'';
   const searchContext=[category?.label,category?.description,(category?.subtopics||[]).join(' ')].filter(Boolean).join(' ');
   const defaultQ=`Explica los puntos principales y la evidencia sobre ${topic}.`;
-  // Open directly without prompt — user can edit the question in the deep-dive page
-  const url='/static/deep-dive.html?corpus='+encodeURIComponent(corpus)+'&q='+encodeURIComponent(defaultQ)+'&search='+encodeURIComponent(searchContext)+'&category_id='+encodeURIComponent(categoryId);
-  window.open(url,'_blank');
+  // Deep dive consolidado en el chat: mismo agente, mismo tool loop, misma
+  // memoria — el retrieval corre sobre el corpus del reporte server-side.
+  if(!corpus){toast('Este reporte no tiene corpus asociado');return}
+  ddContext={corpus,category_id:categoryId,search:searchContext,topic};
+  renderDdChip();
+  document.querySelectorAll('.nav-item,.panel').forEach(x=>x.classList.remove('active'));
+  const nav=document.querySelector('.nav-item[data-panel="agent"]');
+  if(nav)nav.classList.add('active');
+  const panel=$('#panel-agent');
+  if(panel)panel.classList.add('active');
+  loadAgentPanel();
+  const input=$('#agent-chat-input');
+  if(input){input.value=defaultQ;input.focus()}
+}
+
+function renderDdChip(){
+  const chip=$('#dd-chip');
+  if(!chip)return;
+  if(!ddContext){chip.style.display='none';return}
+  chip.style.display='flex';
+  chip.innerHTML=`<span class="dd-label">Profundizando: ${esc(ddContext.topic)}</span><button type="button" class="dd-close" onclick="clearDdContext()" title="Salir del modo deep dive">×</button>`;
+}
+
+function clearDdContext(){
+  ddContext=null;
+  renderDdChip();
 }
 
 async function renameTopic(encodedId){
@@ -802,13 +910,633 @@ async function renameTopic(encodedId){
   try{await api('/api/topics/edit',{method:'POST',body:JSON.stringify({category_id:categoryId,label})});toast('Tópico actualizado');if(selectedReportPath){await loadReport(selectedReportPath)}else{refreshAll()}}catch(error){toast(error.message)}
 }
 
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));
+// Sidebar colapsable: rail de íconos (56px). Estado persistido.
+function toggleSidebar(){
+  const sb=document.getElementById('sidebar');
+  if(!sb)return;
+  const collapsed=sb.classList.toggle('collapsed');
+  const t=document.getElementById('sidebar-toggle');
+  if(t)t.textContent=collapsed?'›':'‹';
+  try{localStorage.setItem('ipa_sidebar_collapsed',collapsed?'1':'0')}catch(e){}
+}
+
+// Panel de sesiones redimensionable: drag handle, ancho persistido.
+(function initSessResizer(){
+  const aside=document.querySelector('.agent-sessions-panel');
+  const layout=document.querySelector('.agent-layout');
+  const handle=document.getElementById('sess-resizer');
+  if(!aside||!layout||!handle)return;
+  try{
+    const w=parseInt(localStorage.getItem('ipa_sess_w')||'',10);
+    if(w>=160&&w<=560)layout.style.setProperty('--sess-w',w+'px');
+  }catch(e){}
+  handle.addEventListener('mousedown',e=>{
+    e.preventDefault();
+    const startX=e.clientX,startW=aside.getBoundingClientRect().width;
+    handle.classList.add('dragging');
+    document.body.style.userSelect='none';
+    function mv(ev){
+      const w=Math.min(560,Math.max(160,startW+ev.clientX-startX));
+      layout.style.setProperty('--sess-w',w+'px');
+      try{localStorage.setItem('ipa_sess_w',String(Math.round(w)))}catch(e2){}
+    }
+    function up(){
+      handle.classList.remove('dragging');
+      document.body.style.userSelect='';
+      document.removeEventListener('mousemove',mv);
+      document.removeEventListener('mouseup',up);
+    }
+    document.addEventListener('mousemove',mv);
+    document.addEventListener('mouseup',up);
+  });
+})();
+
+// Topbar ocultable: queda un handle flotante (▾) para restaurarla.
+function toggleTopbar(){
+  const hidden=document.body.classList.toggle('no-topbar');
+  const r=document.getElementById('topbar-restore');
+  if(r)r.style.display=hidden?'block':'none';
+  try{localStorage.setItem('ipa_topbar_hidden',hidden?'1':'0')}catch(e){}
+}
+
+(function initChrome(){
+  try{
+    if(localStorage.getItem('ipa_sidebar_collapsed')==='1'){
+      const sb=document.getElementById('sidebar');
+      if(sb)sb.classList.add('collapsed');
+      const t=document.getElementById('sidebar-toggle');
+      if(t)t.textContent='›';
+    }
+    if(localStorage.getItem('ipa_topbar_hidden')==='1'){
+      document.body.classList.add('no-topbar');
+      const r=document.getElementById('topbar-restore');
+      if(r)r.style.display='block';
+    }
+  }catch(e){}
+})();
+
+document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.nav-item,.panel').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
   $('#panel-'+b.dataset.panel).classList.add('active');
-  if(b.dataset.panel==='documents')loadDocuments();
-  if(b.dataset.panel==='review')loadDecisions();
+  if(b.dataset.panel==='approvals')loadApprovals();
+  if(b.dataset.panel==='agent')loadAgentPanel();
+  if(b.dataset.panel==='knowledge')loadKnowledge();
 });
+
+// ── Agent panel: chat + sesiones ─────────────────────────────────────────
+let agentSessionId=null;
+let chatRole='general';
+let ddContext=null;
+function setChatRole(role){
+  chatRole=role;
+  document.querySelectorAll('#chat-role .role-btn').forEach(b=>b.classList.toggle('active',b.dataset.role===role));
+}
+
+async function loadAgentPanel(){
+  try{
+    const d=await api('/api/agent/sessions');
+    renderSessionList(d.sessions||[]);
+    if(!agentSessionId&&d.sessions.length){openAgentSession(d.sessions[0].session_id)}
+    else if(!agentSessionId)renderChatEmpty();
+  }catch(e){$('#chat-messages').innerHTML=`<div class="notice">${esc(e.message)}</div>`}
+  loadTutorRoadmaps();
+}
+
+// ── Roadmap Tutor: stepper visual por unidad ─────────────────────────────
+async function loadTutorRoadmaps(){
+  const el=$('#tutor-roadmaps');
+  if(!el)return;
+  try{
+    const d=await api('/api/tutor/roadmaps');
+    renderTutorRoadmaps(d.roadmaps||[]);
+  }catch(e){el.innerHTML=`<div class="muted" style="font-size:12px">${esc(e.message)}</div>`}
+}
+
+function renderTutorRoadmaps(roadmaps){
+  const el=$('#tutor-roadmaps');
+  if(!roadmaps.length){el.innerHTML='<div class="muted" style="font-size:12px;padding:6px 0">Sin roadmaps todavía. Activá el rol Tutor y pedí aprender un tema.</div>';return}
+  el.innerHTML=roadmaps.map(r=>{
+    const steps=r.units.map(u=>{
+      const mark=u.status==='done'?'✓':u.status==='current'?'▶':String(u.order);
+      return `<div class="rm-step ${esc(u.status)}" title="${esc(u.reason)}">
+        <span class="rm-num">${mark}</span>
+        <div class="rm-body">
+          <div class="rm-title">${esc(u.title)}</div>
+          <div class="rm-meta">${u.minutes} min · ${esc((u.assessment_types||[]).join(', '))}</div>
+        </div>
+      </div>`;
+    }).join('');
+    const m=r.mastery
+      ?`<div class="rm-mastery">mastery ${esc(r.mastery.status)}${r.mastery.score!=null?' · '+(r.mastery.score*100).toFixed(0)+'%':''} · ${r.mastery.attempts} intentos · ${r.mastery.evidence_count} evidencias</div>`
+      :'';
+    return `<div class="rm-card" onclick="goToTutorChat()" title="Ir al chat del tutor">
+      <div class="rm-head"><span class="rm-topic">${esc(r.topic)}</span>
+        <span class="rm-head-actions">
+          <span class="rm-status ${esc(r.status)}">${esc(r.status)}</span>
+          <button class="icon-btn tiny" title="Archivar roadmap" onclick="event.stopPropagation();archiveTutorRoadmap('${esc(r.roadmap_id)}')">📦</button>
+        </span>
+      </div>
+      ${steps}${m}
+    </div>`;
+  }).join('');
+}
+
+async function archiveTutorRoadmap(roadmapId){
+  if(!confirm('¿Archivar este roadmap? Sale de la lista; el progreso se conserva.'))return;
+  try{
+    await api('/api/tutor/roadmap/archive',{method:'POST',body:JSON.stringify({roadmap_id:roadmapId,archived:true})});
+    toast('Roadmap archivado');
+    loadTutorRoadmaps();
+  }catch(e){toast(e.message)}
+}
+
+// Click en la card del roadmap → panel Agente, rol Tutor, input listo.
+function goToTutorChat(){
+  document.querySelectorAll('.nav-item,.panel').forEach(x=>x.classList.remove('active'));
+  const nav=document.querySelector('.nav-item[data-panel="agent"]');
+  if(nav)nav.classList.add('active');
+  const panel=$('#panel-agent');
+  if(panel)panel.classList.add('active');
+  setChatRole('tutor');
+  loadAgentPanel();
+  const input=$('#agent-chat-input');
+  if(input){input.focus();input.placeholder='Seguimos con el roadmap…'}
+}
+
+async function newAgentSession(){
+  try{
+    const d=await api('/api/agent/sessions/manage',{method:'POST',body:JSON.stringify({action:'new'})});
+    agentSessionId=d.session_id;
+    clearDdContext();
+    $('#chat-messages').innerHTML='<div class="muted" style="text-align:center;padding:40px">Nueva conversación lista. Escribí un mensaje.</div>';
+    loadAgentPanel();
+  }catch(e){toast(e.message)}
+}
+
+async function renameAgentSession(sessionId,currentTitle){
+  const title=window.prompt('Nuevo nombre:',currentTitle||'');
+  if(!title||!title.trim())return;
+  try{
+    await api('/api/agent/sessions/manage',{method:'POST',body:JSON.stringify({action:'rename',session_id:sessionId,title:title.trim()})});
+    toast('Sesión renombrada');
+    loadAgentPanel();
+  }catch(e){toast(e.message)}
+}
+
+async function archiveAgentSession(sessionId){
+  if(!confirm('¿Archivar esta conversación? Los episodios se conservan; sale de la lista activa.'))return;
+  try{
+    await api('/api/agent/sessions/manage',{method:'POST',body:JSON.stringify({action:'archive',session_id:sessionId})});
+    if(agentSessionId===sessionId){agentSessionId=null;$('#chat-messages').innerHTML='<div class="muted" style="text-align:center;padding:40px">Sesión archivada.</div>'}
+    toast('Sesión archivada');
+    loadAgentPanel();
+  }catch(e){toast(e.message)}
+}
+
+function renderSessionList(sessions){
+  const el=$('#agent-sessions-list');
+  if(!el)return;
+  if(!sessions.length){el.innerHTML='<div class="muted" style="padding:12px">Sin sesiones aún. Escribí un mensaje para empezar.</div>';return}
+  el.innerHTML=sessions.map(s=>`
+    <div class="session-item ${s.session_id===agentSessionId?'active':''}" onclick="openAgentSession('${esc(s.session_id)}')">
+      <div class="session-row">
+        <strong>${esc(s.title||s.session_id.slice(-14))}</strong>
+        <span class="session-actions">
+          <button class="icon-btn tiny" title="Renombrar" onclick="event.stopPropagation();renameAgentSession('${esc(s.session_id)}','${esc((s.title||'').replace(/'/g,"\\'"))}')">✏️</button>
+          <button class="icon-btn tiny" title="Archivar" onclick="event.stopPropagation();archiveAgentSession('${esc(s.session_id)}')">📦</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:11px">${esc(s.interface||'')} · ${s.episode_count||0} episodios · ${fmtRelative(s.last_active_at)}${s.consolidated_at?` · <span class="sum-flag" title="${esc((s.summary||'').slice(0,240))}">✦ resumida</span>`:''}</div>
+    </div>`).join('');
+}
+
+function renderChatEmpty(){
+  $('#chat-messages').innerHTML='<div class="chat-empty">Escribí un mensaje para empezar a conversar con tu agente.</div>';
+  _renderedEpisodeIds=new Set();
+}
+
+// Episodios ya renderizados (deduplicación: el poller solo agrega nuevos)
+let _renderedEpisodeIds=new Set();
+
+function renderEpisode(e){
+  return `<div class="chat-msg ${e.turn_role}" data-episode-id="${esc(e.episode_id)}">${e.turn_role==='assistant'?renderMarkdown(e.content):esc(e.content)}<div class="chat-meta">${esc(e.turn_role)} · ${fmtRelative(e.created_at)}</div></div>`;
+}
+
+// Polling: detecta episodios nuevos en la sesión activa (p. ej. el resumen
+// proactivo que el agente escribe cuando termina el pipeline). Append-only:
+// nunca re-renderiza lo que ya está (evita duplicar mensajes locales).
+setInterval(async()=>{
+  if(!agentSessionId)return;
+  const panel=$('#panel-agent');
+  if(!panel||!panel.classList.contains('active'))return;
+  try{
+    const d=await api('/api/agent/session?session_id='+encodeURIComponent(agentSessionId));
+    const msgs=$('#chat-messages');
+    const episodes=d.episodes||[];
+    const fresh=episodes.filter(e=>!_renderedEpisodeIds.has(e.episode_id));
+    if(!fresh.length)return;
+    // Si el chat está en medio de un streaming local, no tocar el DOM
+    if(msgs.querySelector('.chat-msg.streaming'))return;
+    const hadEmpty=msgs.querySelector('.chat-empty');
+    for(const e of fresh){
+      _renderedEpisodeIds.add(e.episode_id);
+      if(hadEmpty)hadEmpty.remove();
+      // Dedup: eliminar bubbles locales optimistas (user append / streaming
+      // ya cerrado) cuyo episodio canónico acaba de llegar. Sin esto, un
+      // re-render fallido dejaba ambas copias visibles para siempre.
+      const head=(e.content||'').replace(/\s+/g,' ').trim().slice(0,50);
+      if(head){
+        msgs.querySelectorAll('.chat-msg:not([data-episode-id]):not(.streaming)').forEach(l=>{
+          if(l.classList.contains(e.turn_role)
+             && l.textContent.replace(/\s+/g,' ').includes(head)){
+            l.remove();
+          }
+        });
+      }
+      msgs.insertAdjacentHTML('beforeend',renderEpisode(e));
+    }
+    scrollChatToBottom();
+    const isProactive=fresh.some(e=>e.turn_role==='assistant');
+    if(isProactive&&(document.hidden||!$('#panel-agent').classList.contains('active'))){
+      toast('💬 Tu agente tiene novedades');
+    }
+  }catch{}
+},10000);
+
+// Card de pipeline en vivo dentro del chat: se crea cuando el agente lanza
+// run_pipeline y se actualiza cada 5s desde /api/state hasta que termina.
+let _pipelineCardTimer=null;
+function mountPipelineCardInChat(){
+  const msgs=$('#chat-messages');
+  if(!msgs||document.getElementById('chat-pipeline-card'))return;
+  const card=document.createElement('div');
+  card.id='chat-pipeline-card';
+  card.className='chat-pipeline-card';
+  card.innerHTML='<span class="eyebrow">PIPELINE EN CURSO</span><div class="pc-stage">Iniciando…</div><div class="pc-bar"><div class="pc-fill" style="width:0%"></div></div><div class="muted" style="font-size:11px" id="chat-pipeline-detail"></div>';
+  msgs.appendChild(card);
+  scrollChatToBottom();
+  if(_pipelineCardTimer)clearInterval(_pipelineCardTimer);
+  _pipelineCardTimer=setInterval(async()=>{
+    const cardEl=document.getElementById('chat-pipeline-card');
+    if(!cardEl){clearInterval(_pipelineCardTimer);_pipelineCardTimer=null;return}
+    try{
+      const st=await api('/api/state');
+      const p=st.pipeline||{};
+      const stageLabels={'scraper':'Scraping','fast_path':'Ingestando (BM25 + LanceDB)','reporter_fast':'Reporte rápido','reporter_full':'Reporte (BGE-M3 + Qwen)','parallel':'Generando reporte'};
+      if(p.status==='running'){
+        cardEl.querySelector('.pc-fill').style.width=(p.percent||0)+'%';
+        cardEl.querySelector('.pc-stage').textContent=`${stageLabels[p.stage]||p.stage||'Ejecutando'} · ${p.percent||0}%`;
+        const detail=$('#chat-pipeline-detail');
+        if(detail)detail.textContent=p.detail||'';
+      }else{
+        // Terminó (o falló): congelar la card y dejar de poller
+        cardEl.querySelector('.pc-fill').style.width='100%';
+        cardEl.querySelector('.pc-stage').textContent=p.status==='done'?'✓ Completado':'Estado: '+(p.status||'finalizado');
+        clearInterval(_pipelineCardTimer);_pipelineCardTimer=null;
+      }
+    }catch{}
+  },5000);
+}
+
+async function openAgentSession(sessionId){
+  agentSessionId=sessionId;
+  try{
+    const d=await api('/api/agent/session?session_id='+encodeURIComponent(sessionId));
+    renderSessionList((await api('/agent/sessions'.replace('/agent','/api/agent'))).sessions);
+    const msgs=$('#chat-messages');
+    _renderedEpisodeIds=new Set((d.episodes||[]).map(e=>e.episode_id));
+    const msgs=$('#chat-messages');
+    _renderedEpisodeIds=new Set((d.episodes||[]).map(e=>e.episode_id));
+    if(!d.episodes.length){renderChatEmpty();mountPendingTutorGates();return}
+    $('#chat-messages').innerHTML=d.episodes.map(renderEpisode).join('');
+    scrollChatToBottom();
+    mountPendingTutorGates();
+  }catch(e){toast(e.message)}
+}
+
+function scrollChatToBottom(){
+  const el=$('#chat-messages');
+  if(el)el.scrollTop=el.scrollHeight;
+}
+
+function sendAgentText(text){
+  const input=$('#agent-chat-input');
+  input.value=text;
+  sendAgentMessage({preventDefault(){}});
+}
+// Gate del tutor: card con Aprobar / Rechazar / Debatir. Se re-monta desde
+// /api/agent/approvals después de cada re-render (los gates no son episodios
+// y el re-render canónico los borra).
+function tutorGateCard(kind,id,heading,subHtml){
+  return `<div class="tutor-gate" id="gate-${esc(id)}" data-gate-kind="${esc(kind)}">
+    <div style="width:100%;font-size:12px;color:var(--muted)">${kind==='roadmap'?esc(heading||'Roadmap propuesto'):'Investigación propuesta'}${sub||''}</div>
+    <button class="approve" onclick="tutorDecide('${kind}','${esc(id)}','approve')">Aprobar</button>
+    <button class="reject" onclick="tutorDecide('${kind}','${esc(id)}','reject')">Rechazar</button>
+    ${kind==='roadmap'?`<button class="ghost small" onclick="tutorDebate('${esc(id)}')">Debatir</button>`:''}
+  </div>`;
+}
+function tutorDebate(id){
+  const gate=document.getElementById('gate-'+id);
+  if(!gate)return;
+  if(gate.querySelector('.debate-row'))return;
+  const row=document.createElement('div');
+  row.className='debate-row';
+  row.style.cssText='display:flex;gap:6px;width:100%;margin-top:6px';
+  row.innerHTML=`<input type="text" class="debate-input" placeholder="Qué ajustar: orden, profundidad, alcance…" style="flex:1;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--text);font-size:12px">
+    <button class="primary" style="padding:4px 12px;font-size:12px">Enviar</button>`;
+  const send=()=>{
+    const txt=row.querySelector('input').value.trim();
+    if(!txt)return;
+    row.remove();
+    sendAgentText(txt);
+  };
+  row.querySelector('button').onclick=send;
+  row.querySelector('input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();send()}});
+  gate.appendChild(row);
+  row.querySelector('input').focus();
+}
+async function mountPendingTutorGates(){
+  const msgs=$('#chat-messages');
+  if(!msgs||!agentSessionId)return;
+  try{
+    const d=await api('/api/agent/approvals?status=pending');
+    const gates=(d.approvals||[]).filter(a=>
+      (a.kind==='roadmap'||a.kind==='research_request')
+      &&['pending','proposed','pending_approval'].includes(a.status));
+    for(const a of gates){
+      if(document.getElementById('gate-'+a.id))continue;
+      const sub=`<div class="muted" style="font-size:12px;margin-top:4px">${esc(a.summary||'')}</div>`;
+      msgs.insertAdjacentHTML('beforeend',tutorGateCard(a.kind==='roadmap'?'roadmap':'research',a.id,a.kind==='roadmap'?(a.title||'Roadmap propuesto'):'Investigación propuesta',sub));
+    }
+    scrollChatToBottom();
+  }catch{}
+}
+async function tutorDecide(kind,id,decision){
+  const url=kind==='roadmap'?'/api/tutor/roadmap/decision':'/api/tutor/research/decision';
+  const body=kind==='roadmap'?{roadmap_id:id,decision}:{request_id:id,decision};
+  if(agentSessionId)body.session_id=agentSessionId;
+  const gate=document.getElementById('gate-'+id);
+  if(gate)gate.querySelectorAll('button').forEach(b=>b.disabled=true);
+  try{
+    const d=await api(url,{method:'POST',body:JSON.stringify(body)});
+    if(!d.ok){toast(d.error||'Error en la decisión');if(gate)gate.querySelectorAll('button').forEach(b=>b.disabled=false);return}
+    if(gate){
+      const status=d.status==='approved'?'<span style="color:var(--accent)">Aprobado</span>':'<span style="color:var(--danger)">Rechazado</span>';
+      gate.innerHTML=`<div style="font-size:12px">${status}</div>`;
+    }
+    if(kind==='research'&&d.status==='approved'){
+      const ind=$('#research-indicator');
+      if(ind){ind.style.display='flex';$('#research-indicator-text').textContent='Investigación del tutor en curso…'}
+    }
+    loadApprovals&&loadApprovals();
+    loadTutorRoadmaps();
+  }catch(e){
+    toast(e.message);
+    if(gate)gate.querySelectorAll('button').forEach(b=>b.disabled=false);
+  }
+}
+
+async function sendAgentMessage(event){
+  event.preventDefault();
+  const input=$('#agent-chat-input');
+  const message=input.value.trim();
+  if(!message)return;
+  input.value='';
+  // Cancelar stream anterior si todavía está generando (bug del 2026-09-08:
+  // mandar un mensaje nuevo no cancelaba el anterior, dejando bubbles
+  // streaming vacíos superpuestos).
+  if(window._agentStreamController){
+    try{window._agentStreamController.abort()}catch{}
+    window._agentStreamController=null;
+  }
+  // Remover bubbles "streaming" huérfanos del turno anterior
+  document.querySelectorAll('.chat-msg.assistant.streaming').forEach(el=>el.remove());
+  appendChatMsg('user',message);
+  // Create assistant placeholder for streaming
+  const el=$('#chat-messages');
+  const assistantDiv=document.createElement('div');
+  assistantDiv.className='chat-msg assistant streaming';
+  assistantDiv.innerHTML='<div class="chat-content"></div><div class="chat-meta">assistant · ahora</div>';
+  el.appendChild(assistantDiv);
+  const contentEl=assistantDiv.querySelector('.chat-content');
+  el.scrollTop=el.scrollHeight;
+
+  try{
+    const body={message,role:chatRole};
+    if(agentSessionId)body.session_id=agentSessionId;
+    if(ddContext){
+      body.context='deep_dive';
+      body.corpus=ddContext.corpus;
+      body.category_id=ddContext.category_id;
+      body.search=ddContext.search;
+    }
+    const controller=new AbortController();
+    window._agentStreamController=controller;
+    const response=await fetch('/api/agent/chat/stream',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body),
+      signal:controller.signal
+    });
+    if(!response.ok){
+      const errData=await response.json().catch(()=>({error:'HTTP '+response.status}));
+      contentEl.textContent='[error] '+errData.error;
+      assistantDiv.classList.remove('streaming');
+      return;
+    }
+    const reader=response.body.getReader();
+    const decoder=new TextDecoder();
+    let buffer='';
+    let fullReply='';
+    let lastSources=[];
+    const pendingTutorGates=[];
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buffer+=decoder.decode(value,{stream:true});
+      const lines=buffer.split('\n');
+      buffer=lines.pop()||'';
+      for(const line of lines){
+        if(!line.startsWith('data: '))continue;
+        try{
+          const data=JSON.parse(line.slice(6));
+          if(data.type==='session'){agentSessionId=data.session_id}
+          else if(data.type==='token'){fullReply+=data.text;contentEl.textContent=fullReply;el.scrollTop=el.scrollHeight}
+          else if(data.type==='retrieval'){
+            const stageLabels={
+              'start':'Buscando en el corpus…',
+              'searching':'Consultando índice vectorial…',
+              'found':`Encontrados ${data.count} chunks relevantes`,
+              'empty':'Sin resultados en el corpus',
+              'no_corpus':'Corpus no disponible',
+              'timeout':'Retrieval demorado — respondiendo sin contexto',
+              'error':`Error en retrieval: ${data.error||'?'}`
+            };
+            if(data.stage==='found'&&data.sources){lastSources=data.sources}
+            if(data.stage==='empty'){
+              contentEl.innerHTML=`<span class="tool-activity">${esc(stageLabels.empty)}</span>`+
+                `<button class="research-btn" data-q="${esc(data.query||'')}" onclick="sendAgentText('investigá '+this.dataset.q)">🔎 Investigar en la web</button>`;
+            }else{
+              contentEl.innerHTML=`<span class="tool-activity">${esc(stageLabels[data.stage]||data.stage)}</span>`;
+            }
+            el.scrollTop=el.scrollHeight;
+          }
+          else if(data.type==='tool_start'){
+            fullReply='';
+            contentEl.innerHTML=`<span class="tool-activity">🔧 Ejecutando <strong>${esc(data.tool)}</strong>${data.args&&Object.keys(data.args).length?` ${esc(JSON.stringify(data.args))}`:''}…</span>`;
+            el.scrollTop=el.scrollHeight;
+          }
+          else if(data.type==='tool_result'){
+            contentEl.innerHTML=`<span class="tool-activity ${data.ok?'ok':'fail'}">${data.ok?'✓':'✗'} ${esc(data.tool)}</span>`;
+            el.scrollTop=el.scrollHeight;
+            if((data.tool==='run_pipeline'||data.tool==='run_ingestion')&&data.ok)mountPipelineCardInChat();
+          }
+          else if(data.type==='new_message'){
+            // El agente continúa en una burbuja nueva (post-tool)
+            fullReply='';
+            const div2=document.createElement('div');
+            div2.className='chat-msg assistant streaming';
+            div2.innerHTML='<div class="chat-content"></div><div class="chat-meta">assistant · ahora</div>';
+            el.appendChild(div2);
+            contentEl=div2.querySelector('.chat-content');
+            el.scrollTop=el.scrollHeight;
+          }
+          else if(data.type==='roadmap_proposal'){
+            pendingTutorGates.push({kind:'roadmap',id:data.roadmap_id,title:data.title,items:data.items});
+          }
+          else if(data.type==='research_proposal'){
+            pendingTutorGates.push({kind:'research',id:data.request_id,query:data.query});
+          }
+          else if(data.type==='error'){contentEl.textContent='[error] '+(data.error||'unknown');assistantDiv.classList.remove('streaming')}
+          else if(data.type==='done'){
+            if(data.follow_up){
+              contentEl.innerHTML=renderMarkdown(data.follow_up);
+            }else{
+              fullReply=data.reply||fullReply;
+              contentEl.innerHTML=renderMarkdown(fullReply);
+            }
+            if(lastSources.length){
+              const items=lastSources.map(s=>{
+                const label=s.source_domain||s.document_id||'?';
+                const inner=s.source_url
+                  ?`<a href="${esc(s.source_url)}" target="_blank" rel="noopener">[${s.n}] ${esc(label)}</a>`
+                  :`[${s.n}] ${esc(label)}`;
+                return `<div class="source-item">${inner}</div>`;
+              }).join('');
+              contentEl.innerHTML+=`<div class="sources-block"><div class="sources-title">Fuentes</div>${items}</div>`;
+            }
+            if(pendingTutorGates.length){
+              const gates=pendingTutorGates.map(g=>{
+                const list=g.items?`<ul style="margin:6px 0 0 18px;font-size:12px;color:var(--muted)">${g.items.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>`:'';
+                const sub=g.query?`<div class="muted" style="font-size:12px;margin-top:4px">${esc(g.query)}</div>`:'';
+                return tutorGateCard(g.kind,g.id,g.title,sub+list);
+              }).join('');
+              contentEl.innerHTML+=gates;
+            }
+            assistantDiv.classList.remove('streaming');
+          }
+        }catch{}
+      }
+    }
+    assistantDiv.classList.remove('streaming');
+    // Re-render desde el servidor: la verdad canónica. Elimina duplicados
+    // (el append local del user + el episodio del servidor) y muestra los
+    // episode_ids reales para que el poller deduplique correctamente.
+    // Retry: si el fetch falla, el poller dedup limpia las copias locales
+    // en el próximo tick — no dejamos duplicados permanentes.
+    let sessData=null;
+    for(let a=0;a<3&&!sessData;a++){
+      try{sessData=await api('/api/agent/session?session_id='+encodeURIComponent(agentSessionId))}
+      catch(e){await new Promise(r=>setTimeout(r,700))}
+    }
+    if(sessData){
+      const msgs=$('#chat-messages');
+      _renderedEpisodeIds=new Set((sessData.episodes||[]).map(e=>e.episode_id));
+      msgs.innerHTML=sessData.episodes.map(renderEpisode).join('');
+      scrollChatToBottom();
+    }
+    loadAgentPanel();
+    mountPendingTutorGates();
+  }catch(err){
+    if(err.name==='AbortError'){
+      // Cancelado por un mensaje nuevo: remover el bubble vacío
+      assistantDiv.remove();
+    }else{
+      contentEl.textContent='[error] '+err.message;
+      assistantDiv.classList.remove('streaming');
+    }
+  }finally{
+    window._agentStreamController=null;
+  }
+}
+
+function appendChatMsg(role,content){
+  const el=$('#chat-messages');
+  const div=document.createElement('div');
+  div.className='chat-msg '+role;
+  if(role==='assistant'){div.innerHTML=renderMarkdown(content)}
+  else{div.textContent=content}
+  el.appendChild(div);
+  el.scrollTop=el.scrollHeight;
+}
+
+// ── Unified approvals queue (Fase 3) ─────────────────────────────────────
+async function loadApprovals(){
+  const el=$('#approvals-queue');
+  if(!el)return;
+  try{
+    const filter=$('#approvals-filter')?.value||'pending';
+    const d=await api('/api/agent/approvals?status='+encodeURIComponent(filter));
+    if(!d.approvals.length){el.innerHTML='<div class="muted" style="text-align:center;padding:40px">No hay nada esperando tu decisión. Todo al día.</div>';return}
+    const kindLabels={memory_consolidation:'Consolidación de memoria',mastery_inference:'Inferencia de mastery',roadmap:'Roadmap pedagógico',research_request:'Research request',reporter_decision:'Curación Reporter'};
+    el.innerHTML=d.approvals.map(a=>`
+      <div class="approval-card kind-${esc(a.kind)}">
+        <div class="approval-info">
+          <span class="approval-kind">${esc(kindLabels[a.kind]||a.kind)}</span>
+          <div class="approval-summary">${esc(a.summary)}</div>
+          <div class="approval-meta">${esc(a.topic_id||'')} · ${fmtRelative(a.proposed_at)} · estado: ${esc(a.status)}</div>
+          ${a.units?`<details><summary class="muted">${a.units.length} unidades</summary>${a.units.map(u=>`<div class="muted" style="padding:4px 0">${u.order}. ${esc(u.concept_id)} — ${esc(u.reason)}</div>`).join('')}</details>`:''}
+        </div>
+        <div class="approval-actions">
+          ${a.status==='pending'||a.status==='proposed'||a.status==='pending_approval'?`
+            <button class="approve-btn" onclick="decideApproval('${esc(a.kind)}','${esc(a.id)}','approved')">Aprobar</button>
+            <button class="reject-btn" onclick="decideApproval('${esc(a.kind)}','${esc(a.id)}','rejected')">Rechazar</button>`
+          :`<span class="approval-status ${a.status}">${esc(a.status)}</span>`}
+        </div>
+      </div>`).join('')||'<div class="muted" style="text-align:center;padding:40px">Nada pendiente.</div>';
+  }catch(e){el.innerHTML=`<div class="notice">${esc(e.message)}</div>`}
+}
+
+async function decideApproval(kind,id,decision){
+  try{
+    const endpoint={'memory_consolidation':'/api/agent/approvals/consolidation',
+                    'mastery_inference':'/api/agent/approvals/mastery',
+                    'roadmap':'/api/agent/approvals/roadmap',
+                    'research_request':'/api/agent/approvals/research'}[kind];
+    if(!endpoint){toast('Tipo de aprobación desconocido: '+kind);return}
+    await api(endpoint,{method:'POST',body:JSON.stringify({id,decision:decision,decided_by:'web-user'})});
+    toast(decision==='approved'?'Aprobado':'Rechazado');
+    loadApprovals();
+  }catch(e){toast(e.message)}
+}
+
+// ── Knowledge panel (documents + chunks browser) ─────────────────────────
+async function loadKnowledge(){
+  const el=$('#knowledge-documents');
+  if(!el)return;
+  try{
+    const corpus=$('#knowledge-corpus')?.value||'reporter';
+    const d=await api('/api/documents?corpus='+encodeURIComponent(corpus)+'&limit=100');
+    const docs=d.documents||[];
+    if(!docs.length){el.innerHTML='<div class="muted" style="text-align:center;padding:40px">Sin documentos en este corpus.</div>';return}
+    el.innerHTML=docs.map(d=>`
+      <div class="doc-item" onclick="viewDocument('${esc(d.path||'')}')">
+        <strong>${esc(d.title||d.name||d.document_id||'')}</strong>
+        <div class="muted">${esc(d.mime_type||'')} · ${fmtRelative(d.received_at||d.created_at||'')}</div>
+      </div>`).join('');
+  }catch(e){el.innerHTML=`<div class="notice">${esc(e.message)}</div>`}
+}
 
 // Process modal
 let processTimer=null;
@@ -868,8 +1596,7 @@ async function cleanReporterCorpus(){
 
 async function startProcess(name,endpoint){
   try{
-    const body=name==='enrichment'?JSON.stringify({embeddings:true,llm:true}):'{}';
-    const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body});
+    const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     if(!r.ok){const e=await r.json().catch(()=>({error:r.statusText}));alert('Error: '+e.error);return}
     refreshAll();
   }catch(e){alert('Error: '+e.message)}
@@ -915,6 +1642,13 @@ async function loadProcessDetail(name){
     if(processTimer){clearInterval(processTimer);processTimer=null}
     if(isRunning){
       processTimer=setInterval(()=>{if(currentProcess===name)loadProcessDetail(name);else{clearInterval(processTimer);processTimer=null}},3000);
+    }else{
+      // Process finished: one final refresh to show the completed state.
+      // The card in the overview updates via refreshAll, but the detail panel
+      // was stuck showing the last "running" snapshot.
+      if(currentProcess===name){
+        setTimeout(()=>{if(currentProcess===name)loadProcessDetail(name)},1500);
+      }
     }
   }catch(e){target.innerHTML=`<div class="notice">${esc(e.message)}</div>`}
 }

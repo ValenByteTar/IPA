@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/agent_session.schema.json",
+  "title": "AgentSession",
+  "description": "Durable agent session opened by a surface (CLI, dashboard). The session groups episodes; identity, memory and state live in the agent core, not in the surface (DEC-002).",
+  "type": "object", "additionalProperties": false,
+  "required": ["session_id", "interface", "role", "status", "started_at", "last_active_at", "identity_hash", "episode_count"],
+  "properties": {
+    "session_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "interface": { "$ref": "agent_common.schema.json#/$defs/interface" },
+    "role": { "$ref": "agent_common.schema.json#/$defs/role" },
+    "status": { "$ref": "agent_common.schema.json#/$defs/sessionStatus" },
+    "title": { "type": ["string", "null"], "maxLength": 200 },
+    "started_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "last_active_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "identity_hash": { "$ref": "agent_common.schema.json#/$defs/identityHash" },
+    "episode_count": { "type": "integer", "minimum": 0 }
+  }
+}

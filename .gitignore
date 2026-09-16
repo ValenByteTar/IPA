@@ -13,6 +13,8 @@ Landing/*
 !Landing/.gitkeep
 Archive/*
 !Archive/.gitkeep
+Transit/*
+!Transit/.gitkeep
 models/*
 !models/.gitkeep
 # exllamav3-dev: track docs and placeholder, ignore vendored source and binaries

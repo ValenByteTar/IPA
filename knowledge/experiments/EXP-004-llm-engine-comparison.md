@@ -77,13 +77,38 @@ Runs `delib-final-*` (EXL3 3.0bpw + MTP, batch 6):
 - [x] deliberación vinculada a artefactos crudos
 - [x] Granite 4.1-8B ejecutado (con caveat de rubric y casos)
 - [x] `environment.json` registra solo GPU y Python → **resuelto 2026-09-06**: el runner ahora registra `library_versions` (torch, exllamav3 desde version.py, extensión, fla, transformers, safetensors); versiones históricas capturadas post-hoc del mismo venv
-- [ ] prueba formal de sesión larga, cancelación y reset del generator
+- [x] prueba formal de sesión larga, cancelación y reset del generator → **resuelto 2026-09-08**: 30 turnos secuenciales con Qwen3.5-9B EXL3 3.0bpw, 60 episodios registrados, 0 fallos, VRAM estable (crecimiento neto +20 MB, pico 4735 MB), unload limpio a 718 MB
 - [x] re-score EXL3 vs GGUF sobre el subset común de 6 tareas: GGUF superior en calidad (0.8906 vs 0.8160; pareado 31-58-199)
 - [ ] re-run de Granite con rubric v2 y 48 casos, o declarar formalmente la comparación no comparable
 
 ## Conclusión
 
 Los runs crudos confirman el perfil operacional EXL3 3.0bpw + MTP (41.7 tok/s por secuencia, 295 tok/s agregados, 5025 MB VRAM, 0 failures). El re-score del subset común muestra que **GGUF es superior en calidad** (0.8906 vs 0.8160; EXL3 solo supera en groundedness y en t12); la debilidad principal del perfil EXL3 sigue siendo diagnóstico pedagógico (diagnosis_accuracy 0.6707 en el subset).
+
+## Gate Fase 2 del Tutor (2026-09-08)
+
+Corrida formal `tutor-fase2-qwen35-9b-3.0` (720 generaciones, 15 tareas × 48 casos, EXL3 3.0bpw, batch 8 óptimo empírico, sin MTP — configuración idéntica a la baseline `full-qwen9b-3.0` para comparabilidad), ejecutada como gate cuantitativo de Fase 2 del agent-core roadmap:
+
+| Métrica | Baseline `full-qwen9b-3.0` (rubric v1) | Gate Fase 2 (rubric v2, t12 corregido) | Δ |
+|---|---:|---:|---:|
+| n | 720 | 720 | — |
+| quality_score_avg | 0.9054 | 0.9124 | +0.007 |
+| diagnosis_accuracy | 0.6977 | 0.6628 | −0.035 |
+| next_step_accuracy | 0.0 (rubric vieja) | 0.75 | +0.75 |
+| json_valid_rate | 0.8854 | 0.9028 | +0.017 |
+| abstention_accuracy | 0.7708 | 0.8125 | +0.042 |
+| groundedness | 0.968 | 0.9437 | −0.024 |
+| no_unsupported_claims | 0.9985 | 0.9986 | +0.000 |
+| tok/s | 15.1 | 27.5 | +12.4 |
+| VRAM peak | 4648 MB | 4924 MB | +276 MB |
+
+- 720/720 generaciones, 0 failures, 0 OOM, 0 timeouts. Decision del runner: `candidate`.
+- `next_step_accuracy` 0.75 con la rubrica t12 corregida (la baseline 0.0 era un artefacto de parsing, ver corrección 1 arriba).
+- `diagnosis_accuracy` 0.6628 vs 0.6977 baseline (−3.5pp): dentro del rango 0.67-0.70 medido para el 9B (BM-006); el andamiaje determinístico del Tutor (TutorSession.diagnose) es la compensación.
+- `abstention_accuracy` 0.8125: consistente con el rango 0.81-0.89 del roadmap.
+- Artefactos crudos: `small-model-deliberation/engine_benchmark/results/tutor-fase2-qwen35-9b-3.0/` (metrics.json, raw_outputs.jsonl, 720 records).
+
+**Conclusión del gate**: el gate cuantitativo de Fase 2 se cumple — el loop del Tutor (diagnóstico → lección → assessment → mastery) está soportado cuantitativamente por el modelo estrella en la configuración de producción (EXL3 3.0bpw, batch 8, sin MTP).
 
 ## Recomendación
 

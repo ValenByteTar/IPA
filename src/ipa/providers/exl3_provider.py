@@ -1,4 +1,4 @@
-﻿"""ExLlamaV3 provider â€” inferencia nativa GPU sin overhead HTTP.
+"""ExLlamaV3 provider â€” inferencia nativa GPU sin overhead HTTP.
 
 Modelo estrella: Qwen3.5-9B EXL3 3.0bpw + MTP speculative decoding.
 Seleccionado por benchmark pedagÃ³gico (720 generaciones, 15 tareas,
@@ -177,6 +177,52 @@ def _detect_family(model_id: str) -> str:
     return "chatml"
 
 
+def _build_cjk_bias(tokenizer) -> Dict[int, float]:
+    """Construye {token_id: -inf} para tokens con caracteres CJK.
+
+    Escanea el vocabulario decodificando por chunks (decode exige Tensor).
+    Si un token decodifica con caracteres de los rangos CJK (han, kana,
+    hangul, compatibilidad), se banea. Scan O(vocab), ~0.2s para 248k tokens.
+    """
+    import torch
+    bias: Dict[int, float] = {}
+    vocab_size = getattr(tokenizer, "actual_vocab_size", None) or 150000
+    chunk = 2048
+    for start in range(0, vocab_size, chunk):
+        end = min(start + chunk, vocab_size)
+        try:
+            id_tensor = torch.arange(start, end, dtype=torch.long)
+            texts = tokenizer.decode(id_tensor)
+        except Exception:
+            continue
+        for tid, piece in zip(range(start, end), texts):
+            if piece and _has_cjk(piece):
+                bias[tid] = float("-inf")
+    return bias
+
+
+def _has_cjk(text: str) -> bool:
+    """True si el texto contiene caracteres no latinos (CJK o cirílico).
+
+    El modelo es bilingüe zh/en y en español desliza caracteres chinos
+    Y cirílicos ("Модель" visto en producción). Ambos alfabetos están
+    baneados a nivel sampler para respuestas en alfabeto latino puro.
+    """
+    for ch in text:
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF    # CJK Unified Ideographs
+            or 0x3400 <= code <= 0x4DBF  # CJK Extension A
+            or 0x3040 <= code <= 0x30FF  # Hiragana + Katakana
+            or 0xAC00 <= code <= 0xD7AF  # Hangul
+            or 0xF900 <= code <= 0xFAFF  # CJK Compatibility Ideographs
+            or 0x0400 <= code <= 0x04FF  # Cyrillic
+            or 0x0500 <= code <= 0x052F  # Cyrillic Supplement
+        ):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # VRAM monitor
 # ---------------------------------------------------------------------------
@@ -323,6 +369,10 @@ class ExL3Provider:
         use_mtp: bool = True,
         mtp_draft_tokens: int = 2,
         mtp_cache_tokens: int = 4096,
+        cache_k_bits: int = 0,
+        cache_v_bits: int = 0,
+        suppress_cjk: bool = False,
+        rep_p: float = 1.1,
     ) -> None:
         self.model_path = model_path
         self.model_id = model_id
@@ -335,10 +385,20 @@ class ExL3Provider:
         self.top_k = top_k
         self.seed = seed
         self.no_think = no_think
+        self.rep_p = rep_p
         self.batch_size = batch_size
         self.use_mtp = use_mtp
         self.mtp_draft_tokens = mtp_draft_tokens
         self.mtp_cache_tokens = mtp_cache_tokens
+        # KV cache cuantizado: 0 = fp16 (default). 8 = q8 (mitad de VRAM).
+        # Solo aplica a capas de atención global; las recurrentes usan O(1).
+        self.cache_k_bits = cache_k_bits
+        self.cache_v_bits = cache_v_bits
+        # Ban de tokens CJK (chino/japonés/coreano): el modelo es bilingüe
+        # zh/en y en español a veces desliza caracteres chinos. El bias -inf
+        # los prohíbe a nivel sampler (capa dura); el prompt es la capa blanda.
+        self.suppress_cjk = suppress_cjk
+        self._cjk_bias: Optional[Dict[int, float]] = None
         self._mtp_model = None
         self._mtp_cache = None
         self._config = None
@@ -365,12 +425,28 @@ class ExL3Provider:
         if is_recurrent:
             print(f"  [EXL3] Model has recurrent states (Mamba/SSM/linear-attn)", flush=True)
 
+        # Construir ban de tokens CJK una sola vez por carga (scan del vocab).
+        if self.suppress_cjk:
+            self._cjk_bias = _build_cjk_bias(self._tokenizer)
+            print(f"  [EXL3] CJK suppress: {len(self._cjk_bias)} tokens baneados", flush=True)
+
         # mtp_cache_tokens: permite override del cache limit.
         # CRÃTICO: default 2048 causa outputs vacÃ­os en prompts >750 tokens.
         if self.mtp_cache_tokens > 0:
             cache_tokens = min(self.context_length, self.mtp_cache_tokens)
         else:
             cache_tokens = min(self.context_length, 2048) if self.use_mtp else self.context_length
+
+        # KV cache cuantizado (opcional): reduce VRAM del cache principal.
+        # El cache MTP queda en fp16: el speculative decoding depende de él.
+        _quant_layer = None
+        if self.cache_k_bits and self.cache_v_bits:
+            try:
+                from exllamav3.cache import CacheLayer_quant as _CacheLayer_quant
+                _quant_layer = _CacheLayer_quant
+                print(f"  [EXL3] KV cache principal cuantizado: k={self.cache_k_bits}b v={self.cache_v_bits}b (MTP fp16)", flush=True)
+            except ImportError:
+                print("  [EXL3] CacheLayer_quant no disponible; usando fp16", flush=True)
 
         if self.use_mtp:
             self._mtp_model = Model.from_config(self._config, component="mtp")
@@ -382,12 +458,23 @@ class ExL3Provider:
             )
             self._mtp_model.load(reserve_per_device=0.05)
 
-        self._cache = Cache(
-            self._model,
-            max_num_tokens=cache_tokens,
-            max_batch_size=self.batch_size,
-            max_history=self.mtp_draft_tokens if self.use_mtp else 0,
-        )
+        if _quant_layer is not None:
+            self._cache = Cache(
+                self._model,
+                max_num_tokens=cache_tokens,
+                max_batch_size=self.batch_size,
+                max_history=self.mtp_draft_tokens if self.use_mtp else 0,
+                layer_type=_quant_layer,
+                k_bits=self.cache_k_bits,
+                v_bits=self.cache_v_bits,
+            )
+        else:
+            self._cache = Cache(
+                self._model,
+                max_num_tokens=cache_tokens,
+                max_batch_size=self.batch_size,
+                max_history=self.mtp_draft_tokens if self.use_mtp else 0,
+            )
         if self.use_mtp:
             self._model.load(reserve_per_device=0.05)
         else:
@@ -501,7 +588,7 @@ class ExL3Provider:
         max_tokens = max_new_tokens or self.max_output_tokens
         temp = temperature if temperature is not None else self.temperature
 
-        sampler = ComboSampler()
+        sampler = ComboSampler(logit_bias=self._cjk_bias, rep_p=self.rep_p)
         sampler.temperature = temp
         sampler.top_p = self.top_p if self.top_p < 1.0 else 0.0
         sampler.top_k = self.top_k if self.top_k > 0 else 0
@@ -510,11 +597,13 @@ class ExL3Provider:
 
         stops = list(stop_sequences) if stop_sequences else []
         if self._family in ("chatml", "ornith", "lfm"):
-            if "<|im_end|>" not in stops:
-                stops.append("<|im_end|>")
+            for s in ("<|im_end|>", "</s>", "<|im_start|>", "</think>"):
+                if s not in stops:
+                    stops.append(s)
         elif self._family == "granite":
-            if "<|end_of_text|>" not in stops:
-                stops.append("<|end_of_text|>")
+            for s in ("<|end_of_text|>", "</s>"):
+                if s not in stops:
+                    stops.append(s)
 
         try:
             input_ids = self._tokenizer.encode(prompt, add_bos=False)
@@ -598,7 +687,7 @@ class ExL3Provider:
         max_tokens = max_new_tokens or self.max_output_tokens
         temp = temperature if temperature is not None else self.temperature
 
-        sampler = ComboSampler()
+        sampler = ComboSampler(logit_bias=self._cjk_bias, rep_p=self.rep_p)
         sampler.temperature = temp
         sampler.top_p = self.top_p if self.top_p < 1.0 else 0.0
         sampler.top_k = self.top_k if self.top_k > 0 else 0
@@ -607,11 +696,13 @@ class ExL3Provider:
 
         stops = list(stop_sequences) if stop_sequences else []
         if self._family in ("chatml", "ornith", "lfm"):
-            if "<|im_end|>" not in stops:
-                stops.append("<|im_end|>")
+            for s in ("<|im_end|>", "</s>", "<|im_start|>", "</think>"):
+                if s not in stops:
+                    stops.append(s)
         elif self._family == "granite":
-            if "<|end_of_text|>" not in stops:
-                stops.append("<|end_of_text|>")
+            for s in ("<|end_of_text|>", "</s>"):
+                if s not in stops:
+                    stops.append(s)
 
         try:
             input_ids = self._tokenizer.encode(prompt, add_bos=False)
@@ -711,7 +802,7 @@ class ExL3Provider:
         max_tokens = max_new_tokens or self.max_output_tokens
         temp = temperature if temperature is not None else self.temperature
 
-        sampler = ComboSampler()
+        sampler = ComboSampler(logit_bias=self._cjk_bias, rep_p=self.rep_p)
         sampler.temperature = temp
         sampler.top_p = self.top_p if self.top_p < 1.0 else 0.0
         sampler.top_k = self.top_k if self.top_k > 0 else 0
@@ -720,11 +811,13 @@ class ExL3Provider:
 
         stops = list(stop_sequences) if stop_sequences else []
         if self._family in ("chatml", "ornith", "lfm"):
-            if "<|im_end|>" not in stops:
-                stops.append("<|im_end|>")
+            for s in ("<|im_end|>", "</s>", "<|im_start|>", "</think>"):
+                if s not in stops:
+                    stops.append(s)
         elif self._family == "granite":
-            if "<|end_of_text|>" not in stops:
-                stops.append("<|end_of_text|>")
+            for s in ("<|end_of_text|>", "</s>"):
+                if s not in stops:
+                    stops.append(s)
 
         results = [GenerationResult(text="", latency_s=0.0) for _ in range(n)]
         result_texts = [""] * n
@@ -850,33 +943,41 @@ class ExL3Provider:
 # ---------------------------------------------------------------------------
 
 def create_star_provider(
-    model_path: str = "models/Qwen3.5-9B-exl3-3.0bpw",
+    model_path: str = "models/Qwen3.5-4B-exl3-4bpw",
     batch_size: int = 6,
     interactive: bool = False,
 ) -> ExL3Provider:
-    """Crea el provider con la configuraciÃ³n Ã³ptima del modelo estrella.
+    """Crea el provider con la configuración óptima del modelo estrella.
 
-    Qwen3.5-9B EXL3 3.0bpw + MTP speculative decoding.
-    Ver RECOMENDACION_OPERACIONAL.md para justificaciÃ³n de cada parÃ¡metro.
+    Qwen3.5-4B EXL3 4.0bpw — más chico pero más estable en chat libre.
+    El 9B cuantizado (3.0bpw y 4.0bpw) se degrada después de ~80 tokens en
+    chat libre. El 4B 4.0bpw sostiene coherencia mejor por ser más chico
+    (menos capas = menos acumulación de error).
 
     Args:
         model_path: Path al directorio del modelo.
-        batch_size: 6 para deliberaciÃ³n/paralelo, 1 para interactivo.
-        interactive: Si True, usa batch_size=1 (modo interactivo, 45 tok/s).
+        batch_size: 6 para deliberación/paralelo, 1 para interactivo.
+        interactive: Si True, usa batch_size=1 (modo interactivo).
     """
     if interactive:
         batch_size = 1
     return ExL3Provider(
         model_path=model_path,
-        model_id="Qwen3.5-9B-EXL3-3.0bpw",
-        quantization="EXL3-3.0bpw",
-        context_length=4096,
-        max_output_tokens=512,
-        temperature=0.0,
+        model_id="Qwen3.5-4B-EXL3-4.0bpw",
+        quantization="EXL3-4.0bpw",
+        # 4B 4.0bpw pesa ~4.2GB. En VRAM con KV cache q8:
+        #   6144 ctx: ~4.8 GB peak → margen holgado en 4050 de 6GB
+        context_length=6144,
+        max_output_tokens=1024,
+        temperature=0.1,
         no_think=True,
         batch_size=batch_size,
-        use_mtp=True,
-        mtp_draft_tokens=2,
-        mtp_cache_tokens=4096,
+        use_mtp=False,  # el 4B no tiene MTP
+        mtp_draft_tokens=0,
+        mtp_cache_tokens=0,
+        cache_k_bits=8,
+        cache_v_bits=8,
+        suppress_cjk=True,
+        rep_p=1.15,
     )
 

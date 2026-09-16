@@ -1,4 +1,4 @@
-﻿"""Web scraper â€” fetch articles from whitelisted sites, extract text + images.
+"""Web scraper â€” fetch articles from whitelisted sites, extract text + images.
 
 This module is designed for intelligence gathering: scrape recent articles
 from a curated list of sites, extract clean text (trafilatura) and images
@@ -127,27 +127,57 @@ class ScrapeHistory:
         if not url:
             return False
         now = datetime.now(timezone.utc).isoformat()
+        # Stale cutoff computed in Python as an ISO string: claimed_at is
+        # stored ISO-with-T, and comparing it against SQLite's
+        # datetime('now', ...) format (space separator) always compares
+        # False, which made stale 'running' claims permanent.
+        from datetime import timedelta
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after)).isoformat()
         cur = self._conn.execute("""INSERT INTO scrape_jobs(url,status,attempts,claimed_at)
             VALUES (?, 'running', 1, ?) ON CONFLICT(url) DO UPDATE SET
             status='running', attempts=attempts+1, claimed_at=excluded.claimed_at
-            WHERE status != 'running' OR claimed_at < datetime('now', ?)
-        """, (url, now, f'-{stale_after} seconds'))
+            WHERE status != 'running' OR claimed_at < ?
+        """, (url, now, stale_cutoff))
         self._conn.commit()
         return cur.rowcount == 1
 
     def record(self, url: str, title: str = "", status: str = "ok",
-               site_url: str = "") -> None:
-        """Record a URL as scraped."""
+               site_url: str = "", days_back: int | None = None) -> None:
+        """Record a URL as scraped.
+
+        status='filtered' marks articles discovered but outside the
+        days_back window; days_back records the window width used so a
+        wider window re-evaluates them instead of skipping forever.
+        """
         from datetime import datetime, timezone
         url = normalize_url(url)
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             "INSERT OR REPLACE INTO scraped_urls (url, title, status, scraped_at, site_url, claimed_at) "
             "VALUES (?, ?, ?, ?, ?, ?)", (url, title, status, now, site_url, now))
+        # 'filtered' fetches succeeded — only 'error' is a failed job.
+        job_status = "failed" if status == "error" else "complete"
         self._conn.execute("UPDATE scrape_jobs SET status=?, completed_at=?, error=? WHERE url=?",
-                           ("complete" if status == "ok" else "failed", now,
-                            None if status == "ok" else title, url))
+                           (job_status, now, title if status == "error" else None, url))
+        if days_back is not None:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(scraped_urls)")}
+            if "filtered_days_back" not in columns:
+                self._conn.execute("ALTER TABLE scraped_urls ADD COLUMN filtered_days_back INTEGER")
+            self._conn.execute("UPDATE scraped_urls SET filtered_days_back=? WHERE url=?",
+                               (days_back, url))
         self._conn.commit()
+
+    def is_filtered(self, url: str, days_back: int) -> bool:
+        """True if the URL was already date-filtered with a window at least
+        as wide as days_back (re-scraping it would discard it again)."""
+        url = normalize_url(url)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(scraped_urls)")}
+        if "filtered_days_back" not in columns:
+            return False
+        row = self._conn.execute(
+            "SELECT filtered_days_back FROM scraped_urls WHERE url = ? AND status = 'filtered'",
+            (url,)).fetchone()
+        return bool(row and row[0] is not None and row[0] >= days_back)
 
     def count(self) -> int:
         """Total number of scraped URLs."""
@@ -663,8 +693,10 @@ class WebScraper:
         """
         start = time.monotonic()
         html = self.fetch_page(url)
+        engine_used = "requests"
         if html is None and self.engine in ("auto", "playwright"):
             html = self.fetch_page(url, use_engine="playwright")
+            engine_used = "playwright"
         if html is None:
             return ScrapeResult(
                 url=url, title="", text="", date=None,
@@ -694,6 +726,7 @@ class WebScraper:
                 )
                 if extracted:
                     html = pw_html  # Use rendered HTML for image extraction too
+                    engine_used = "playwright"
 
         if not extracted:
             return ScrapeResult(
@@ -776,7 +809,7 @@ class WebScraper:
             canonical_url=canonical_url,
             content_hash=content_hash,
             quality_score=quality_score,
-            metadata={"word_count": str(len(extracted.split()))},
+            metadata={"word_count": str(len(extracted.split())), "engine": engine_used},
         )
 
     @staticmethod
@@ -1143,11 +1176,26 @@ class WebScraper:
         """
         from xml.etree import ElementTree as ET
         from datetime import datetime, timedelta, timezone
+        import random as _random
+        import time as _time
 
-        try:
-            resp = self._session.get(feed_url, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException:
+        # arXiv (and other throttled APIs) return HTTP 429 on parallel
+        # bursts. Retry with jittered backoff so concurrent site workers
+        # desynchronize instead of hammering the endpoint in lockstep.
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = self._session.get(feed_url, timeout=self.timeout)
+                if resp.status_code == 429 and attempt < 2:
+                    _time.sleep(5.0 + _random.uniform(0, 5.0) * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 2:
+                    return []
+                _time.sleep(3.0 + _random.uniform(0, 3.0))
+        if resp is None:
             return []
 
         try:
@@ -1223,14 +1271,23 @@ class WebScraper:
                        url_pattern: str | None = None,
                        exclude_paths: list[str] | None = None,
                        max_urls: int = 500,
+                       days_back: int = 0,
                        ) -> list[str]:
         """Parse a sitemap (or sitemap index) and return article URLs.
 
         Handles both sitemapindex (references child sitemaps) and urlset
         (direct URLs).  Follows child sitemaps recursively up to max_urls.
-        Filters by url_pattern and exclude_paths.
+        Filters by url_pattern and exclude_paths. When days_back > 0,
+        entries with a <lastmod> older than the cutoff are dropped during
+        discovery — avoids fetching years of articles just to date-filter
+        them one by one afterwards.
         """
         from xml.etree import ElementTree as ET
+        from datetime import datetime, timedelta, timezone as _tz
+
+        cutoff = None
+        if days_back and days_back > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
 
         try:
             resp = self._session.get(sitemap_url, timeout=self.timeout)
@@ -1261,7 +1318,7 @@ class WebScraper:
                 if child_url:
                     child_urls = self._parse_sitemap(
                         child_url, url_pattern, exclude_paths,
-                        max_urls - len(urls),
+                        max_urls - len(urls), days_back=days_back,
                     )
                     urls.extend(child_urls)
             return urls
@@ -1273,6 +1330,25 @@ class WebScraper:
             loc = url_el.findtext(f"{ns}loc")
             if not loc:
                 continue
+
+            # Date filter on <lastmod> when available (discovery-time,
+            # before any article fetch)
+            if cutoff is not None:
+                lastmod = url_el.findtext(f"{ns}lastmod")
+                if lastmod:
+                    dt = None
+                    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                                "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%f%z"):
+                        try:
+                            dt = datetime.strptime(lastmod.strip(), fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if dt is not None:
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_tz.utc)
+                        if dt < cutoff:
+                            continue
 
             # Apply url_pattern
             if url_pattern:
@@ -1327,7 +1403,7 @@ class WebScraper:
                 errors: list[str] = []
 
                 for link in article_links:
-                    if self.history.is_scraped(link) or not self.history.claim(link):
+                    if self.history.is_scraped(link) or self.history.is_filtered(link, site.days_back) or not self.history.claim(link):
                         skipped += 1
                         continue
                     result = self.extract_article(link, days_back=site.days_back)
@@ -1337,7 +1413,7 @@ class WebScraper:
                         self.history.record(link, status="error", site_url=site.url)
                         self._rate_limit(link, site.delay_seconds)
                         continue
-                    if result.date and site.days_back > 0:
+                    if result.date and site.days_back > 0 and site.trust_article_dates:
                         try:
                             date_str = result.date.replace("Z", "+00:00")
                             article_date = datetime.fromisoformat(date_str)
@@ -1345,7 +1421,12 @@ class WebScraper:
                                 article_date = article_date.replace(tzinfo=timezone.utc)
                             cutoff = datetime.now(timezone.utc) - timedelta(days=site.days_back)
                             if article_date < cutoff:
+                                # Record so future runs skip the re-fetch
+                                # (a wider window re-evaluates, see is_filtered).
                                 skipped += 1
+                                self.history.record(link, title=str(site.days_back), status="filtered",
+                                                    site_url=site.url, days_back=site.days_back)
+                                self._rate_limit(link, site.delay_seconds)
                                 continue
                         except (ValueError, TypeError):
                             pass
@@ -1397,6 +1478,7 @@ class WebScraper:
                     if result.error:
                         errors.append(f"{link}: {result.error}")
                         skipped += 1
+                        self.history.record(link, title=result.error, status="error", site_url=site.url)
                     else:
                         results.append(result)
                         scraped += 1
@@ -1425,6 +1507,7 @@ class WebScraper:
                 url_pattern=site.url_pattern,
                 exclude_paths=site.exclude_paths,
                 max_urls=site.max_articles * 3 if site.max_articles > 0 else 10000,
+                days_back=site.days_back,
             )
             if article_links:
                 if site.max_articles > 0:
@@ -1446,7 +1529,8 @@ class WebScraper:
                     if result.error:
                         errors.append(f"{link}: {result.error}")
                         skipped += 1
-                    elif result.date and site.days_back > 0:
+                        self.history.record(link, title=result.error, status="error", site_url=site.url)
+                    elif result.date and site.days_back > 0 and site.trust_article_dates:
                         try:
                             date_str = result.date.replace("Z", "+00:00")
                             article_date = datetime.fromisoformat(date_str)
@@ -1454,7 +1538,11 @@ class WebScraper:
                                 article_date = article_date.replace(tzinfo=timezone.utc)
                             cutoff = datetime.now(timezone.utc) - timedelta(days=site.days_back)
                             if article_date < cutoff:
+                                # Record so future runs skip the re-fetch
+                                # (a wider window re-evaluates, see is_filtered).
                                 skipped += 1
+                                self.history.record(link, title=str(site.days_back), status="filtered",
+                                                    site_url=site.url, days_back=site.days_back)
                                 continue
                         except (ValueError, TypeError):
                             pass
@@ -1612,15 +1700,17 @@ class WebScraper:
         cutoff = datetime.now(timezone.utc) - timedelta(days=site.days_back)
 
         for link in article_links:
-            # Skip already-scraped URLs (deduplication)
-            if self.history.is_scraped(link):
+            # Skip already-scraped URLs (deduplication); also skip URLs that
+            # a previous run date-filtered with a window at least this wide.
+            if self.history.is_scraped(link) or self.history.is_filtered(link, site.days_back):
                 skipped += 1
                 continue
             result = self.extract_article(link, days_back=site.days_back)
             if result.error:
                 errors.append(f"{link}: {result.error}")
                 skipped += 1
-            elif result.date and site.days_back > 0:
+                self.history.record(link, title=result.error, status="error", site_url=site.url)
+            elif result.date and site.days_back > 0 and site.trust_article_dates:
                 try:
                     # trafilatura returns ISO dates (may be date-only or
                     # datetime with/without timezone).
@@ -1630,7 +1720,11 @@ class WebScraper:
                     if article_date.tzinfo is None:
                         article_date = article_date.replace(tzinfo=timezone.utc)
                     if article_date < cutoff:
+                        # Record so future runs skip the re-fetch
+                        # (a wider window re-evaluates, see is_filtered).
                         skipped += 1
+                        self.history.record(link, title=str(site.days_back), status="filtered",
+                                            site_url=site.url, days_back=site.days_back)
                         continue
                 except (ValueError, TypeError):
                     pass  # If we can't parse date, include it

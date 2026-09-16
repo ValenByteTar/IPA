@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS document_centroids (
     computed_at      TEXT NOT NULL,
     FOREIGN KEY (document_id) REFERENCES documents(document_id)
 );
+
+CREATE TABLE IF NOT EXISTS document_sources (
+    document_id   TEXT PRIMARY KEY,
+    source_url    TEXT,
+    source_domain TEXT,
+    provenance    TEXT NOT NULL,
+    quality_score REAL,
+    recorded_at   TEXT NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES documents(document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_document_sources_provenance ON document_sources(provenance);
 """
 
 
@@ -92,9 +103,10 @@ class DocumentStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA busy_timeout = 30000")
         self._conn.execute("PRAGMA temp_store = MEMORY")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
@@ -263,4 +275,52 @@ class DocumentStore:
             "SELECT document_id, representative_chunk_ids FROM document_centroids"
         ).fetchall()
         return {row[0]: _json.loads(row[1]) for row in rows}
+
+    # --- Document provenance ---
+
+    def put_source(self, document_id: str, source_url: str, source_domain: str,
+                   provenance: str, quality_score: float = 0.0) -> None:
+        """Record the provenance of a document (where it came from).
+
+        provenance: "configured_scrape" (known source) or "agent_research" (agent search).
+        """
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._conn.execute(
+            "INSERT OR REPLACE INTO document_sources "
+            "(document_id, source_url, source_domain, provenance, quality_score, recorded_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (document_id, source_url, source_domain, provenance, quality_score, now),
+        )
+
+    def get_source(self, document_id: str) -> dict | None:
+        """Return provenance info for a document, or None if not recorded."""
+        row = self._conn.execute(
+            "SELECT source_url, source_domain, provenance, quality_score FROM document_sources WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"source_url": row[0], "source_domain": row[1], "provenance": row[2], "quality_score": row[3]}
+
+    def all_sources(self) -> dict[str, dict]:
+        """Return all document provenance records as {document_id: {source_url, source_domain, provenance, quality_score}}."""
+        rows = self._conn.execute(
+            "SELECT document_id, source_url, source_domain, provenance, quality_score FROM document_sources"
+        ).fetchall()
+        return {row[0]: {"source_url": row[1], "source_domain": row[2], "provenance": row[3], "quality_score": row[4]} for row in rows}
+
+    def all_document_texts(self) -> dict[str, str]:
+        """Return {document_id: text} for every live (non-tombstoned) document."""
+        rows = self._conn.execute(
+            "SELECT document_id, text FROM documents WHERE tombstoned = 0"
+        ).fetchall()
+        return {row[0]: (row[1] or "") for row in rows}
+
+    def sources_by_provenance(self, provenance: str) -> dict[str, dict]:
+        """Return all documents with a given provenance type."""
+        rows = self._conn.execute(
+            "SELECT document_id, source_url, source_domain, quality_score FROM document_sources WHERE provenance = ?",
+            (provenance,),
+        ).fetchall()
+        return {row[0]: {"source_url": row[1], "source_domain": row[2], "quality_score": row[3]} for row in rows}
 

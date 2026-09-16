@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/web_source.schema.json",
+  "title": "WebSource",
+  "description": "Provenance record for material acquired from the web. Web-acquired content is a derived, labeled representation — never canonical authority (PAT-003). The trust_label and content_hash make this boundary auditable (Fase 1, DEC-002).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["web_source_id", "source_url", "fetched_at", "content_hash", "trust_label", "fetch_method", "content_type", "byte_size"],
+  "properties": {
+    "web_source_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "source_url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 10,
+      "maxLength": 2048,
+      "description": "Original URL from which the content was fetched."
+    },
+    "canonical_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "Canonical URL after redirect resolution, if different from source_url."
+    },
+    "fetched_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "content_hash": {
+      "$ref": "agent_common.schema.json#/$defs/hash",
+      "description": "sha256 of the raw fetched content (before any parsing or transformation)."
+    },
+    "title": { "type": ["string", "null"], "maxLength": 500 },
+    "license": {
+      "type": ["string", "null"],
+      "maxLength": 200,
+      "description": "Detected license or usage terms, if available. null when unknown."
+    },
+    "trust_label": {
+      "type": "string",
+      "enum": ["high", "medium", "low", "unverified"],
+      "description": "Trust classification. high: established primary source; medium: reputable secondary; low: user-generated or unknown; unverified: no signal."
+    },
+    "fetch_method": {
+      "type": "string",
+      "enum": ["requests", "playwright", "rss", "sitemap", "api", "manual"],
+      "description": "How the content was acquired."
+    },
+    "content_type": {
+      "type": "string",
+      "description": "MIME type of the fetched content.",
+      "maxLength": 100
+    },
+    "byte_size": { "type": "integer", "minimum": 0 },
+    "research_request_id": {
+      "anyOf": [{ "$ref": "agent_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "description": "The ResearchRequest that authorized this fetch, if any."
+    },
+    "artifact_id": {
+      "anyOf": [{ "$ref": "agent_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "description": "Landing artifact_id if the content was ingested into the pipeline."
+    }
+  }
+}

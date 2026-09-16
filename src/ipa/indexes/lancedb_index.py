@@ -1,4 +1,4 @@
-﻿"""LanceDBIndex â€” vector index backed by LanceDB.
+"""LanceDBIndex â€” vector index backed by LanceDB.
 
 Competitor in E7.  Provides the same interface as BM25Index:
 add_chunks, search, count, is_queryable, close.
@@ -191,9 +191,30 @@ class LanceDBIndex:
             self._table.create_fts_index("text")
             self._fts_indexed = True
         except Exception as e:
-            # FTS index may already exist, or tantivy not available
-            print(f"  Warning: FTS index creation failed: {e}")
-            # Try to continue â€” hybrid search will fall back to dense-only
+            if "already exists" in str(e).lower():
+                # Index already exists from a previous run — that is the
+                # desired state; mark as indexed instead of warning on every
+                # subsequent call.
+                self._fts_indexed = True
+            else:
+                # tantivy not available or other failure — hybrid search
+                # will fall back to dense-only
+                print(f"  Warning: FTS index creation failed: {e}")
+
+    def get_vectors(self, chunk_ids: list[str]) -> dict[str, list[float]]:
+        """Fetch dense vectors for the given chunk ids: {chunk_id: vector}.
+
+        Used by the topic backfill (document centroids) — no search, direct
+        row access by id.
+        """
+        if not chunk_ids or self._table is None:
+            return {}
+        id_list = ", ".join(f"'{cid}'" for cid in chunk_ids)
+        try:
+            rows = self._table.search().where(f"chunk_id IN ({id_list})").limit(len(chunk_ids)).to_list()
+        except Exception:
+            return {}
+        return {r["chunk_id"]: r["vector"] for r in rows if r.get("vector")}
 
     def search(
         self,
@@ -273,18 +294,20 @@ class LanceDBIndex:
         if limit <= 0 or self._table is None:
             return []
 
-        # Load candidate rows
+        # Load candidate rows (to_list() returns list[dict] in current LanceDB)
         if candidate_ids:
-            id_list = ", ".join(f"'{cid}'" for cid in candidate_ids)
+            id_set = set(candidate_ids)
             try:
-                df = self._table.search().where(f"chunk_id IN ({id_list})").to_list()
+                rows = self._table.search().where(f"chunk_id IN ({id_list})").to_list()
             except Exception:
-                df = self._table.to_pandas()
-                df = df[df["chunk_id"].isin(candidate_ids)]
+                rows = [
+                    row for row in self._table.to_arrow().to_pylist()
+                    if row.get("chunk_id") in id_set
+                ]
         else:
-            df = self._table.to_pandas()
+            rows = self._table.to_arrow().to_pylist()
 
-        if df.empty:
+        if not rows:
             return []
 
         # Convert query sparse keys to str (BGE-M3 uses str keys)
@@ -292,7 +315,7 @@ class LanceDBIndex:
 
         # Score each candidate by dot product
         scored: list[tuple[str, float, dict]] = []
-        for _, row in df.iterrows():
+        for row in rows:
             sparse_json = row.get("sparse_json", "")
             if not sparse_json:
                 continue
@@ -307,7 +330,7 @@ class LanceDBIndex:
                 if d_weight > 0:
                     score += q_weight * d_weight
             if score > 0:
-                scored.append((row["chunk_id"], score, row.to_dict()))
+                scored.append((row["chunk_id"], score, row))
 
         scored.sort(key=lambda x: x[1], reverse=True)
 

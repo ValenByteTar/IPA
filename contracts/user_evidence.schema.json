@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/user_evidence.schema.json",
+  "title": "UserEvidence",
+  "description": "Append-only evidence record about the learner. Assessments, conversation observations and self-reports accumulate here; mastery updates in UserTopicRecord must trace back to this evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_id", "topic_id", "evidence_type", "observation", "observed_at", "recorded_at", "source_refs", "generation", "field_origins"],
+  "properties": {
+    "evidence_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "topic_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "evidence_type": {
+      "type": "string",
+      "enum": ["assessment", "conversation", "self_report", "observation"],
+      "x-field-origin": "system"
+    },
+    "assessment_id": {
+      "anyOf": [
+        { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+        { "type": "null" }
+      ],
+      "x-field-origin": "system"
+    },
+    "session_id": {
+      "anyOf": [
+        { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+        { "type": "null" }
+      ],
+      "x-field-origin": "system"
+    },
+    "observation": { "type": "string", "minLength": 1, "maxLength": 4000, "x-field-origin": "generated" },
+    "observed_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "recorded_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+      "x-field-origin": "source"
+    },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["observation", "source_refs"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "evidence_type": { "const": "assessment" } }, "required": ["evidence_type"] },
+      "then": { "properties": { "assessment_id": { "type": "string" } }, "required": ["assessment_id"] }
+    }
+  ]
+}

@@ -14,14 +14,14 @@ superseded_by: null
 
 # EXP-002 â€” Adaptive rechunking
 
-## HipÃ³tesis
+## Hipótesis
 
-Reagrupar sÃ³lo documentos con baja densidad lexical puede reducir chunks problemÃ¡ticos sin degradar recall documental.
+Reagrupar sólo documentos con baja densidad lexical puede reducir chunks problemáticos sin degradar recall documental.
 
-## ConfiguraciÃ³n
+## Configuración
 
 - Corpus analizado: 720 documentos.
-- ActivaciÃ³n: mÃ¡s del 30% de chunks de un documento con lexical density menor que 0,4.
+- Activación: más del 30% de chunks de un documento con lexical density menor que 0,4.
 - Estrategia: merge adyacente y fallback recursive cuando fuese necesario.
 - Artefacto: `outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json`.
 
@@ -32,10 +32,10 @@ Reagrupar sÃ³lo documentos con baja densidad lexical puede reducir chunks prob
 - El delta total fue de -153 chunks.
 - Recall documental@10 se mantuvo en 1,0 para el corpus activado.
 
-## ConclusiÃ³n
+## Conclusión
 
-La estrategia es segura para el corpus probado y puede usarse como operaciÃ³n derivada selectiva. No debe reemplazar automÃ¡ticamente el baseline fixed-window en todo el corpus.
+La estrategia es segura para el corpus probado y puede usarse como operación derivada selectiva. No debe reemplazar automáticamente el baseline fixed-window en todo el corpus.
 
 ## Provenance
 
-Artefacto histÃ³rico (`outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json`) no disponible localmente (ver PM-002). Conclusiones retenidas; runners reproducibles en `scripts/benchmarks/run_adaptive_rechunk.py` y `compare_adaptive_retrieval.py`. Relacionado: [PM-002].
+Artefacto histórico (`outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json`) no disponible localmente (ver PM-002). Conclusiones retenidas; runners reproducibles en `scripts/benchmarks/run_adaptive_rechunk.py` y `compare_adaptive_retrieval.py`. Relacionado: [PM-002].

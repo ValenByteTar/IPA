@@ -99,13 +99,13 @@ def test_metadata_normalizes_headers_and_hash(tmp_path):
 def test_llm_label_requires_structured_nonempty_output():
     class Result:
         ok = True
-        text = '{"label":"Tema vÃ¡lido","description":"DescripciÃ³n con evidencia."}'
+        text = '{"label":"Tema válido","description":"Descripción con evidencia."}'
 
     class Provider:
         def generate_chat(self, *_args, **_kwargs):
             return Result()
 
-    assert ReporterLLM(Provider()).label([_doc("doc:one", "photonic processors")])["label"] == "Tema vÃ¡lido"
+    assert ReporterLLM(Provider()).label([_doc("doc:one", "photonic processors")])["label"] == "Tema válido"
 
 
 def test_llm_label_rejects_invalid_output():

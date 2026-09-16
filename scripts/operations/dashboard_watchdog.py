@@ -20,7 +20,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 # Use pythonw.exe (no console window) to match the launcher
 PYTHONW = str(ROOT / ".venv" / "Scripts" / "pythonw.exe")
 PYTHON = str(ROOT / ".venv" / "Scripts" / "python.exe")
@@ -28,7 +28,7 @@ if not Path(PYTHONW).exists():
     PYTHONW = sys.executable
 if not Path(PYTHON).exists():
     PYTHON = sys.executable
-DASHBOARD_SCRIPT = str(ROOT / "scripts" / "web_dashboard.py")
+DASHBOARD_SCRIPT = str(ROOT / "scripts" / "operations" / "web_dashboard.py")
 PID_FILE = ROOT / "outputs" / "web_dashboard" / "dashboard.pid"
 
 

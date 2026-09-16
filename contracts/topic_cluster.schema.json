@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/topic_cluster.schema.json",
+  "title": "TopicCluster",
+  "description": "Deterministic cluster of related documents/concepts computed over existing embedding centroids. Emergent (threshold-based, no fixed K), auditable, and the navigation unit for multi-hop retrieval (Fase 3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cluster_id", "label", "description", "member_document_ids", "member_concept_ids", "parent_cluster_id", "coherence_score", "representative_chunk_id", "created_at", "generation", "field_origins"],
+  "properties": {
+    "cluster_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "label": { "type": "string", "minLength": 1, "maxLength": 200, "x-field-origin": "generated" },
+    "description": { "type": ["string", "null"], "maxLength": 2000, "x-field-origin": "generated" },
+    "member_document_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+      "x-field-origin": "source"
+    },
+    "member_concept_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+      "x-field-origin": "mixed"
+    },
+    "parent_cluster_id": {
+      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "x-field-origin": "generated"
+    },
+    "coherence_score": { "type": "number", "minimum": 0, "maximum": 1, "x-field-origin": "generated" },
+    "representative_chunk_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "source" },
+    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["label", "member_document_ids", "coherence_score"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "parent_cluster_id": { "type": "string" } }, "required": ["parent_cluster_id"] },
+      "then": { "properties": { "parent_cluster_id": { "not": { "const": "" } } } }
+    }
+  ]
+}

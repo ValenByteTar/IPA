@@ -1,4 +1,9 @@
-﻿"""DoclingParser â€” PDF parser backed by IBM Docling.
+﻿"""DoclingParser — PDF parser backed by IBM Docling.
+
+E3 benchmark adapter only: this parser exists for the parser competition
+benchmark (scripts/benchmarks/run_parser_benchmark.py) and its tests. It is
+NOT in the active ingestion path — FastPath routes PDFs to pymupdf
+(see ipa/ingestion/parsers.py _PARSERS).
 
 Competitor to PyMuPDF in E3.  Produces CanonicalDocument records with
 per-page text and source spans, same interface as parse_pdf_pymupdf.
@@ -39,9 +44,11 @@ def parse_pdf_docling(path: Path, artifact_id: str, do_ocr: bool = False) -> Par
         )
 
     # Docling reads DOCLING_DEVICE and supports CUDA for model inference.
-    # Keep this explicit so the E3 benchmark does not silently fall back to CPU.
+    # Keep this explicit: cuda when a GPU is available, cpu otherwise (the
+    # system must run 100% on CPU when no GPU is found).
     import os
-    os.environ.setdefault("DOCLING_DEVICE", "cuda")
+    from ipa.providers.device import has_gpu
+    os.environ.setdefault("DOCLING_DEVICE", "cuda" if has_gpu() else "cpu")
 
     # Configure pipeline: layout detection + table structure, OCR only if needed.
     from docling.document_converter import PdfFormatOption

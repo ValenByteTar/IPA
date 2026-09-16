@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/user_topic_record.schema.json",
+  "title": "UserTopicRecord",
+  "description": "Mastery state for one topic in the unified user model (DEC-002). The Tutor's pedagogical state scope: what the learner knows, per topic, supported by evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["record_id", "topic_id", "mastery_status", "mastery_score", "attempts", "last_assessment_id", "evidence_ids", "updated_at", "created_at", "generation", "field_origins"],
+  "properties": {
+    "record_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "topic_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
+    "mastery_status": { "$ref": "tutor_common.schema.json#/$defs/masteryStatus", "x-field-origin": "generated" },
+    "mastery_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "x-field-origin": "generated"
+    },
+    "attempts": { "type": "integer", "minimum": 0, "x-field-origin": "system" },
+    "last_assessment_id": {
+      "anyOf": [
+        { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+        { "type": "null" }
+      ],
+      "x-field-origin": "system"
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+      "x-field-origin": "system"
+    },
+    "prerequisite_ids": {
+      "type": "array",
+      "items": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
+      "x-field-origin": "mixed"
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "x-field-origin": "generated"
+    },
+    "updated_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
+      "required": ["mastery_status", "mastery_score", "attempts", "last_assessment_id", "evidence_ids"],
+      "x-field-origin": "system"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mastery_status": { "const": "unknown" } }, "required": ["mastery_status"] },
+      "then": { "properties": { "last_assessment_id": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": { "mastery_status": { "enum": ["understood", "applied", "needs_review", "misconception"] } },
+        "required": ["mastery_status"]
+      },
+      "then": {
+        "properties": { "last_assessment_id": { "type": "string" } },
+        "required": ["last_assessment_id"]
+      }
+    }
+  ]
+}

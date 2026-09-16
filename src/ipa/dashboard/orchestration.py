@@ -131,7 +131,7 @@ class Orchestrator:
             # blocks to run, closing Tantivy writers and flushing LanceDB).
             creationflags = 0
             if os.name == "nt":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             log_dir = CORPUS / "logs" / self.run_id
             log_dir.mkdir(parents=True, exist_ok=True)
             log_handle = open(log_dir / f"{name}.log", "a", encoding="utf-8", buffering=1)

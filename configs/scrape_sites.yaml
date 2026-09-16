@@ -26,11 +26,14 @@
 
 sites:
   # --- NVIDIA Developer Blog ---
+  # Sitemap discovery (2026-09-13): the RSS feed caps at ~100 recent items;
+  # the wp-sitemap index lists the full archive, so days_back does the
+  # windowing instead of the feed size.
   - url: https://developer.nvidia.com/blog
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 2.0
-    rss_feed: "https://developer.nvidia.com/blog/feed"
+    sitemap_url: "https://developer.nvidia.com/blog/wp-sitemap.xml"
     url_pattern: "^/blog/[^/]+/?$"
     exclude_paths:
       - "/blog/category/"
@@ -52,7 +55,7 @@ sites:
 
   # --- Anthropic (no RSS, listing crawl) ---
   - url: https://www.anthropic.com/news
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/(news|research)/[^/]+$"
@@ -69,7 +72,7 @@ sites:
 
   # --- Anthropic Research (separate listing) ---
   - url: https://www.anthropic.com/research
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/research/[^/]+$"
@@ -79,7 +82,7 @@ sites:
 
   # --- Claude Blog ---
   - url: https://claude.com/blog
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/blog/[^/]+/?$"
@@ -88,7 +91,7 @@ sites:
 
   # --- Google Blog (RSS-first) ---
   - url: https://blog.google/rss/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     rss_feed: "https://blog.google/rss/"
@@ -96,7 +99,7 @@ sites:
 
   # --- vLLM Blog ---
   - url: https://vllm.ai/blog
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 1.5
     url_pattern: "^/blog/\\d{4}-\\d{2}-\\d{2}-[^/]+/?$"
@@ -106,24 +109,29 @@ sites:
 
   # --- Emergent Mind (arxiv paper wrappers) ---
   - url: https://www.emergentmind.com/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 1.5
     url_pattern: "^/papers/[^/]+$"
 
-  # --- Microsoft Research Blog (paginated listing) ---
+  # --- Microsoft Research Blog (sitemap + paginated listing fallback) ---
+  # Sitemap (2026-09-13) exposes the full archive; the listing crawl with
+  # max_pages stays as fallback if the sitemap fails.
   - url: https://www.microsoft.com/en-us/research/blog/
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 2.0
+    sitemap_url: "https://www.microsoft.com/en-us/research/sitemap.xml"
     url_pattern: "^/en-us/research/blog/[^/]+/?$"
     paginate: true
-    max_pages: 5
+    max_pages: 20
     trust_article_dates: true
 
   # --- Qwen AI (SPA — JSON API discovery) ---
+  # The API list is stale (newest item 2025-12-23); days_back widened so the
+  # window still covers it. See docs/operations/scrape-source-audit.md.
   - url: https://qwen.ai/blog
-    days_back: 1
+    days_back: 400
     max_articles: 0
     delay_seconds: 2.0
     json_api_url: "https://qwen.ai/api/page_config?code=research.research-list"
@@ -133,31 +141,63 @@ sites:
 
   # --- The Hacker News (Blogger pagination, URL date filter) ---
   - url: https://thehackernews.com/
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 1.5
-    # Filter by URL: only September 2026 articles
-    url_pattern: "^/2026/09/[^/]+\\.html$"
+    # Filter by URL: any year (the 365-day window does the date filtering;
+    # the old ^/2026/ pattern silently dropped Sep-Dec 2025 articles)
+    url_pattern: "^/20\\d{2}/\\d{2}/[^/]+\\.html$"
     trust_article_dates: false
     paginate: true
-    max_pages: 10
+    max_pages: 40
     paginate_url_template: "blogger"
 
   # --- LabLab.ai (sitemap discovery) ---
-  # Sitemap lists ALL historical articles. trust_article_dates: false
-  # disables date filtering, so max_articles caps the scrape to avoid
-  # pulling the entire archive.
+  # Sitemap lists ALL historical articles (~436). trust_article_dates: false
+  # disables date filtering. Cap removed 2026-09-13 to pull the deep archive
+  # (was max_articles: 50 — the discovery audit showed 386 unregistered).
   - url: https://lablab.ai/ai-tutorials
-    days_back: 1
-    max_articles: 50
+    days_back: 365
+    max_articles: 0
     delay_seconds: 1.5
     sitemap_url: "https://lablab.ai/sitemap.xml"
     url_pattern: "^/(ai-tutorials|ai-articles|blog)/[^/]+$"
     trust_article_dates: false
 
+  # --- arXiv deep archive (Atom API, sorted by submission date) ---
+  # The API returns Atom entries; _parse_rss_feed handles Atom natively.
+  # max_results=200 per category ≈ the most recent ~2-4 weeks of cs.LG
+  # volume (cs.LG gets ~100 papers/day). Deeper archive would need start
+  # offsets — one entry per offset to respect arxiv's 1 req/3s rate limit.
+  # NOTE: arxiv rate-limits (HTTP 429) parallel bursts; a 429 yields an
+  # empty result for that run and is retried on the next ingestion.
+  - url: https://arxiv.org/abs/cs.LG
+    days_back: 365
+    max_articles: 0
+    delay_seconds: 3.0
+    rss_feed: "http://export.arxiv.org/api/query?search_query=cat:cs.LG&sortBy=submittedDate&sortOrder=descending&start=0&max_results=200"
+    url_pattern: "^/abs/[^/]+$"
+    trust_article_dates: true
+
+  - url: https://arxiv.org/abs/cs.CL
+    days_back: 365
+    max_articles: 0
+    delay_seconds: 3.0
+    rss_feed: "http://export.arxiv.org/api/query?search_query=cat:cs.CL&sortBy=submittedDate&sortOrder=descending&start=0&max_results=200"
+    url_pattern: "^/abs/[^/]+$"
+    trust_article_dates: true
+
+  - url: https://arxiv.org/abs/cs.AI
+    days_back: 365
+    max_articles: 0
+    delay_seconds: 3.0
+    rss_feed: "http://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&start=0&max_results=200"
+    url_pattern: "^/abs/[^/]+$"
+    trust_article_dates: true
+
   # --- BleepingComputer (Cloudflare-protected) ---
   - url: https://www.bleepingcomputer.com/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 1.5
     url_pattern: "^/news/[^/]+/$"
@@ -165,21 +205,24 @@ sites:
     trust_article_dates: false
 
   # --- CISA Cybersecurity Advisories (paginated ?page=N) ---
+  # CISA moved advisory items to /news-events/alerts/YYYY/MM/DD/<slug>; the
+  # listing also uses a "Show more" progressive load, so playwright is needed.
   - url: https://www.cisa.gov/news-events/cybersecurity-advisories
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 2.0
-    url_pattern: "^/news-events/cybersecurity-advisories/[a-z0-9-]+"
+    url_pattern: "^/news-events/(alerts|cybersecurity-advisories)/"
     exclude_paths:
       - "/news-events/cybersecurity-advisories/all"
       - "/news-events/cybersecurity-advisories/page/"
     trust_article_dates: true
+    engine: playwright
     paginate: true
-    max_pages: 5
+    max_pages: 15
 
   # --- CISA News & Events (general site) ---
   - url: https://www.cisa.gov/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/news-events/[^/]+/[a-z0-9-]+"
@@ -192,7 +235,7 @@ sites:
 
   # --- Meta AI Research ---
   - url: https://ai.meta.com/research/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/blog/[^/]+/?$"
@@ -201,20 +244,41 @@ sites:
     exclude_paths:
       - "/static-resource/"
 
+  # --- Meta for Developers — Facebook platform blog ---
+  # DISABLED 2026-09-13: article pages (/blog/post/YYYY/) render only nav
+  # chrome even with Playwright + networkidle (~1.5KB of menu text, no body).
+  # Verified: extract_article returns "quality gate rejected: too little
+  # article text". The source only produced orphan images. See
+  # docs/operations/scrape-source-audit.md.
+  # - url: https://developers.facebook.com/blog/
+  #   days_back: 92
+  #   max_articles: 0
+  #   delay_seconds: 2.0
+  #   url_pattern: "^/blog/post/\\d{4}/"
+  #   trust_article_dates: true
+
+  # --- Meta Horizon developer blog (VR/XR) ---
+  - url: https://developers.meta.com/horizon/blog/
+    days_back: 92
+    max_articles: 0
+    delay_seconds: 2.0
+    url_pattern: "^/horizon/blog/[^/]+/?$"
+    trust_article_dates: true
+
   # --- OffSec Blog (paginated /blog/N/) ---
   - url: https://www.offsec.com/blog/
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/blog/[a-z][a-z0-9-]+/?$"
     paginate: true
-    max_pages: 5
+    max_pages: 15
     paginate_url_template: "https://www.offsec.com/blog/{n}/"
     trust_article_dates: true
 
   # --- NetSPI Blog (executive + technical, no pagination) ---
   - url: https://www.netspi.com/blog/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/blog/(executive-blog|technical-blog)/[^/]+/[^/]+/?$"
@@ -222,7 +286,7 @@ sites:
 
   # --- NetSPI Podcast (episodes, no pagination) ---
   - url: https://www.netspi.com/podcast/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/podcast/[^/]+/?$"
@@ -230,7 +294,7 @@ sites:
 
   # --- NetSPI Newsroom (press releases + news, no pagination) ---
   - url: https://www.netspi.com/newsroom/
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/newsroom/(netspi-in-the-news|press-release)/[^/]+/?$"
@@ -238,7 +302,7 @@ sites:
 
   # --- Cobalt Blog (paginated /blog/page/N/) ---
   - url: https://www.cobalt.io/blog
-    days_back: 1
+    days_back: 365
     max_articles: 0
     delay_seconds: 2.0
     url_pattern: "^/blog/[a-z][a-z0-9-]+/?$"
@@ -248,13 +312,13 @@ sites:
       - "/blog/category/"
       - "/blog/rss.xml"
     paginate: true
-    max_pages: 5
+    max_pages: 15
     paginate_url_template: "https://www.cobalt.io/blog/page/{n}"
     trust_article_dates: true
 
   # --- Internet Security Auditors Blog (ISEC) ---
   - url: https://blog.isecauditors.com/en
-    days_back: 1
+    days_back: 92
     max_articles: 0
     delay_seconds: 2.0
     # Articles: /en/<slug> — exclude archive, author, tag paths

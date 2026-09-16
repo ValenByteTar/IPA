@@ -1,4 +1,4 @@
-﻿"""Runtime data contracts for Tutor Agent records."""
+"""Runtime data contracts for Tutor Agent records."""
 from __future__ import annotations
 
 import hashlib
@@ -23,6 +23,10 @@ class FieldOrigin(StrEnum):
     GENERATED = "generated"
     SYSTEM = "system"
     MIXED = "mixed"
+    USER_OR_GENERATED = "user_or_generated"
+    USER_OR_SYSTEM_POLICY = "user_or_system_policy"
+    SYSTEM_POLICY = "system_policy"
+    GENERATED_OR_USER = "generated_or_user"
 
 
 class HumanApprovalDecision(StrEnum):
@@ -415,6 +419,95 @@ class ResearchRequest:
 
 def answer_hash(answer: str) -> str:
     return "sha256:" + hashlib.sha256(answer.encode("utf-8")).hexdigest()
+
+
+class EvidenceType(StrEnum):
+    """Kind of learner evidence recorded in the append-only evidence log."""
+    ASSESSMENT = "assessment"
+    CONVERSATION = "conversation"
+    SELF_REPORT = "self_report"
+    OBSERVATION = "observation"
+
+
+@dataclass(frozen=True)
+class UserEvidence:
+    """Append-only evidence about the learner (Fase 2).
+
+    Assessments, conversation observations and self-reports accumulate here;
+    mastery updates in UserTopicRecord must trace back to this evidence
+    (invariant: user_evidence_is_append_only, mastery_is_supported_by_
+    assessment_evidence).
+    """
+    evidence_id: str
+    topic_id: str
+    evidence_type: EvidenceType
+    observation: str
+    observed_at: str
+    recorded_at: str
+    source_refs: list[SourceRef]
+    generation: GenerationProvenance
+    field_origins: dict[str, str]
+    assessment_id: str | None = None
+    session_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.observation.strip():
+            raise ValueError("evidence requires a non-empty observation")
+        if not self.source_refs:
+            raise ValueError("evidence requires at least one source reference")
+        if self.evidence_type == EvidenceType.ASSESSMENT and not self.assessment_id:
+            raise ValueError("assessment evidence requires assessment_id")
+        _validate_time_order(self.observed_at, self.recorded_at)
+        _validate_origins(
+            self.field_origins,
+            {"observation", "source_refs"},
+            self.generation,
+        )
+
+
+@dataclass(frozen=True)
+class UserTopicRecord:
+    """Mastery state for one topic in the unified user model (Fase 2, DEC-002).
+
+    The Tutor owns this state scope: what the learner knows per topic. Any
+    non-unknown mastery state must trace to an assessment (invariant:
+    user_topic_records_require_evidence_for_mastery).
+    """
+    record_id: str
+    topic_id: str
+    mastery_status: MasteryStatus
+    mastery_score: float | None
+    attempts: int
+    last_assessment_id: str | None
+    evidence_ids: list[str]
+    updated_at: str
+    created_at: str
+    generation: GenerationProvenance
+    field_origins: dict[str, str]
+    prerequisite_ids: list[str] = field(default_factory=list)
+    notes: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mastery_score is not None and not 0 <= self.mastery_score <= 1:
+            raise ValueError("mastery_score must be between 0 and 1")
+        if self.attempts < 0:
+            raise ValueError("attempts must be non-negative")
+        # mastery_is_supported_by_assessment_evidence
+        if self.mastery_status == MasteryStatus.UNKNOWN and self.last_assessment_id:
+            raise ValueError("unknown mastery must not reference an assessment")
+        if self.mastery_status in {
+            MasteryStatus.UNDERSTOOD, MasteryStatus.APPLIED,
+            MasteryStatus.NEEDS_REVIEW, MasteryStatus.MISCONCEPTION,
+        } and not self.last_assessment_id:
+            raise ValueError(
+                f"mastery_status '{self.mastery_status.value}' requires assessment evidence"
+            )
+        _validate_time_order(self.created_at, self.updated_at)
+        _validate_origins(
+            self.field_origins,
+            {"mastery_status", "mastery_score", "attempts", "last_assessment_id", "evidence_ids"},
+            self.generation,
+        )
 
 
 def contract_dict(record: Any) -> dict[str, Any]:

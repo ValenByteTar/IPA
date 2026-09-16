@@ -1,4 +1,4 @@
-﻿"""Tutor contracts and capabilities (transitional facade)."""
+"""Tutor contracts and capabilities (transitional facade)."""
 from __future__ import annotations
 
 from importlib import import_module
@@ -9,6 +9,12 @@ _EXPORTS = {
     "Roadmap": ("tutor_contracts", "Roadmap"),
     "AssessmentResult": ("tutor_contracts", "AssessmentResult"),
     "ResearchRequest": ("tutor_contracts", "ResearchRequest"),
+    "UserTopicRecord": ("tutor_contracts", "UserTopicRecord"),
+    "UserEvidence": ("tutor_contracts", "UserEvidence"),
+    "EvidenceType": ("tutor_contracts", "EvidenceType"),
+    "TutorSession": ("tutor_runtime", "TutorSession"),
+    "TutorStore": ("tutor_runtime", "TutorStore"),
+    "DiagnosisResult": ("tutor_runtime", "DiagnosisResult"),
 }
 
 

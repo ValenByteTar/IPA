@@ -22,18 +22,18 @@ Comparar fixed-window, recursive, token y semantic chunking para el procesamient
 
 - Dataset: 50 PDFs.
 - Artefacto: `outputs/experiments/E5/benchmark_report.json`.
-- MÃ©tricas: throughput, duplicaciÃ³n, tamaÃ±o y calidad observable.
+- Métricas: throughput, duplicación, tamaño y calidad observable.
 
 ## Resultados
 
-- Fixed-window: aproximadamente 48.000 chunks/s, 0% de duplicados y tamaÃ±o uniforme de 512 caracteres.
-- Recursive y token: entre 30 y 100 veces mÃ¡s lentos, con mejora marginal observada.
-- Semantic chunker: requiere tuning; threshold 0,3, mÃ­nimo 200 y mÃ¡ximo 1200 redujo duplicaciÃ³n a 0,4%.
+- Fixed-window: aproximadamente 48.000 chunks/s, 0% de duplicados y tamaño uniforme de 512 caracteres.
+- Recursive y token: entre 30 y 100 veces más lentos, con mejora marginal observada.
+- Semantic chunker: requiere tuning; threshold 0,3, mínimo 200 y máximo 1200 redujo duplicación a 0,4%.
 
-## ConclusiÃ³n
+## Conclusión
 
 Fixed-window es el baseline operativo por velocidad, estabilidad e idempotencia. Semantic/adaptive chunking debe activarse selectivamente cuando la calidad adicional justifique el coste.
 
 ## Provenance
 
-Artefacto histÃ³rico (`outputs/experiments/E5/benchmark_report.json`) no disponible localmente (ver PM-002). Conclusiones retenidas; runner reproducible en `scripts/benchmarks/run_parser_benchmark.py --mode chunkers`. Relacionado: [PM-002].
+Artefacto histórico (`outputs/experiments/E5/benchmark_report.json`) no disponible localmente (ver PM-002). Conclusiones retenidas; runner reproducible en `scripts/benchmarks/run_parser_benchmark.py --mode chunkers`. Relacionado: [PM-002].

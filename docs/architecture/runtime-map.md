@@ -17,10 +17,15 @@ Landing
 ## Slow/derived paths
 
 ```text
-DocumentStore -> embeddings -> vector index
+DocumentStore -> embeddings -> vector index (LanceDB)
 DocumentStore/chunks -> enrichment -> derived text/queries/claims
-Reporter corpus -> curation -> topics -> report/deep-dive
+Reporter corpus -> curation -> topics -> report -> deep dive (chat unificado)
 ```
+
+Note: deep dive runs inside the unified agent chat (`context=deep_dive` in
+`/api/agent/chat/stream`). The standalone `deep-dive.html` page and the
+`/api/deep-dive*` endpoints are deprecated (kept for compatibility only —
+no UI entry point).
 
 ## Public entrypoints
 

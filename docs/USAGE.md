@@ -1,0 +1,143 @@
+# IPA — Guía de uso
+
+Instalación, arranque y uso de todo el sistema en una sola página.
+Para reglas operativas completas ver `AGENTS.md`; para decisiones
+arquitectónicas, `docs/DECISION_LOG.md`.
+
+## Instalación
+
+Requisito: Python 3.12 (`py -3.12` en esta máquina).
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev,retrieval,parsers,web,mcp]"
+.venv\Scripts\python.exe -m pytest -q
+```
+
+- `requirements.txt` — rangos curados por perfil.
+- `requirements.lock` — freeze exacto del entorno (reproducibilidad).
+
+### Perfiles opcionales
+
+| Perfil | Contenido |
+|---|---|
+| (base) | PyYAML, rich, pytest, PyMuPDF, rank-bm25, numpy |
+| `retrieval` | tantivy, lancedb, sqlite-vec, sentence-transformers, transformers |
+| `parsers` | docling, unstructured[pdf] — **solo benchmark E3**, no en ingesta |
+| `web` | requests, trafilatura, playwright, easyocr |
+| `tutor` | torch (CUDA), exllamav3, transformers, flash-linear-attention |
+| `mcp` | mcp>=1.0 |
+| `all` | todo lo anterior |
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev,retrieval,parsers,web,mcp]"
+.venv\Scripts\python.exe -m pytest -q
+```
+
+## Arranque
+
+```powershell
+# Dashboard web (un solo comando, abre el navegador)
+.\start_ipa_dashboard.bat
+# Con orquestador de consola al lado
+.\start_ipa_dashboard.bat -StartOrchestrator
+
+# Manual
+.venv\Scripts\python.exe scripts\operations\web_dashboard.py --host 127.0.0.1 --port 8765
+.venv\Scripts\python.exe scripts\operations\orchestrator.py --no-scraper --no-hammer
+
+# CLI del agente (misma identidad y memoria que el dashboard)
+.venv\Scripts\python.exe scripts\cli\agent.py chat
+.venv\Scripts\python.exe scripts\cli\agent.py chat --role tutor --llm -m "mensaje"
+```
+
+URL local: `http://127.0.0.1:8765` · Health: `/api/health`
+
+## Chat del agente (dashboard)
+
+- **Selector de rol** en el input: `General` / `Tutor`.
+- **General**: chat reactivo con protocolo de tools acotado (máx. 3 rondas por
+  turno, desbloqueo progresivo). Detecta intención de aprendizaje ("quiero
+  aprender X") y ofrece pasar a Tutor.
+- **Deep dive**: "Profundizar" desde un reporte abre el chat con contexto del
+  corpus del reporte (los endpoints `/api/deep-dive*` standalone están
+  deprecados).
+- Herramientas principales: `search_corpus`, `research_topic`,
+  `compile_report`, `recall_memory`, `plan_task`, `get_user_profile`,
+  `list_topics`, `get_system_status`.
+
+## Tutor
+
+1. `"quiero aprender X"` → diagnóstico determinístico sobre corpus + mastery.
+2. Corpus insuficiente (<3 conceptos) → propone investigación web → **gate
+   humano** (botón en el chat). Mientras corre, el tutor responde de forma
+   determinística que aguardamos la fuente web.
+3. Roadmap propuesto (LLM) → **Aprobar / Rechazar / Debatir**. Debatir toma
+   feedback y re-propone (v+1, supersedes); el gate humano sigue aplicando.
+4. Lecciones con avance determinístico ("siguiente unidad", "ya entendí").
+5. Assessment estructurado (JSON + abstención) → mastery persistido.
+
+Los roadmaps se pueden archivar (flag operativo, el progreso se conserva).
+Las sesiones procesadas por el consolidador automático se marcan `✦ resumida`.
+
+## Aprobaciones (human-in-the-loop)
+
+Cola unificada en el panel Aprobaciones: consolidaciones de memoria,
+inferencias de mastery/user model, roadmaps del Tutor, research requests,
+curación del Reporter. **Nada se aplica sin aprobación humana** (PAT-004).
+
+## Procesos idle (scheduler)
+
+`ipa/agentic/idle_scheduler.py` orquesta el trabajo en segundo plano con tiers,
+prioridades y locks por recurso:
+
+- **Tier 1** (sin VRAM, paralelo): higiene de sesiones → consolidación de
+  memoria → topificación (clustering + curación) → promoción → inferencias
+  cognitivas (user model, skills, principios, agenda).
+- **Tier 2 (LLM)**: re-etiquetado de tópicos, clasificación de grises,
+  principios abstractos. Solo con idle profundo (≥30 min puede cargar el
+  modelo) o aprovechando un modelo ya cargado (≥5 min quieto). Preemptible
+  al primer mensaje.
+
+Log auditable: `outputs/web_dashboard/logs/idle_enrichment.log`.
+
+## MCP server
+
+```powershell
+python -m ipa.mcp.mcp_server
+```
+
+Tools: `search_knowledge`, `ingest_url`, `ingest_file`, `list_sources`,
+`get_document`. Ver el docstring de `src/ipa/mcp/mcp_server.py` para la
+configuración del cliente MCP.
+
+## Variables de entorno
+
+| Variable | Default | Efecto |
+|---|---|---|
+| `IPA_LLM_PROVIDER` | `ollama` | `ollama` o `exl3` (exl3 sin GPU cae a ollama) |
+| `IPA_OLLAMA_MODEL` | `qwen3.5:9b-q4_K_M` | modelo del chat |
+| `IPA_FORCE_CPU` | (no) | `1` fuerza modo 100% CPU |
+| `IPA_AUTO_RESEARCH` | `1` | auto-research ante gap de corpus (`0` desactiva) |
+| `IPA_AUTO_RESEARCH_DEDUP_MINUTES` | `10` | ventana de dedup de research |
+| `IPA_IDLE_DEEP_ENRICHMENT` | `0` | Tier 2 puede cargar el modelo (idle ≥30 min) |
+| `IPA_IDLE_LLM_LOADED_ENRICHMENT` | `1` | Tier 2 con modelo ya cargado (≥5 min idle) |
+| `IPA_IDLE_DEEP_THRESHOLD_MINUTES` | `30` | umbral de idle profundo |
+| `IPA_RESEARCH_REVIEW_IDLE_SECONDS` | `60` | inactividad para el review worker |
+| `IPA_RETRIEVAL_TIMEOUT_SECONDS` | `60` | timeout del retrieval híbrido |
+
+## Hardware: GPU o 100% CPU
+
+- **Con GPU**: modelo estrella en CUDA, OCR y Docling acelerados.
+- **Sin GPU**: fallback automático — chat/Tutor por Ollama (CPU), OCR y
+  Docling en `cpu`, embeddings en CPU. Nada falla al boot; `IPA_FORCE_CPU=1`
+  lo fuerza explícitamente.
+
+## Seguridad y política de datos
+
+- Nunca commitear secretos, datos personales o corpus no autorizado.
+- `.gitignore` cubre: `Landing/`, `Archive/`, `Transit/`, `models/`,
+  `outputs/`, `local_archive/`, `*.db`, logs y `.env`.
+- Los artefactos generados (índices, reportes) son derivados y rebuildables.
+- Scraping solo con allowlists explícitas y jobs acotados.

@@ -22,12 +22,29 @@ sources
 
 ## Current status
 
-The repository is an active local research and engineering platform. The fast
-ingestion path, canonical SQLite store, Tantivy/LanceDB adapters, web acquisition,
-OCR, Reporter, Tutor contracts, observability, and EKS development memory are
-implemented at different maturity levels. The status of any capability must be
-verified through its tests and experiment evidence; planned designs are not
-presented as production guarantees.
+**v0.1.0 — first stable milestone.** IPA is a functional local-first personal
+agent platform: contract-first Hybrid RAG, a shared agent core (CLI + dashboard),
+a Tutor role with human approval gates, bounded web research, an idle cognitive
+layer, and an idle scheduler with an explicit resource model. It is intentionally
+bounded: single user, single machine, bounded tools per turn. See `CHANGELOG.md`
+for what ships in this version.
+
+The fast ingestion path, canonical SQLite store, Tantivy/LanceDB adapters, web
+acquisition, OCR, Reporter, Tutor contracts, observability, and EKS development
+memory are implemented at different maturity levels. The status of any capability
+must be verified through its tests and experiment evidence; planned designs are
+not presented as production guarantees.
+
+## Hardware: GPU or 100% CPU
+
+IPA runs with or without an NVIDIA GPU:
+
+- **GPU present** — the star model runs on CUDA (Ollama or ExL3), OCR and
+  Docling use GPU acceleration.
+- **No GPU** — the system falls back automatically and runs 100% on CPU:
+  chat and Tutor use the Ollama provider (CPU), OCR and Docling resolve to
+  `cpu`, and embeddings run on CPU. Nothing fails at boot for lack of a GPU;
+  set `IPA_FORCE_CPU=1` to force CPU mode explicitly.
 
 ## Architecture
 
@@ -51,7 +68,7 @@ presented as production guarantees.
        +-------------------------+-------------------------+
        v                         v                         v
  DocumentStore             Lexical views              Vector views
- canonical data             Tantivy / FTS5             LanceDB / sqlite-vec
+ canonical data             Tantivy / FTS5             LanceDB
                                  |
                                  v
                  Reporter / Agent Runtime / Tutor
@@ -102,8 +119,23 @@ docs/          architecture, policies, plans and operations
 web/           local dashboard assets
 ```
 
+```text
+src/ipa/       public Python package and bounded contexts
+contracts/     authoritative JSON Schemas and contract vocabulary
+configs/       reproducible configuration profiles
+data/sample/   small synthetic fixtures
+tests/         contract, unit, integration and capability tests
+scripts/       thin CLI, benchmark, validation and operations entrypoints
+tools/         development-only tools, including EKS MCP
+knowledge/     EKS engineering memory (dev-time only)
+docs/          architecture, policies, plans and operations
+web/           local dashboard assets
+```
+
 Local corpus, models, indexes, databases, caches, and generated reports are not
-committed. See `public-surface-manifest.json` and `.gitignore`.
+committed. See `public-surface-manifest.json` and `.gitignore`. Pinned
+dependencies for reproducible installs live in `requirements.lock`
+(`requirements.txt` keeps the curated ranges).
 
 ## Dashboard and orchestrator
 
@@ -152,7 +184,9 @@ validation and human approval.
 
 ## Development commands
 
-See `AGENTS.md` for the complete command reference. The principal gates are:
+See `AGENTS.md` for the complete command reference and `docs/USAGE.md` for the
+single-page install/usage guide (profiles, dashboard, chat/Tutor, tools,
+environment variables, CPU fallback). The principal gates are:
 
 ```powershell
 .venv\Scripts\python.exe -m pytest -q

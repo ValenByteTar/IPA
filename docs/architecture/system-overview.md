@@ -18,13 +18,15 @@ source
 ```
 
 `DocumentStore` is the canonical source for documents and chunks. Tantivy, FTS5,
-LanceDB, sqlite-vec, embeddings, rerankers and enrichment are derived adapters.
+LanceDB, embeddings, rerankers and enrichment are derived adapters (LanceDB won
+the E7 vector competition; sqlite-vec survives only in the memory vector index,
+`MemoryVectorIndex` — it is not a corpus vector store).
 The fast path must make content lexically available without waiting for GPU or
 LLM stages.
 
 The platform has separate consumers:
 
-- Reporter: isolated periodic analysis and human-gated promotion.
+- Reporter: isolated periodic analysis (promotion is now decoupled — see DEC-003).
 - Agent Runtime: bounded retrieval, evidence, context and generation.
 - Tutor: learning goals, concepts, roadmaps and assessment.
 - EKS: development-time engineering memory, never runtime corpus knowledge.

@@ -124,7 +124,8 @@ def parse_pdf_pymupdf(path: Path, artifact_id: str) -> ParserResult:
         if pdf_is_scanned and not text.strip():
             if _ocr_adapter is None:
                 from ipa.acquisition.ocr_adapter import OCRAdapter
-                _ocr_adapter = OCRAdapter(gpu=True, paragraph=True)
+                from ipa.providers.device import has_gpu
+                _ocr_adapter = OCRAdapter(gpu=has_gpu(), paragraph=True)
 
             # Render page to image
             max_dim_px = max(page.rect.width, page.rect.height)

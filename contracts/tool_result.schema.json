@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/tool_result.schema.json",
+  "title": "ToolResult",
+  "description": "Structured result of a deterministic tool execution. The result_hash makes the output auditable without storing the full payload in every consumer (Fase 1, DEC-002).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tool_result_id", "tool_call_id", "session_id", "tool_name", "result", "result_hash", "started_at", "completed_at", "elapsed_ms", "status"],
+  "properties": {
+    "tool_result_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "tool_call_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "session_id": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+    "tool_name": {
+      "type": "string",
+      "enum": ["search_corpus", "list_topics", "get_topic_info", "recall_conversation", "research_topic"]
+    },
+    "result": {
+      "type": "object",
+      "description": "Structured tool output. Schema varies per tool_name; validated at runtime by the tool implementation."
+    },
+    "result_hash": {
+      "$ref": "agent_common.schema.json#/$defs/hash",
+      "description": "sha256 of the canonical JSON serialization of result."
+    },
+    "source_refs": {
+      "type": "array",
+      "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
+      "description": "References to documents, chunks, or artifacts consulted or produced by this tool.",
+      "default": []
+    },
+    "started_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "completed_at": { "$ref": "agent_common.schema.json#/$defs/timestamp" },
+    "elapsed_ms": { "type": "integer", "minimum": 0 },
+    "status": {
+      "type": "string",
+      "enum": ["completed", "failed"]
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Error message when status is failed; null otherwise."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "completed" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "tool_name": { "const": "research_topic" } }, "required": ["tool_name"] },
+      "then": {
+        "properties": {
+          "result": {
+            "required": ["web_sources"],
+            "properties": {
+              "web_sources": {
+                "type": "array",
+                "items": { "$ref": "agent_common.schema.json#/$defs/identifier" },
+                "description": "web_source_ids produced by this research execution."
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

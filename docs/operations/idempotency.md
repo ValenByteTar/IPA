@@ -12,6 +12,10 @@ existing records before publishing.
 - Long-running stages need durable status, retry state and fingerprints.
 - Partial vector/enrichment availability must be visible to consumers.
 - Original artifacts are immutable; tombstones preserve history.
+- Promotion between corpora must be idempotent (PM-003): `promotion_executor.py`
+  validates existing LanceDB chunk IDs and deduplicates within each batch.
+- The three main-corpus indexes (DocumentStore, BM25, LanceDB) must have
+  exact chunk-ID parity. Audit after any bulk promotion.
 
 Use `scripts/validation/` and the experiment reports to verify these invariants.
 Do not delete `Landing/` with unprocessed files or `Archive/` as routine cleanup.

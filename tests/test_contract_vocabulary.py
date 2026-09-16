@@ -22,6 +22,14 @@ EXPECTED_RECORDS = {
     "ReporterReport",
     "ReporterDocumentDecision",
     "TopicLink",
+    "AgentSession",
+    "AgentEpisode",
+    "ToolCall",
+    "ToolResult",
+    "WebSource",
+    "UserTopicRecord",
+    "UserEvidence",
+    "TopicCluster",
 }
 
 EXPECTED_INVARIANTS = {
@@ -36,10 +44,22 @@ EXPECTED_INVARIANTS = {
     "active_roadmaps_require_human_approval",
     "research_execution_requires_human_approval",
     "mastery_is_supported_by_assessment_evidence",
+    "user_topic_records_require_evidence_for_mastery",
+    "user_evidence_is_append_only",
+    "topic_clusters_are_emergent",
+    "topic_clusters_are_derived_not_authoritative",
+    "memory_consolidation_requires_human_approval",
     "reporter_categories_are_emergent",
     "reporter_rejections_do_not_delete_artifacts",
     "reporter_promotion_requires_human_approval",
     "reporter_reports_are_corpus_fingerprinted",
+    "agent_episodes_are_append_only",
+    "agent_memory_lives_outside_any_corpus",
+    "agent_episodes_record_active_identity_hash",
+    "tool_calls_are_deterministic",
+    "tool_results_record_content_hash",
+    "web_sources_never_become_canonical",
+    "web_sources_require_trust_label",
 }
 
 # Cross-record field expectations: every record must carry identity + provenance.
@@ -105,6 +125,14 @@ def test_every_record_declares_artifact_id_or_equivalent_identity():
         "Roadmap": "roadmap_id",
         "AssessmentResult": "assessment_id",
         "ResearchRequest": "request_id",
+        "AgentSession": "session_id",
+        "AgentEpisode": "episode_id",
+        "ToolCall": "tool_call_id",
+        "ToolResult": "tool_result_id",
+        "WebSource": "web_source_id",
+        "UserTopicRecord": "record_id",
+        "UserEvidence": "evidence_id",
+        "TopicCluster": "cluster_id",
     }
     for record_name, identity in identity_fields.items():
         assert identity in data["records"][record_name], (

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 
@@ -88,3 +88,85 @@ def test_directory_backend_is_reported_without_sqlite_error(tmp_path):
     result = dashboard.db_counts(directory)
     assert result["backend"] == "directory"
     assert result["files"] == 1
+
+
+# ── Deep dive consolidado en el chat (context=deep_dive) ────────────────────
+
+def test_deep_dive_context_absent_returns_none():
+    from ipa.dashboard.api import parse_deep_dive_context
+    assert parse_deep_dive_context({}) is None
+    assert parse_deep_dive_context({"context": "chat"}) is None
+
+
+def test_deep_dive_context_valid_reporter_corpus():
+    from ipa.dashboard.api import parse_deep_dive_context
+    corpus = dashboard.REPORTER_ROOT / "some-report" / "corpus"
+    ctx = parse_deep_dive_context({
+        "context": "deep_dive", "corpus": str(corpus),
+        "category_id": "cat:1", "search": "rag agentes",
+    })
+    assert ctx is not None
+    assert ctx["corpus"] == corpus.resolve()
+    assert ctx["category_id"] == "cat:1"
+    assert ctx["search"] == "rag agentes"
+
+
+def test_deep_dive_context_rejects_corpus_outside_reporter_root():
+    from ipa.dashboard.api import parse_deep_dive_context
+    with pytest.raises(PermissionError):
+        parse_deep_dive_context({
+            "context": "deep_dive", "corpus": str(dashboard.ROOT / "Landing"),
+        })
+    with pytest.raises(PermissionError):
+        parse_deep_dive_context({"context": "deep_dive", "corpus": "C:/Windows"})
+
+
+def test_retrieval_cache_holds_only_thread_safe_handles(tmp_path):
+    """Regression: caching DocumentStore (sqlite) in _RETRIEVAL_STORES caused
+    cross-thread errors when the tutor path used it from a request thread."""
+    import sqlite3
+    import threading
+
+    from ipa.dashboard import api as api_mod
+    from ipa.indexes.lancedb_index import LanceDBIndex
+
+    corpus = tmp_path / "corpus"
+    lance = api_mod._retrieval_lance(corpus)
+    assert isinstance(lance, LanceDBIndex)
+    assert api_mod._retrieval_lance(corpus) is lance
+    for cached in api_mod._RETRIEVAL_STORES.values():
+        assert not isinstance(cached, (tuple, list)), (
+            "cached tuples carried a thread-bound DocumentStore"
+        )
+        assert not any(
+            isinstance(v, sqlite3.Connection)
+            for v in vars(cached).values()
+        ), "cached object holds a sqlite connection"
+
+
+def test_sqlite_connection_cross_thread_raises(tmp_path):
+    """Documents the failure mode the fix avoids: a sqlite3.Connection created
+    in one thread cannot be used in another."""
+    import sqlite3
+    import threading
+
+    db = tmp_path / "t.db"
+    conn_holder: list[sqlite3.Connection] = []
+    done = threading.Event()
+
+    def _owner():
+        conn = sqlite3.connect(str(db))
+        conn_holder.append(conn)
+        done.wait(timeout=5)
+        conn.close()
+
+    t = threading.Thread(target=_owner)
+    t.start()
+    while not conn_holder:
+        t.join(timeout=0.05)
+    conn = conn_holder[0]
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+    # close() is also thread-bound — the owning thread must close it.
+    done.set()
+    t.join()
