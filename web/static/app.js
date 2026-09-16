@@ -1206,8 +1206,6 @@ async function openAgentSession(sessionId){
     renderSessionList((await api('/agent/sessions'.replace('/agent','/api/agent'))).sessions);
     const msgs=$('#chat-messages');
     _renderedEpisodeIds=new Set((d.episodes||[]).map(e=>e.episode_id));
-    const msgs=$('#chat-messages');
-    _renderedEpisodeIds=new Set((d.episodes||[]).map(e=>e.episode_id));
     if(!d.episodes.length){renderChatEmpty();mountPendingTutorGates();return}
     $('#chat-messages').innerHTML=d.episodes.map(renderEpisode).join('');
     scrollChatToBottom();

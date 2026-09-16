@@ -26,6 +26,39 @@ if (-not (Test-Path $Dashboard)) {
     exit 1
 }
 
+# Ensure Ollama is running (LLM backend for the agent; also the CPU fallback target)
+$ollamaUp = $false
+try {
+    $null = Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/tags" -UseBasicParsing -TimeoutSec 2
+    $ollamaUp = $true
+} catch { }
+
+if (-not $ollamaUp) {
+    $ollamaExe = (Get-Command ollama.exe -ErrorAction SilentlyContinue).Source
+    if (-not $ollamaExe) {
+        $candidate = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
+        if (Test-Path $candidate) { $ollamaExe = $candidate }
+    }
+    if ($ollamaExe) {
+        Write-Host "Iniciando Ollama (backend LLM)..." -ForegroundColor Cyan
+        Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            try {
+                $null = Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/tags" -UseBasicParsing -TimeoutSec 2
+                $ollamaUp = $true; break
+            } catch { }
+        }
+        if ($ollamaUp) {
+            Write-Host "Ollama listo." -ForegroundColor Green
+        } else {
+            Write-Host "Ollama no respondio en 127.0.0.1:11434; el chat del agente puede fallar." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "No se encontro ollama.exe; el chat del agente no tendra backend LLM." -ForegroundColor Yellow
+    }
+}
+
 $existing = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "El dashboard ya está ejecutándose en $Url" -ForegroundColor Green
@@ -79,6 +112,6 @@ if (-not $NoBrowser) {
 Write-Host ""
 Write-Host "IPA Control Room: $Url" -ForegroundColor Green
 Write-Host "Desde la interfaz puedes lanzar scraper, Reporter, ingestas, deep dives y revisiones." -ForegroundColor Gray
-Write-Host "El dashboard y el watchdog corren sin ventana de consola (pythonw)." -ForegroundColor Gray
+Write-Host "El dashboard, el watchdog y Ollama corren sin ventana de consola." -ForegroundColor Gray
 Write-Host "Para detener todo: taskkill /F /IM pythonw.exe /IM python.exe" -ForegroundColor Gray
 Write-Host "Si el dashboard cae, el watchdog lo reinicia automaticamente." -ForegroundColor Gray
