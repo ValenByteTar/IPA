@@ -54,12 +54,16 @@ the gap; judges are replaceable: `HeuristicJudge` (default, deterministic) or
 
 Search backends, in order of preference:
 
-- local SearXNG (`IPA_SEARXNG_URL`, e.g. `http://127.0.0.1:8888`) — start with
-  `docker compose -f .devin/searxng/docker-compose.yml up -d`;
+- local SearXNG (`IPA_SEARXNG_URL`, default `http://127.0.0.1:8888`) — the
+  launcher ensures it at boot and the watchdog keeps it alive
+  (`ensure_searxng`: starts Docker Desktop if the daemon is down, then
+  `docker compose -f .devin/searxng/docker-compose.yml up -d`; managed only
+  for local URLs, disable with `IPA_SEARXNG_MANAGED=0`, check cadence via
+  `IPA_SEARXNG_CHECK_INTERVAL`, default 60s);
 - local SQLite cache (`IPA_WEB_SEARCH_CACHE`);
 - controlled DuckDuckGo fallback.
 
-Do not depend on DDG: configure local SearXNG.
+Do not depend on DDG: the managed local SearXNG is the real backend.
 
 ## Auto-research on corpus gap
 
@@ -171,12 +175,22 @@ the dashboard: task bodies live in `server.py` and context arrives via
 
 ## MCP boundary
 
-`ipa/mcp/mcp_server.py` exposes the knowledge pipeline to external MCP clients
-(stdio): `search_knowledge`, `ingest_url`, `scrape_domain`, `ingest_file`,
-`list_sources`, `get_document`. The agent itself does **not** consume MCP:
-its tools are in-process calls over the registries above. No client config in
-this repo points at this server. It reimplements retrieval instead of reusing
-the shared path — see the drift note in `retrieval.md` (its rerank silently did
-nothing until the `RerankCandidate` field bug was fixed, 2026-09-18).
+`ipa/mcp/mcp_server.py` is a **thin proxy** over the dashboard's unified tool
+registry (stdio). It owns no models and no pipeline code: at startup it fetches
+`GET /api/tools/catalog` and registers one MCP tool per registry spec, so the
+MCP surface is generated from the same source of truth the 9B chat uses — it
+cannot drift. Every call is `POST /api/tools/execute {name, args}` to the
+dashboard (`IPA_PROXY_URL`, default `http://127.0.0.1:8765`); the dashboard
+must be running (watchdog-managed). If it is down at startup, the generic
+`ipa_tool(name, args)` + `list_ipa_tools()` still work once it comes back.
+
+Read-only Tutor surface for external sessions (Devin/Claude): `tutor_focus`,
+`tutor_projects`, `tutor_roadmap_context` — the same read models the Roadmaps
+tab renders. `research_topic` is async (same as dashboard chat): it returns
+"investigación en curso" and the material lands via `list_promotions` /
+`get_report`. The agent itself does **not** consume MCP: its tools are
+in-process calls over the registries above. (Pre-2026-09-19 the server
+reimplemented retrieval directly — that duplication is gone; see the drift
+note in `retrieval.md`.)
 
 EKS (`tools/eks_mcp_server.py`) is a separate, read-only dev-time server.

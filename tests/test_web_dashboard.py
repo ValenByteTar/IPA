@@ -335,3 +335,35 @@ def test_tutor_roadmap_context_unknown_returns_error(tmp_path, monkeypatch):
     ctx = tutor_roadmap_context("roadmap:inexistente")
     assert ctx["ok"] is False
     assert "unknown roadmap" in ctx["error"]
+
+
+# ---------------------------------------------------------------------------
+# Unified tool frontier (MCP proxy) — /api/tools/*
+# ---------------------------------------------------------------------------
+
+def test_execute_tool_payload_runs_registry_tool():
+    """Tool real del registry (get_system_status) vía la frontera unificada:
+    sin modelos, solo stores/estado."""
+    from ipa.dashboard.api import execute_tool_payload
+    out = execute_tool_payload("get_system_status", {})
+    assert out["ok"] is True
+    assert out["tool"] == "get_system_status"
+    assert isinstance(out["data"], dict)
+
+
+def test_execute_tool_payload_unknown_and_bad_args():
+    from ipa.dashboard.api import execute_tool_payload
+    out = execute_tool_payload("no_existe", {})
+    assert out["ok"] is False and "unknown tool" in out["error"]
+    out2 = execute_tool_payload("search_corpus", "no-soy-dict")
+    assert out2["ok"] is False and "args" in out2["error"]
+
+
+def test_tool_catalog_payload_matches_registry():
+    """El catálogo expuesto al MCP sale del registry — no puede drift."""
+    from ipa.dashboard.api import tool_catalog_payload
+    from ipa.agent.system_tools import SYSTEM_TOOL_NAMES
+    tools = tool_catalog_payload()["tools"]
+    names = {t["name"] for t in tools}
+    assert names and names <= set(SYSTEM_TOOL_NAMES)
+    assert all(t["description"] and t["args_doc"] for t in tools)
