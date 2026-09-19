@@ -136,6 +136,7 @@ def tutor_roadmaps_payload() -> dict[str, Any]:
     visible = {
         RoadmapStatus.PROPOSED, RoadmapStatus.APPROVED,
         RoadmapStatus.ACTIVE, RoadmapStatus.COMPLETED,
+        RoadmapStatus.REJECTED,
     }
     doc_store = None
     try:
@@ -205,6 +206,150 @@ def tutor_roadmaps_payload() -> dict[str, Any]:
     finally:
         store.close()
     return {"roadmaps": roadmaps}
+
+
+def _goal_payload(goal: Any) -> dict[str, Any]:
+    """LearningGoal → JSON for the Roadmaps tab (the 'project' section)."""
+    return {
+        "goal_id": goal.goal_id,
+        "title": goal.title,
+        "description": goal.description,
+        "status": goal.status.value,
+        "success_criteria": list(goal.success_criteria),
+        "constraints": list(goal.constraints),
+        "created_at": goal.created_at,
+        "updated_at": goal.updated_at,
+        "approved": bool(goal.approval and goal.approval.approved),
+    }
+
+
+def tutor_projects_payload() -> dict[str, Any]:
+    """Projects (LearningGoals) with their roadmaps — the Roadmaps tab
+    selector. Legacy roadmaps without a goal row get one synthesized on read
+    (goal_for_roadmap), so every roadmap belongs to a project."""
+    from ipa.tutor.tutor_runtime import TutorStore, goal_for_roadmap
+
+    store = TutorStore()
+    try:
+        projects: dict[str, dict[str, Any]] = {}
+        for rm in store.list_roadmaps(include_archived=True):
+            goal = goal_for_roadmap(store, rm)
+            proj = projects.setdefault(rm.goal_id, {
+                "goal": _goal_payload(goal), "roadmaps": [],
+            })
+            proj["roadmaps"].append({
+                "roadmap_id": rm.roadmap_id,
+                "version": rm.version,
+                "status": rm.status.value,
+                "created_at": rm.created_at,
+                "n_units": len(rm.units),
+            })
+        return {"projects": sorted(
+            projects.values(),
+            key=lambda p: p["goal"]["updated_at"], reverse=True,
+        )}
+    finally:
+        store.close()
+
+
+def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
+    """Full context for the Roadmaps tab: goal (objective), rationale,
+    progress, re-derived concepts, focus state.
+
+    Concepts re-derive from the canonical DocumentStore by concept_id
+    (= document_id): source domain/url + a text excerpt. Honest labels —
+    until concept curation improves these are source-material titles, not
+    polished pedagogical names (surfaced, not hidden).
+    """
+    from ipa.tutor.tutor_contracts import RoadmapStatus
+    from ipa.tutor.tutor_runtime import TutorStore, goal_for_roadmap
+
+    doc_store = None
+    try:
+        from ipa.agent.system_tools import _main_corpus_dir
+        from ipa.storage.document_store import DocumentStore
+        corpus = _main_corpus_dir()
+        if corpus and (corpus / "document_store.db").exists():
+            doc_store = DocumentStore(corpus / "document_store.db")
+    except Exception:
+        doc_store = None
+
+    def _concept(concept_id: str) -> dict[str, Any]:
+        info = {"concept_id": concept_id, "title": "Documento del corpus",
+                "excerpt": "", "source_url": None, "source_domain": None}
+        if doc_store is not None:
+            try:
+                src = doc_store.get_source(concept_id) or {}
+                info["source_domain"] = src.get("source_domain")
+                info["source_url"] = src.get("source_url")
+                if src.get("source_domain"):
+                    info["title"] = str(src["source_domain"])
+                doc = doc_store.get_document(concept_id)
+                text = (getattr(doc, "text", "") or "").strip().replace("\n", " ")
+                info["excerpt"] = text[:400]
+            except Exception:
+                pass
+        return info
+
+    store = TutorStore()
+    try:
+        rm = store.get_roadmap(roadmap_id)
+        if rm is None:
+            return {"ok": False, "error": f"unknown roadmap: {roadmap_id}"}
+        goal = goal_for_roadmap(store, rm)
+        statuses = store.unit_statuses(rm.roadmap_id)
+        # Roadmaps activados antes de unit_progress: unidad 1 como actual
+        # (GET no muta — mismo criterio que tutor_roadmaps_payload).
+        if not statuses and rm.status in (RoadmapStatus.ACTIVE, RoadmapStatus.COMPLETED):
+            statuses = {1: "current"}
+        record = store.get_topic_record(rm.goal_id.removeprefix("goal:"))
+        mastery = None
+        if record is not None:
+            mastery = {
+                "status": record.mastery_status.value,
+                "score": record.mastery_score,
+                "attempts": record.attempts,
+                "evidence_count": len(record.evidence_ids),
+            }
+        units = [
+            {
+                "order": u.order,
+                "concept_id": u.concept_id,
+                "reason": u.reason,
+                "minutes": u.estimated_effort_minutes,
+                "assessment_types": [
+                    at.value if hasattr(at, "value") else str(at)
+                    for at in u.assessment_types
+                ],
+                "status": statuses.get(u.order, "pending"),
+                "concept": _concept(u.concept_id),
+            }
+            for u in rm.units
+        ]
+        done = sum(1 for s in statuses.values() if s == "done")
+        current = next(
+            (o for o, s in sorted(statuses.items()) if s == "current"), None
+        )
+        return {
+            "ok": True,
+            "roadmap_id": rm.roadmap_id,
+            "goal_id": rm.goal_id,
+            "version": rm.version,
+            "status": rm.status.value,
+            "created_at": rm.created_at,
+            "is_focus": store.get_focus() == rm.roadmap_id,
+            "goal": _goal_payload(goal),
+            "rationale": {
+                "assumptions": list(rm.assumptions),
+                "uncertainties": list(rm.uncertainties),
+                "change_reason": rm.change_reason,
+            },
+            "progress": {"done": done, "current": current, "total": len(rm.units)},
+            "units": units,
+            "mastery": mastery,
+        }
+    finally:
+        store.close()
 
 
 def parse_deep_dive_context(body: dict[str, Any]) -> dict[str, Any] | None:
@@ -521,6 +666,20 @@ class Handler(BaseHTTPRequestHandler):
             with AgentMemory() as memory:
                 sessions = memory.list_sessions(limit=50)
                 self.send_json({"sessions": [s.__dict__ for s in sessions]})
+        elif parsed.path == "/api/idle/status":
+            # Perilla del sidebar: estado del enriquecimiento idle (T1/T2).
+            from . import server as _server_mod
+            self.send_json({"enabled": _server_mod.idle_enabled_state()})
+        elif parsed.path == "/api/tutor/focus":
+            # Indicador del chat: sobre qué roadmap está el agente en esta
+            # sesión (o el foco global si la sesión aún no adoptó ninguno).
+            parsed_query = urllib.parse.parse_qs(parsed.query)
+            _fsid = parsed_query.get("session_id", [""])[0]
+            try:
+                from ipa.tutor.tutor_chat import get_tutor_driver
+                self.send_json(get_tutor_driver().get_focus(_fsid))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
         elif parsed.path == "/api/agent/session":
             query = urllib.parse.parse_qs(parsed.query)
             session_id = query.get("session_id", [""])[0]
@@ -603,6 +762,17 @@ class Handler(BaseHTTPRequestHandler):
             tutor_store.close()
         elif parsed.path == "/api/tutor/roadmaps":
             self.send_json(tutor_roadmaps_payload())
+        elif parsed.path == "/api/tutor/projects":
+            # Selector de la pestaña Roadmaps: proyectos (goals) + sus roadmaps.
+            self.send_json(tutor_projects_payload())
+        elif parsed.path == "/api/tutor/roadmap/context":
+            # Contexto completo de un roadmap para la pestaña (objetivo,
+            # porqué, avance, conceptos re-derivados, foco).
+            _rid = urllib.parse.parse_qs(parsed.query).get("roadmap_id", [""])[0]
+            if not _rid:
+                self.send_json({"ok": False, "error": "roadmap_id required"}, 400)
+            else:
+                self.send_json(tutor_roadmap_context(_rid))
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -841,6 +1011,43 @@ class Handler(BaseHTTPRequestHandler):
                         close_fds=True,
                     )
                 threading.Thread(target=_delayed_restart, daemon=True).start()
+            elif parsed.path == "/api/idle/toggle":
+                # Perilla del sidebar: ON/OFF del enriquecimiento idle
+                # (Tier 1 y Tier 2). Persistido — sobrevive restarts.
+                try:
+                    from . import server as _server_mod
+                    enabled = bool(body.get("enabled", True))
+                    _server_mod.set_idle_enabled(enabled)
+                    self.send_json({"ok": True, "enabled": enabled}, 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+            elif parsed.path == "/api/tutor/roadmap/focus":
+                # El usuario indica sobre qué roadmap trabajar (click en la
+                # card del stepper). La sesión actual lo adopta y el foco
+                # persiste globalmente — otras sesiones lo heredan.
+                try:
+                    from ipa.tutor.tutor_chat import get_tutor_driver
+                    rid = body.get("roadmap_id", "")
+                    sid = body.get("session_id") or ""
+                    if not rid:
+                        self.send_json({"ok": False, "error": "roadmap_id required"}, 400)
+                    else:
+                        self.send_json(get_tutor_driver().focus_roadmap(sid, rid), 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+            elif parsed.path == "/api/tutor/roadmap/unfocus":
+                # Despinear: la sesión suelta el roadmap y el foco global se
+                # limpia si apuntaba a él (botón × del chip del chat).
+                try:
+                    from ipa.tutor.tutor_chat import get_tutor_driver
+                    rid = body.get("roadmap_id", "")
+                    sid = body.get("session_id") or ""
+                    if not rid:
+                        self.send_json({"ok": False, "error": "roadmap_id required"}, 400)
+                    else:
+                        self.send_json(get_tutor_driver().unfocus_roadmap(sid, rid), 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
             elif parsed.path == "/api/tutor/roadmap/decision":
                 # Human gate on a proposed roadmap (button click).
                 try:
@@ -848,8 +1055,8 @@ class Handler(BaseHTTPRequestHandler):
                     rid = body.get("roadmap_id", "")
                     decision = body.get("decision", "")
                     sid = body.get("session_id") or ""
-                    if not rid or decision not in ("approve", "reject"):
-                        self.send_json({"ok": False, "error": "roadmap_id + decision(approve|reject) required"}, 400)
+                    if not rid or decision not in ("approve", "reject", "proposed"):
+                        self.send_json({"ok": False, "error": "roadmap_id + decision(approve|reject|proposed) required"}, 400)
                     else:
                         self.send_json(get_tutor_driver().decide_roadmap(sid, rid, decision), 200)
                 except Exception as exc:
@@ -1157,11 +1364,13 @@ class Handler(BaseHTTPRequestHandler):
                         from ipa.storage.document_store import DocumentStore
                         _embed = _server_mod.get_embedding_adapter()
                         _dense, _sparse = _embed.embed_query_hybrid(query)
+                        from ipa.indexes.reranker_adapter import maybe_rerank, rerank_enabled
                         _out: list[dict[str, Any]] = []
                         _seen: set[str] = set()
                         _store = DocumentStore(_corpus / "document_store.db")
+                        _fetch = 24 if rerank_enabled() else 10
                         try:
-                            for h in _lance.search_hybrid(query, _dense, limit=10, query_sparse=_sparse):
+                            for h in _lance.search_hybrid(query, _dense, limit=_fetch, query_sparse=_sparse):
                                 _ch = _store.get_chunk(h.chunk_id)
                                 if not _ch or _ch.document_id in _seen:
                                     continue
@@ -1172,6 +1381,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "document_id": _ch.document_id,
                                     "source_domain": _src.get("source_domain"),
                                 })
+                            _out = maybe_rerank(query, _out, 10)
                         finally:
                             _store.close()
                         return _out
@@ -1417,17 +1627,23 @@ class Handler(BaseHTTPRequestHandler):
                         if _lance.is_queryable():
                             print("[retrieval] embedding query", flush=True)
                             from ipa.storage.document_store import DocumentStore
+                            from ipa.indexes.reranker_adapter import maybe_rerank, rerank_enabled
                             _embed = _server_mod.get_embedding_adapter()
                             dense_vec, sparse_weights = _embed.embed_query_hybrid(message)
                             print("[retrieval] searching hybrid", flush=True)
                             # Dedup por documento: preferir cobertura de fuentes
                             # distintas sobre múltiples chunks del mismo doc.
+                            # Con rerank activo (default; IPA_RERANK=0 lo
+                            # desactiva) se traen más candidatos y el
+                            # cross-encoder elige el top-8.
+                            _rerank = rerank_enabled()
+                            _fetch = 24 if _rerank else 10
                             _seen_docs: set[str] = set()
                             _store = DocumentStore(_corpus / "document_store.db")
                             try:
                                 for h in _lance.search_hybrid(
                                     message, dense_vec,
-                                    limit=10, query_sparse=sparse_weights,
+                                    limit=_fetch, query_sparse=sparse_weights,
                                 ):
                                     chunk = _store.get_chunk(h.chunk_id)
                                     if not chunk or chunk.document_id in _seen_docs:
@@ -1441,8 +1657,9 @@ class Handler(BaseHTTPRequestHandler):
                                         "source_url": _src.get("source_url"),
                                         "source_domain": _src.get("source_domain"),
                                     })
-                                    if len(_hits) >= 8:
+                                    if len(_hits) >= (_fetch if _rerank else 8):
                                         break
+                                _hits = maybe_rerank(message, _hits, 8)
                             finally:
                                 _store.close()
                         print(f"[retrieval] found {len(_hits)} hits", flush=True)
@@ -1926,6 +2143,7 @@ class Handler(BaseHTTPRequestHandler):
                 from ipa.agentic.memory_consolidation import (
                     ConsolidationStore, approve_proposal, reject_proposal,
                     apply_approved_memory_consolidation,
+                    apply_approved_mastery_inference,
                 )
                 from ipa.tutor.tutor_runtime import TutorStore, TutorSession
                 from ipa.agent import AgentCore
@@ -1945,6 +2163,15 @@ class Handler(BaseHTTPRequestHandler):
                             approved = approve_proposal(consolidation_store, proposal_id, decided_by=decided_by)
                             if approved.kind == "memory_consolidation":
                                 apply_approved_memory_consolidation(consolidation_store, proposal_id)
+                            elif approved.kind == "mastery_inference":
+                                # Mismo gate: la inferencia materializa en el
+                                # UserTopicRecord del TutorStore.
+                                _mts = TutorStore()
+                                try:
+                                    apply_approved_mastery_inference(
+                                        consolidation_store, proposal_id, _mts)
+                                finally:
+                                    _mts.close()
                             self.send_json({"ok": True, "status": "approved"})
                         else:
                             reject_proposal(consolidation_store, proposal_id, decided_by=decided_by, note=note)

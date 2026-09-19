@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,8 +34,17 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=20, help="Top-k results to retrieve per query")
     parser.add_argument(
         "--backends", nargs="+",
-        default=["tantivy", "lancedb", "hybrid"],
-        help="Backends to evaluate",
+        default=["tantivy", "lancedb", "hybrid", "lancedb_hybrid"],
+        help="Backends to evaluate (lancedb_hybrid = production 3-way RRF)",
+    )
+    parser.add_argument(
+        "--rerank", action="store_true",
+        help="Stage-2 cross-encoder rerank of the top-k hits (FlagEmbedding)",
+    )
+    parser.add_argument(
+        "--where", default=None,
+        help="LanceDB SQL pre-filter on metadata columns "
+             "(e.g. \"provenance = 'agent_research'\")",
     )
     args = parser.parse_args()
 
@@ -94,12 +104,22 @@ def main() -> None:
         tantivy_index = TantivyIndex(args.tantivy)
         print(f"  Tantivy: {tantivy_index.count():,} chunks indexed", flush=True)
 
-    if "lancedb" in args.backends or "hybrid" in args.backends:
+    if any(b in args.backends for b in ("lancedb", "hybrid", "lancedb_hybrid")):
         print(f"  Opening LanceDB index: {args.lancedb}", flush=True)
         lancedb_index = LanceDBIndex(args.lancedb)
         print(f"  LanceDB: {lancedb_index.count():,} vectors indexed", flush=True)
         print(f"  Loading embedding model...", flush=True)
         embedding = EmbeddingAdapter(show_progress=False)
+
+    reranker = None
+    doc_store = None
+    if args.rerank:
+        from ipa.indexes.reranker_adapter import RerankerAdapter, RerankCandidate
+        from ipa.storage.document_store import DocumentStore
+        print(f"  Loading reranker (cross-encoder)...", flush=True)
+        reranker = RerankerAdapter(
+            device=os.environ.get("IPA_RERANK_DEVICE", "auto"))
+        doc_store = DocumentStore(args.store)
 
     # ------------------------------------------------------------------
     # 4. Run evaluation per backend
@@ -125,14 +145,27 @@ def main() -> None:
                 hits = tantivy_index.search(q.query_text, limit=args.k)
             elif backend_name == "lancedb":
                 vec = embedding.embed_query(q.query_text)
-                hits = lancedb_index.search(vec, limit=args.k)
+                hits = lancedb_index.search(vec, limit=args.k, where=args.where)
+            elif backend_name == "lancedb_hybrid":
+                dense, sparse = embedding.embed_query_hybrid(q.query_text)
+                hits = lancedb_index.search_hybrid(
+                    q.query_text, dense, limit=args.k,
+                    query_sparse=sparse, where=args.where,
+                )
             elif backend_name == "hybrid":
                 lex_hits = tantivy_index.search(q.query_text, limit=args.k)
                 vec = embedding.embed_query(q.query_text)
-                vec_hits = lancedb_index.search(vec, limit=args.k)
+                vec_hits = lancedb_index.search(vec, limit=args.k, where=args.where)
                 hits = hybrid_fuse(lex_hits, vec_hits, limit=args.k)
             else:
                 raise ValueError(f"Unknown backend: {backend_name}")
+
+            if reranker is not None and hits:
+                cands = []
+                for h in hits:
+                    ch = doc_store.get_chunk(h.chunk_id)
+                    cands.append(RerankCandidate.from_hit(h, ch.text if ch else ""))
+                hits = reranker.rerank(q.query_text, cands, top_k=args.k)
 
             latency_ms = (time.monotonic() - t0) * 1000
 
@@ -176,6 +209,10 @@ def main() -> None:
         lancedb_index.close()
     if embedding:
         embedding.close()
+    if reranker:
+        reranker.close()
+    if doc_store:
+        doc_store.close()
 
 
 if __name__ == "__main__":

@@ -43,6 +43,21 @@ _TOPIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Instruction tail: "MTP, armame un roadmap de 6 fases" — the artifact
+# request is a constraint on the roadmap, not part of the topic.
+_INSTRUCTION_TAIL_RE = re.compile(
+    r"[,\s]+(?:armame|arm[aá]me|haceme|hac[eé]me|creame|cre[aá]me|generame|"
+    r"gener[aá]me|dise[ñn]ame|dame|preparame|prepar[aá]me|quiero)\s+"
+    r"(?:un\s+|una\s+)?(?:roadmap|plan|gu[ií]a|mapa|programa|ruta|temario|"
+    r"esquema|cronograma)\b.*$",
+    re.IGNORECASE,
+)
+# Explicit unit count: "de 6 fases", "en 8 pasos", "10 unidades".
+_UNIT_COUNT_RE = re.compile(
+    r"\b(?:de|en)\s*(\d{1,2})\s*(?:fases?|pasos?|unidades|etapas?)\b",
+    re.IGNORECASE,
+)
+
 _APPROVE_RE = re.compile(r"^\s*(aprobad|aprueb|si|sí|dale|adelante|ok|acepto|activa)[\w\s,.¡!]*$", re.IGNORECASE)
 _REJECT_RE = re.compile(r"^\s*(rechaz|no\b|cancela|descarta|anula)[\w\s,.¡!]*$", re.IGNORECASE)
 
@@ -120,6 +135,7 @@ class TutorChatState:
     roadmap_id: str | None = None
     phase: str = "idle"  # idle | roadmap_proposed | active | research_pending
     pending_request_id: str | None = None
+    requested_units: int | None = None
 
 
 class TutorChatDriver:
@@ -163,11 +179,22 @@ class TutorChatDriver:
             st = TutorChatState()
             # Recover an in-flight proposal after a restart — only for the
             # first session seen since boot, so a brand-new parallel session
-            # doesn't inherit another session's pending gate.
+            # doesn't inherit another session's pending gate. El foco del
+            # usuario manda: si hay un roadmap enfocado, la recuperación
+            # arranca por ahí (no por el primer roadmap que aparezca).
             if not self._states:
                 with self._store() as store:
                     try:
-                        for rm in store.list_roadmaps():
+                        ordered = []
+                        fid = store.get_focus()
+                        if fid:
+                            focused = store.get_roadmap(fid)
+                            if focused is not None:
+                                ordered.append(focused)
+                        ordered.extend(
+                            rm for rm in store.list_roadmaps()
+                            if rm.roadmap_id != fid)
+                        for rm in ordered:
                             if rm.status == RoadmapStatus.PROPOSED:
                                 st.roadmap_id = rm.roadmap_id
                                 st.goal_id = rm.goal_id
@@ -184,6 +211,15 @@ class TutorChatDriver:
                                 break
                     except Exception:
                         pass
+            if st.topic_id:
+                # Roadmaps viejos pueden tener la instrucción del artefacto
+                # pegada al slug ("mtp-armame-un-roadmap-de-6-fases") — el
+                # retrieval del debate usaría basura. Cortar en el primer
+                # marcador de instrucción deja el tema real.
+                st.topic = re.sub(
+                    r"-(?:armame|haceme|creame|generame|dise[ñn]ame|dame|"
+                    r"preparame|quiero)\b.*$", "", st.topic_id,
+                ).replace("-", " ")
             self._states[session_id] = st
         return st
 
@@ -197,8 +233,19 @@ class TutorChatDriver:
             r"[,\s]+(?:punto\s+de\s+partida\s+\S+|desde\s+cero|empezando\s+de\s+cero)\s*$",
             "", topic, flags=re.IGNORECASE,
         ).strip()
+        # "armame un roadmap de N fases" es una instrucción del artefacto.
+        topic = _INSTRUCTION_TAIL_RE.sub("", topic).strip().rstrip(",")
         topic = re.sub(r"^(?:sobre|de|acerca\s+de|el|la|los|las)\s+", "", topic, flags=re.IGNORECASE)
         return topic[:120] or None
+
+    @staticmethod
+    def _detect_unit_count(message: str) -> int | None:
+        """'roadmap de 6 fases' → 6. Clamped 2-12: una unidad no es roadmap."""
+        m = _UNIT_COUNT_RE.search(message)
+        if not m:
+            return None
+        n = int(m.group(1))
+        return n if 2 <= n <= 12 else None
 
     def _concepts_from_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Corpus hits → concept candidates for roadmap proposal."""
@@ -220,13 +267,29 @@ class TutorChatDriver:
             })
         return concepts
 
-    def _render_roadmap(self, roadmap: Any, concepts: list[dict[str, Any]]) -> str:
+    def _render_roadmap(self, roadmap: Any, concepts: list[dict[str, Any]], *,
+                        heading: str = "Roadmap propuesto:") -> str:
         by_id = {c["concept_id"]: c for c in concepts}
-        lines = ["Roadmap propuesto:"]
+        lines = [heading] if heading else []
         for u in roadmap.units:
             title = by_id.get(u.concept_id, {}).get("title", u.concept_id)
             lines.append(f"{u.order}. {title} — {u.reason} (~{u.estimated_effort_minutes} min)")
         return "\n".join(lines)
+
+    @staticmethod
+    def _mismatch_note(topic: str, hits: list[dict[str, Any]]) -> str:
+        """Transparency note when no retrieved hit mentions the topic: the
+        roadmap grounds on the nearest material — say so before the learner
+        commits to a course built on the wrong interpretation."""
+        if not hits or any(
+            topic.lower() in str(h.get("text") or "").lower() for h in hits
+        ):
+            return ""
+        return (
+            f"\n\nNota: el corpus no menciona «{topic}» de forma explícita; "
+            "las unidades salen del material más cercano. Si buscabas otro "
+            "sentido del tema, decime y lo investigamos."
+        )
 
     # ── per-unit progress (unit_progress table; roadmap stays immutable) ──
 
@@ -331,6 +394,14 @@ class TutorChatDriver:
         with self._store() as store:
             session = TutorSession(core=core, store=store, provider=_tutor_provider(provider))
 
+            # ── Adopción de foco (cross-sesión) ──────────────────────────
+            # Sesión nueva o idle + mensaje que NO pide un tema nuevo →
+            # adoptar el roadmap enfocado globalmente (el que el usuario
+            # indicó desde la card o al activar). Así "dale" en una sesión
+            # fresca continúa el roadmap activo, no arranca de cero.
+            if st.phase == "idle" and not st.roadmap_id and self._detect_topic(message) is None:
+                self._adopt_focus(store, st, session_id)
+
             # ── Gate on a pending research request ───────────────────────
             if st.phase == "research_pending" and st.pending_request_id:
                 # Self-heal if decided via the approvals panel.
@@ -394,6 +465,8 @@ class TutorChatDriver:
                         session.activate_roadmap(st.roadmap_id)
                         st.phase = "active"
                         self._ensure_progress(store, st.roadmap_id)
+                        store.set_focus(st.roadmap_id)
+                        store.set_session_roadmap(session_id, st.roadmap_id)
                         roadmap = store.get_roadmap(st.roadmap_id)
                         first = roadmap.units[0] if roadmap and roadmap.units else None
                         out["reply"] = (
@@ -435,12 +508,16 @@ class TutorChatDriver:
                     self._record(core, session_id, message, out["reply"])
                     return out
                 try:
+                    nu = self._detect_unit_count(message)
+                    if nu:
+                        st.requested_units = nu
                     revised = session.propose_roadmap(
                         st.goal_id, concepts,
                         version=(old.version + 1) if old is not None else 1,
                         previous_roadmap_id=st.roadmap_id if old is not None else None,
                         change_reason=f"Debate del alumno: {message[:300]}",
                         feedback=message,
+                        n_units=st.requested_units,
                     )
                     if old is not None:
                         try:
@@ -448,10 +525,13 @@ class TutorChatDriver:
                         except Exception:
                             pass
                     st.roadmap_id = revised.roadmap_id
-                    rendered = self._render_roadmap(revised, concepts)
+                    store.set_session_roadmap(session_id, revised.roadmap_id)
+                    rendered = self._render_roadmap(
+                        revised, concepts,
+                        heading=f"Roadmap revisado (v{revised.version}) con tu feedback:")
+                    rendered += self._mismatch_note(st.topic or "", hits)
                     out["reply"] = (
-                        f"Roadmap revisado (v{revised.version}) con tu feedback:\n\n{rendered}\n\n"
-                        "Aprobá, rechazá, o seguí debatiendo."
+                        f"{rendered}\n\nAprobá, rechazá, o seguí debatiendo."
                     )
                     out["roadmap_proposal"] = {
                         "roadmap_id": revised.roadmap_id,
@@ -463,7 +543,11 @@ class TutorChatDriver:
                     }
                     self._record(core, session_id, message, out["reply"])
                 except Exception as exc:
-                    out["reply"] = f"No pude revisar el roadmap con ese feedback: {exc}"
+                    print(f"[tutor] roadmap revision failed: {exc}", flush=True)
+                    out["reply"] = (
+                        "No pude revisar el roadmap con ese feedback. "
+                        "Podés aprobarlo, rechazarlo, o probar con otro feedback."
+                    )
                     self._record(core, session_id, message, out["reply"])
                 return out
 
@@ -476,19 +560,19 @@ class TutorChatDriver:
                 from ipa.agent.provider_wiring import (
                     build_responder, build_streaming_responder,
                 )
-                # 768: una lección puede necesitar explicar conceptos con
-                # detalle; 256/512 cortaban explicaciones a mitad.
-                # Streaming: los tokens de la lección llegan a la UI en vivo
-                # via on_token (los gates/roadmaps no streamean — son texto
-                # renderizado o JSON estructurado, no generación de chat).
+                # 1536: lecciones ricas (el alumno pidió explicaciones del
+                # doble de largas); 768 cortaba explicaciones extensas a
+                # mitad. Streaming: los tokens de la lección llegan a la UI
+                # en vivo via on_token (los gates/roadmaps no streamean —
+                # son texto renderizado o JSON estructurado, no chat).
                 if provider is not None and on_token is not None:
                     responder = build_streaming_responder(
-                        _tutor_provider(provider), max_new_tokens=768,
+                        _tutor_provider(provider), max_new_tokens=1536,
                         on_token=on_token,
                     )
                 else:
                     responder = build_responder(
-                        _tutor_provider(provider), max_new_tokens=768,
+                        _tutor_provider(provider), max_new_tokens=1536,
                     ) if provider is not None else None
                 result = session.lesson(
                     st.topic_id, message, responder=responder,
@@ -563,6 +647,13 @@ class TutorChatDriver:
             st.topic = topic
             st.topic_id = _slug(topic)
             st.goal_id = f"goal:{st.topic_id}"
+            st.requested_units = self._detect_unit_count(message)
+            try:
+                # El "proyecto" nace con el topic: scaffold determinístico,
+                # el LLM lo refina al proponer el roadmap (_refine_goal).
+                session.ensure_goal(st.goal_id, title=topic, description=message[:500])
+            except Exception as exc:
+                print(f"[tutor] goal persist failed: {exc}", flush=True)
 
             diagnosis = session.diagnose(st.topic_id)
 
@@ -593,17 +684,32 @@ class TutorChatDriver:
                     }
                     self._record(core, session_id, message, out["reply"])
                 except Exception as exc:
-                    out["reply"] = f"Diagnóstico hecho ({diagnosis.summary}), pero falló la propuesta de investigación: {exc}"
+                    print(f"[tutor] research proposal failed: {exc}", flush=True)
+                    out["reply"] = (
+                        f"Diagnóstico hecho ({diagnosis.summary}), pero no pude "
+                        "iniciar la propuesta de investigación. Probá de nuevo."
+                    )
                 return out
 
             # Roadmap proposal (LLM picks/orders; human approves via gate).
             try:
-                roadmap = session.propose_roadmap(st.goal_id, concepts)
+                roadmap = session.propose_roadmap(
+                    st.goal_id, concepts, n_units=st.requested_units)
                 st.phase = "roadmap_proposed"
                 st.roadmap_id = roadmap.roadmap_id
-                rendered = self._render_roadmap(roadmap, concepts)
+                store.set_session_roadmap(session_id, roadmap.roadmap_id)
+                rendered = self._render_roadmap(roadmap, concepts) + self._mismatch_note(topic, hits)
+                # El gate muestra el objetivo persistido (success_criteria):
+                # el humano aprueba el roadmap CONTRA el criterio de éxito.
+                goal = store.get_goal(st.goal_id)
+                goal_line = ""
+                if goal is not None and goal.success_criteria:
+                    goal_line = (
+                        f"\nObjetivo ({goal.title}): "
+                        + "; ".join(goal.success_criteria[:4])
+                    )
                 out["reply"] = (
-                    f"Diagnóstico: {diagnosis.summary}\n\n{rendered}\n\n"
+                    f"Diagnóstico: {diagnosis.summary}\n\n{rendered}{goal_line}\n\n"
                     "Aprobá o rechazá el roadmap (botones abajo o 'aprobado'/'rechazado')."
                 )
                 out["roadmap_proposal"] = {
@@ -618,10 +724,11 @@ class TutorChatDriver:
                 out["topic"] = topic
                 self._record(core, session_id, message, out["reply"])
             except Exception as exc:
+                print(f"[tutor] roadmap proposal failed: {exc}", flush=True)
                 out["reply"] = (
                     f"Diagnóstico: {diagnosis.summary}. "
-                    f"No pude proponer el roadmap ({exc}). "
-                    "Probá de nuevo o decime si querés que investigue más el tema."
+                    "No pude armar un roadmap con el material disponible — "
+                    "¿querés que investigue más el tema en la web?"
                 )
                 self._record(core, session_id, message, out["reply"])
             return out
@@ -653,22 +760,76 @@ class TutorChatDriver:
         )
 
     def decide_roadmap(self, session_id: str, roadmap_id: str, decision: str) -> dict[str, Any]:
-        """Button gate: approve+activate or reject a proposed roadmap."""
+        """Human gate on a roadmap — three states: proposed | accepted | rejected.
+
+        The sidebar badge lets the human move a roadmap between the three
+        gate states at any time: 'approve' accepts (proposed/rejected →
+        active), 'reject' marks rejected, 'proposed' returns a decided
+        roadmap to pending debate. The latest decision is ground truth —
+        the session re-targets that roadmap so the chat follows it.
+        """
         st = self.state(session_id)
         with self._store() as store:
             session = self._fresh_session(store)
             try:
+                rm = store.get_roadmap(roadmap_id)
+                if rm is None:
+                    return {"ok": False, "error": f"unknown roadmap: {roadmap_id}"}
                 if decision == "approve":
-                    session.approve_roadmap(roadmap_id, decided_by="dashboard")
-                    session.activate_roadmap(roadmap_id)
+                    if rm.status in (RoadmapStatus.REJECTED, RoadmapStatus.COMPLETED):
+                        session.reopen_roadmap(roadmap_id, decided_by="dashboard")
+                        rm = store.get_roadmap(roadmap_id)
+                    if rm.status == RoadmapStatus.PROPOSED:
+                        session.approve_roadmap(roadmap_id, decided_by="dashboard")
+                        rm = store.get_roadmap(roadmap_id)
+                    if rm.status == RoadmapStatus.APPROVED:
+                        rm = session.activate_roadmap(roadmap_id)
+                    try:
+                        # Un solo gate: aprobar el roadmap confirma y activa
+                        # el LearningGoal que sirve (mismo decided_by).
+                        session.approve_goal(rm.goal_id, decided_by="dashboard")
+                        session.activate_goal(rm.goal_id)
+                    except Exception as exc:
+                        print(f"[tutor] goal activation failed: {exc}", flush=True)
                     self._ensure_progress(store, roadmap_id)
-                    if st.roadmap_id == roadmap_id:
-                        st.phase = "active"
+                    self._point_session_at(st, rm, phase="active")
+                    # Activar ES indicar foco: otras sesiones lo adoptan.
+                    store.set_focus(roadmap_id)
+                    store.set_session_roadmap(session_id, roadmap_id)
                     return {"ok": True, "status": "active"}
+                if decision == "proposed":
+                    if rm.status != RoadmapStatus.PROPOSED:
+                        rm = session.reopen_roadmap(roadmap_id, decided_by="dashboard")
+                    try:
+                        session.reopen_goal(rm.goal_id, decided_by="dashboard")
+                    except Exception as exc:
+                        print(f"[tutor] goal reopen failed: {exc}", flush=True)
+                    self._point_session_at(st, rm, phase="roadmap_proposed")
+                    # Debatir un roadmap también ES indicar foco: el chip y
+                    # otras sesiones deben apuntar al que el usuario reabrió.
+                    store.set_focus(roadmap_id)
+                    store.set_session_roadmap(session_id, roadmap_id)
+                    return {"ok": True, "status": "proposed"}
                 session.reject_roadmap(roadmap_id, decided_by="dashboard")
+                try:
+                    # El goal solo se cancela si ninguna otra versión viva lo sirve.
+                    live = [
+                        r for r in store.list_roadmaps(rm.goal_id)
+                        if r.roadmap_id != roadmap_id
+                        and r.status in (
+                            RoadmapStatus.PROPOSED,
+                            RoadmapStatus.APPROVED,
+                            RoadmapStatus.ACTIVE,
+                        )
+                    ]
+                    if not live:
+                        session.cancel_goal(rm.goal_id)
+                except Exception as exc:
+                    print(f"[tutor] goal cancel failed: {exc}", flush=True)
                 if st.roadmap_id == roadmap_id:
                     st.phase = "idle"
                     st.roadmap_id = None
+                store.clear_focus(roadmap_id)
                 return {"ok": True, "status": "rejected"}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
@@ -677,6 +838,136 @@ class TutorChatDriver:
                     session.core.memory.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _point_session_at(st: TutorChatState, rm: Any, *, phase: str) -> None:
+        """Sidebar gate decisions re-target the session at that roadmap —
+        the human's latest decision defines what the tutor teaches next."""
+        st.roadmap_id = rm.roadmap_id
+        st.goal_id = rm.goal_id
+        st.topic_id = rm.goal_id.removeprefix("goal:")
+        st.topic = st.topic_id.replace("-", " ")
+        st.phase = phase
+
+    def _adopt_focus(self, store: Any, st: TutorChatState, session_id: str) -> bool:
+        """Adoptar el foco global si apunta a un roadmap ACTIVE — continuidad
+        cross-sesión sin tocar sesiones que ya tienen rumbo propio."""
+        try:
+            fid = store.get_focus()
+            if not fid:
+                return False
+            rm = store.get_roadmap(fid)
+            if rm is None or rm.status != RoadmapStatus.ACTIVE:
+                return False
+            self._point_session_at(st, rm, phase="active")
+            # Cleanup de slugs viejos con instrucción pegada (mismo criterio
+            # que el recovery de state()).
+            st.topic = re.sub(
+                r"-(?:armame|haceme|creame|generame|dise[ñn]ame|dame|"
+                r"preparame|quiero)\b.*$", "", st.topic_id or "",
+            ).replace("-", " ")
+            store.set_session_roadmap(session_id, rm.roadmap_id)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _point_session_at(st: TutorChatState, rm: Any, *, phase: str) -> None:
+        """Sidebar gate decisions re-target the session at that roadmap —
+        the human's latest decision defines what the tutor teaches next."""
+        st.roadmap_id = rm.roadmap_id
+        st.goal_id = rm.goal_id
+        st.topic_id = rm.goal_id.removeprefix("goal:")
+        st.topic = re.sub(
+            r"-(?:armame|haceme|creame|generame|dise[ñn]ame|dame|"
+            r"preparame|quiero)\b.*$", "", st.topic_id or "",
+        ).replace("-", " ")
+        st.phase = phase
+
+    def _adopt_focus(self, store: Any, st: TutorChatState, session_id: str) -> bool:
+        """Adoptar el foco global (roadmap ACTIVO) en esta sesión. Solo
+        roadmaps activos: la continuidad de lección es el caso de uso; los
+        gates pendientes se recuperan por otra vía (mountPendingTutorGates)."""
+        try:
+            fid = store.get_focus()
+            if not fid:
+                return False
+            rm = store.get_roadmap(fid)
+            if rm is None or rm.status != RoadmapStatus.ACTIVE:
+                return False
+            self._point_session_at(st, rm, phase="active")
+            store.set_session_roadmap(session_id, rm.roadmap_id)
+            return True
+        except Exception:
+            return False
+
+    def focus_roadmap(self, session_id: str, roadmap_id: str) -> dict[str, Any]:
+        """El usuario indica sobre qué roadmap trabajar (click en la card o
+        select de estado en el panel). Apunta la sesión ACTUAL (si hay) y
+        persiste el foco global — otras sesiones lo adoptan al continuar."""
+        st = self.state(session_id)
+        with self._store() as store:
+            try:
+                rm = store.get_roadmap(roadmap_id)
+                if rm is None:
+                    return {"ok": False, "error": f"unknown roadmap: {roadmap_id}"}
+                phase = ("active" if rm.status in (
+                    RoadmapStatus.ACTIVE, RoadmapStatus.APPROVED,
+                    RoadmapStatus.COMPLETED) else "roadmap_proposed")
+                self._point_session_at(st, rm, phase=phase)
+                store.set_focus(roadmap_id)
+                if session_id:
+                    store.set_session_roadmap(session_id, roadmap_id)
+                return {"ok": True, "focus": self._focus_info(store, st, rm)}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def unfocus_roadmap(self, session_id: str, roadmap_id: str) -> dict[str, Any]:
+        """Quita el pin del roadmap mostrado: desadopta la sesión actual y
+        limpia el foco global si apunta a ese roadmap. El topic de la sesión
+        se conserva (la conversación sigue); solo se suelta el roadmap."""
+        st = self.state(session_id)
+        with self._store() as store:
+            try:
+                if session_id:
+                    store.clear_session_roadmap(session_id)
+                store.clear_focus(roadmap_id)
+                if st.roadmap_id == roadmap_id:
+                    st.roadmap_id = None
+                    st.phase = "active" if st.topic_id else "idle"
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        return self.get_focus(session_id)
+
+    def get_focus(self, session_id: str) -> dict[str, Any]:
+        """Info de foco para el indicador del chat: el roadmap de la sesión
+        si tiene uno; si no, el foco global (aún no adoptado por la sesión)."""
+        st = self.state(session_id)
+        with self._store() as store:
+            try:
+                rid = st.roadmap_id or store.get_focus()
+                if not rid:
+                    return {"ok": True, "focus": None}
+                rm = store.get_roadmap(rid)
+                if rm is None:
+                    return {"ok": True, "focus": None}
+                return {"ok": True, "focus": self._focus_info(store, st, rm)}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def _focus_info(self, store: Any, st: Any, rm: Any) -> dict[str, Any]:
+        statuses = store.unit_statuses(rm.roadmap_id)
+        current = next(
+            (o for o in sorted(statuses) if statuses.get(o) == "current"), None)
+        done = sum(1 for v in statuses.values() if v == "done")
+        return {
+            "roadmap_id": rm.roadmap_id,
+            "topic": st.topic or rm.goal_id.removeprefix("goal:").replace("-", " "),
+            "phase": st.phase,
+            "unit_current": current,
+            "unit_total": len(rm.units),
+            "units_done": done,
+        }
 
     def decide_research(self, session_id: str, request_id: str, decision: str) -> dict[str, Any]:
         st = self.state(session_id)

@@ -19,7 +19,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from ipa.tutor.tutor_contracts import (
     GenerationProvenance,
     HumanApproval,
     HumanApprovalDecision,
+    LearningGoal,
+    LearningGoalStatus,
     MasteryStatus,
     RecommendedAction,
     Roadmap,
@@ -53,6 +55,9 @@ TUTOR_POLICY = (
     "Política pedagógica:\n"
     "- Diagnosticá antes de explicar: revisá el estado de mastery del tema.\n"
     "- Explicá con andamiaje: partí de lo que el alumno ya sabe.\n"
+    "- Explicaciones ricas: desarrollá la idea con definición, un ejemplo "
+    "concreto y la conexión con lo que el alumno ya sabe (2-4 párrafos). "
+    "Conciso en trámites y confirmaciones, generoso en la explicación.\n"
     "- Evaluá con evidencia: toda afirmación sobre el aprendizaje cita un assessment.\n"
     "- Abstenete si no tenés evidencia suficiente: mejor 'no sé' que inventar.\n"
     "- Si el corpus no alcanza para enseñar el tema, proponé investigar antes de improvisar."
@@ -156,6 +161,24 @@ class TutorStore:
                 summary TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (roadmap_id, unit_order)
+            );
+            CREATE TABLE IF NOT EXISTS tutor_focus (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                roadmap_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_roadmap (
+                session_id TEXT PRIMARY KEY,
+                roadmap_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS learning_goals (
+                goal_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
         """)
         # Migración aditiva: flag operativo de archivado. No es un estado del
@@ -289,6 +312,53 @@ class TutorStore:
             ).fetchall()
         return [self._deserialize_roadmap(payload) for (payload,) in rows]
 
+    # -- learning goals (the project a roadmap serves) ----------------------
+
+    def save_goal(self, goal: Any) -> None:
+        """Insert or update a learning goal record. The store is a dumb
+        persistence layer — status/approval invariants live in the contract."""
+        if not isinstance(goal, LearningGoal):
+            raise TypeError("save_goal expects a LearningGoal contract instance")
+        payload = asdict(goal)
+        payload["status"] = goal.status.value
+        if payload.get("approval"):
+            payload["approval"]["decision"] = goal.approval.decision.value
+        self._conn.execute(
+            "INSERT OR REPLACE INTO learning_goals "
+            "(goal_id, status, title, payload_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (goal.goal_id, goal.status.value, goal.title,
+             json.dumps(payload, ensure_ascii=False),
+             goal.created_at, goal.updated_at),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _deserialize_goal(payload: str) -> LearningGoal:
+        """JSON → LearningGoal contract (status, approval, provenance)."""
+        data = json.loads(payload)
+        data["status"] = LearningGoalStatus(data["status"])
+        approval = data.get("approval")
+        if approval:
+            approval["decision"] = HumanApprovalDecision(approval["decision"])
+            data["approval"] = HumanApproval(**approval)
+        generation = data.get("generation")
+        if generation:
+            data["generation"] = GenerationProvenance(**generation)
+        return LearningGoal(**data)
+
+    def get_goal(self, goal_id: str) -> LearningGoal | None:
+        row = self._conn.execute(
+            "SELECT payload_json FROM learning_goals WHERE goal_id = ?", (goal_id,)
+        ).fetchone()
+        return self._deserialize_goal(row[0]) if row else None
+
+    def list_goals(self) -> list[LearningGoal]:
+        rows = self._conn.execute(
+            "SELECT payload_json FROM learning_goals ORDER BY updated_at DESC"
+        ).fetchall()
+        return [self._deserialize_goal(payload) for (payload,) in rows]
+
     # -- unit progress (operational, additive — the Roadmap stays immutable) --
 
     def set_unit_status(self, roadmap_id: str, unit_order: int, status: str) -> None:
@@ -332,6 +402,55 @@ class TutorStore:
             {"roadmap_id": r, "unit_order": int(o), "summary": s}
             for r, o, s in rows
         ]
+
+    # -- foco de roadmap (cross-sesión, una sola fila) ------------------------
+
+    def set_focus(self, roadmap_id: str) -> None:
+        """Foco global del usuario: el roadmap sobre el que estamos trabajando.
+        Cualquier sesión (nueva o existente) lo adopta al continuar."""
+        self._conn.execute(
+            "INSERT INTO tutor_focus (id, roadmap_id, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET roadmap_id = excluded.roadmap_id, "
+            "updated_at = excluded.updated_at",
+            (roadmap_id, _now()),
+        )
+        self._conn.commit()
+
+    def get_focus(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT roadmap_id FROM tutor_focus WHERE id = 1").fetchone()
+        return row[0] if row else None
+
+    def clear_focus(self, roadmap_id: str) -> None:
+        """Solamente si el foco apunta a ese roadmap (p.ej. al rechazarlo)."""
+        self._conn.execute(
+            "DELETE FROM tutor_focus WHERE id = 1 AND roadmap_id = ?",
+            (roadmap_id,),
+        )
+        self._conn.commit()
+
+    def set_session_roadmap(self, session_id: str, roadmap_id: str) -> None:
+        """Asociación sesión→roadmap (para el tag de los resúmenes de sesión)."""
+        self._conn.execute(
+            "INSERT INTO session_roadmap (session_id, roadmap_id, updated_at) "
+            "VALUES (?, ?, ?) ON CONFLICT (session_id) "
+            "DO UPDATE SET roadmap_id = excluded.roadmap_id, updated_at = excluded.updated_at",
+            (session_id, roadmap_id, _now()),
+        )
+        self._conn.commit()
+
+    def get_session_roadmap(self, session_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT roadmap_id FROM session_roadmap WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def clear_session_roadmap(self, session_id: str) -> None:
+        """Desadopta el roadmap de la sesión (unpin desde el chip del chat)."""
+        self._conn.execute(
+            "DELETE FROM session_roadmap WHERE session_id = ?", (session_id,))
+        self._conn.commit()
 
     # -- research requests (approval-gated) ---------------------------------
 
@@ -488,6 +607,23 @@ class TutorSession:
             f"Último assessment: {record.last_assessment_id or 'ninguno'}."
         )
 
+    def _diagnosis_summary(self, topic_id: str) -> str:
+        """User-facing diagnosis summary — factual state only.
+
+        _mastery_context() is LESSON POLICY (an instruction to the lesson LLM);
+        it must not leak into student-facing text. No trailing period either:
+        the driver composes f"...{summary}. " → double period.
+        """
+        record = self.store.get_topic_record(topic_id)
+        if record is None:
+            return f"Tema: {topic_id}. Estado del alumno: desconocido (sin evidencia)"
+        evidence_count = len(self.store.list_evidence(topic_id))
+        return (
+            f"Tema: {topic_id}. Estado del alumno: {record.mastery_status.value} "
+            f"(score {record.mastery_score if record.mastery_score is not None else 'n/a'}, "
+            f"{record.attempts} intentos, {evidence_count} evidencias)"
+        )
+
     def build_lesson_messages(self, topic_id: str, user_message: str, *, history_limit: int = 8,
                               progress_note: str | None = None) -> list[dict[str, str]]:
         """Identity + pedagogical policy + mastery context + bounded history."""
@@ -556,7 +692,7 @@ class TutorSession:
             return DiagnosisResult(
                 topic_id=topic_id, mastery_status=MasteryStatus.UNKNOWN,
                 mastery_score=None, attempts=0, evidence_count=0,
-                summary=self._mastery_context(topic_id),
+                summary=self._diagnosis_summary(topic_id),
                 next_action=RecommendedAction.HUMAN_REVIEW,
                 source="new_topic",
             )
@@ -572,7 +708,7 @@ class TutorSession:
             mastery_score=record.mastery_score,
             attempts=record.attempts,
             evidence_count=len(self.store.list_evidence(topic_id)),
-            summary=self._mastery_context(topic_id),
+            summary=self._diagnosis_summary(topic_id),
             next_action=next_action,
             source="store",
         )
@@ -590,6 +726,7 @@ class TutorSession:
         previous_roadmap_id: str | None = None,
         change_reason: str | None = None,
         feedback: str | None = None,
+        n_units: int | None = None,
     ) -> Roadmap:
         """LLM proposes a 3-7 unit learning roadmap; status stays 'proposed'.
 
@@ -605,9 +742,17 @@ class TutorSession:
                       3-7 of them.
             version: 1 for a new roadmap; >1 requires previous_roadmap_id +
                      change_reason (supersedes, never mutates).
+            n_units: explicit unit count the learner asked for ("roadmap de
+                     6 fases"); clamped to the contract range 3-7.
         """
         if self.provider is None:
             raise ValueError("roadmap proposal requires a provider (LLM proposes)")
+        # Dedup defensivo: el retrieval puede repetir concept_id entre chunks.
+        _seen: set[str] = set()
+        concepts = [
+            c for c in concepts
+            if c["concept_id"] not in _seen and not _seen.add(c["concept_id"])
+        ]
         if len(concepts) < 3:
             raise ValueError("roadmap proposal requires at least 3 available concepts")
 
@@ -615,16 +760,28 @@ class TutorSession:
             f"- {c['concept_id']}: {c.get('title', '')} — {c.get('definition', '')[:150]}"
             for c in concepts
         )
+        unit_clause = (
+            f"Diseñá un roadmap de aprendizaje de {max(3, min(7, n_units))} unidades "
+            "(pedido explícito del alumno, ajustado al rango válido 3-7). "
+            if n_units else
+            "Diseñá un roadmap de aprendizaje de 3 a 7 unidades para este alumno. "
+        )
         prompt = (
             f"{self._mastery_context(concepts[0]['concept_id'])}\n\n"
             f"Conceptos disponibles:\n{concept_lines}\n\n"
             + (f"Feedback del alumno sobre la versión anterior:\n\"{feedback[:600]}\"\n\n" if feedback else "")
-            + "Diseñá un roadmap de aprendizaje de 3 a 7 unidades para este alumno. "
+            + unit_clause +
             "Ordená las unidades de lo más básico a lo más avanzado, respetando "
             "prerrequisitos. Respondé SOLO JSON:\n"
-            '{"units": [{"concept_id": "...", "reason": "<=30 palabras", '
+            '{"goal": {"title": "<=60 chars", "description": "<=300 chars", '
+            '"success_criteria": ["<criterio medible de éxito>"], '
+            '"constraints": ["<restricción explícita del alumno>"]}, '
+            '"units": [{"concept_id": "...", "reason": "<=30 palabras", '
             '"estimated_effort_minutes": 30, "assessment_types": ["explanation", "application"]}], '
             '"assumptions": ["..."], "uncertainties": ["..."]}\n'
+            '"goal" describe el proyecto de aprendizaje: success_criteria = 1-5 criterios '
+            "medibles para saber que el alumno lo logró; constraints = solo restricciones "
+            "que el alumno haya pedido explícitamente (lista vacía si no hay).\n"
             "assessment_types válidos: retrieval, explanation, application, critique, transfer, misconception_correction."
         )
         parsed: dict[str, Any] | None = None
@@ -645,12 +802,11 @@ class TutorSession:
                 raise RuntimeError(f"roadmap proposal failed: {result.error}")
             try:
                 candidate = _extract_json(result.text)
-                proposed_units = candidate.get("units", [])
-                if not 3 <= len(proposed_units) <= 7:
-                    raise ValueError(f"LLM proposed {len(proposed_units)} units (need 3-7)")
+                if not isinstance(candidate.get("units"), list):
+                    raise ValueError("LLM response has no units list")
                 parsed = candidate
                 break
-            except Exception as exc:  # JSON malformado o unit count inválido → retry
+            except Exception as exc:  # JSON malformado → retry
                 last_err = exc
         if parsed is None:
             # Fallback determinístico: el scaffold ordena los conceptos como
@@ -677,37 +833,19 @@ class TutorSession:
                 "uncertainties": [],
             }
 
-        # Scaffold: map LLM proposal onto contract-shaped units with provenance.
+        # Scaffold: map the proposal onto contract-shaped units with provenance.
         # The LLM only picks/orders concepts; IDs, orders and source_refs are
-        # deterministic scaffold work.
-        concept_by_id = {c["concept_id"]: c for c in concepts}
+        # deterministic scaffold work. _shape_units absorbs imperfect
+        # proposals (unknown/duplicate concept_ids, out-of-range counts) —
+        # an LLM slip must never dead-end the proposal with a contract error.
         now = _now()
-        units: list[RoadmapUnit] = []
-        for i, unit in enumerate(parsed.get("units", []), start=1):
-            concept_id = str(unit.get("concept_id", "")).strip()
-            if concept_id not in concept_by_id:
-                raise ValueError(f"LLM proposed unknown concept: {concept_id!r}")
-            concept = concept_by_id[concept_id]
-            assessment_types = [
-                AssessmentType(at) for at in (unit.get("assessment_types") or ["explanation"])
-                if str(at) in {t.value for t in AssessmentType}
-            ] or [AssessmentType.EXPLANATION]
-            effort = int(unit.get("estimated_effort_minutes", 30))
-            effort = max(5, min(1440, effort))
-            unit_id = f"roadmap_unit:{hashlib.sha256(f'{goal_id}{concept_id}{i}'.encode()).hexdigest()[:12]}"
-            units.append(RoadmapUnit(
-                unit_id=unit_id,
-                order=i,
-                concept_id=concept_id,
-                reason=str(unit.get("reason", ""))[:1000] or f"unidad {i}: {concept.get('title', concept_id)}",
-                estimated_effort_minutes=effort,
-                source_refs=[SourceRef(
-                    source_id=concept_id,
-                    source_type=SourceType.CHUNK,
-                    content_hash=None,
-                )],
-                assessment_types=assessment_types,
-            ))
+        units = self._shape_units(parsed.get("units", []), concepts, goal_id)
+        try:
+            # El bloque "goal" de la propuesta refina el LearningGoal persistido
+            # (no-op en fallback determinístico o con goal ya confirmado).
+            self._refine_goal(goal_id, parsed.get("goal"))
+        except Exception as exc:
+            print(f"[tutor] goal refine failed: {exc}", flush=True)
 
         roadmap_id = f"roadmap:{hashlib.sha256(f'{goal_id}{now}'.encode()).hexdigest()[:16]}"
         roadmap = Roadmap(
@@ -738,6 +876,76 @@ class TutorSession:
         )
         self.store.save_roadmap(roadmap)
         return roadmap
+
+    def _shape_units(
+        self,
+        proposed_units: list[dict[str, Any]],
+        concepts: list[dict[str, Any]],
+        goal_id: str,
+    ) -> list[RoadmapUnit]:
+        """Map an LLM proposal onto contract-shaped units with provenance.
+
+        The LLM only picks/orders concepts; IDs, orders and source_refs are
+        deterministic scaffold work. Imperfect proposals are ABSORBED instead
+        of dead-ending the gate: unknown concept_ids are dropped, repeated
+        ones deduped, the count topped up to the contract minimum (3) with
+        unused concepts (retrieval order) and truncated to the maximum (7).
+        """
+        concept_by_id = {c["concept_id"]: c for c in concepts}
+        units: list[RoadmapUnit] = []
+        seen: set[str] = set()
+
+        def _append(concept_id: str, reason: str, effort: int,
+                    atypes: list[AssessmentType]) -> None:
+            i = len(units) + 1
+            units.append(RoadmapUnit(
+                unit_id=f"roadmap_unit:{hashlib.sha256(f'{goal_id}{concept_id}{i}'.encode()).hexdigest()[:12]}",
+                order=i,
+                concept_id=concept_id,
+                reason=reason,
+                estimated_effort_minutes=effort,
+                source_refs=[SourceRef(
+                    source_id=concept_id,
+                    source_type=SourceType.CHUNK,
+                    content_hash=None,
+                )],
+                assessment_types=atypes,
+            ))
+
+        for unit in proposed_units:
+            concept_id = str(unit.get("concept_id", "")).strip()
+            concept = concept_by_id.get(concept_id)
+            if concept is None or concept_id in seen:
+                continue  # desconocido o repetido → el scaffold lo absorbe
+            seen.add(concept_id)
+            assessment_types = [
+                AssessmentType(at) for at in (unit.get("assessment_types") or ["explanation"])
+                if str(at) in {t.value for t in AssessmentType}
+            ] or [AssessmentType.EXPLANATION]
+            effort = max(5, min(1440, int(unit.get("estimated_effort_minutes", 30))))
+            _append(
+                concept_id,
+                str(unit.get("reason", ""))[:1000] or f"unidad {len(units) + 1}: {concept.get('title', concept_id)}",
+                effort,
+                assessment_types,
+            )
+
+        # Top-up hasta el mínimo del contrato (3) con conceptos no usados.
+        for c in concepts:
+            if len(units) >= 3:
+                break
+            if c["concept_id"] in seen:
+                continue
+            seen.add(c["concept_id"])
+            _append(
+                c["concept_id"],
+                f"unidad {len(units) + 1}: {c.get('title', c['concept_id'])}",
+                30,
+                [AssessmentType.EXPLANATION],
+            )
+        # El contrato exige 3-7 unidades: truncar excedentes (orden intacto).
+        del units[7:]
+        return units
 
     def supersede_roadmap(self, roadmap_id: str, *, decided_by: str, note: str | None = None) -> Roadmap:
         """Mark a proposed roadmap superseded (replaced by a debated revision).
@@ -839,6 +1047,45 @@ class TutorSession:
         self.store.save_roadmap(rejected)
         return rejected
 
+    def reopen_roadmap(self, roadmap_id: str, *, decided_by: str, note: str | None = None) -> Roadmap:
+        """Human gate: return a decided roadmap to pending debate.
+
+        approved/active/completed/rejected → proposed. The dashboard gate
+        exposes three states (proposed | accepted | rejected); moving back
+        to proposed records CHANGES_REQUESTED so the audit trail keeps the
+        human decision. Superseded roadmaps are lineage history and cannot
+        be reopened.
+        """
+        roadmap = self.store.get_roadmap(roadmap_id)
+        if roadmap is None:
+            raise ValueError(f"unknown roadmap: {roadmap_id}")
+        if roadmap.status == RoadmapStatus.PROPOSED:
+            return roadmap
+        if roadmap.status == RoadmapStatus.SUPERSEDED:
+            raise ValueError("superseded roadmaps cannot be reopened")
+        reopened = Roadmap(
+            roadmap_id=roadmap.roadmap_id,
+            goal_id=roadmap.goal_id,
+            version=roadmap.version,
+            status=RoadmapStatus.PROPOSED,
+            units=roadmap.units,
+            assumptions=roadmap.assumptions,
+            uncertainties=roadmap.uncertainties,
+            change_reason=roadmap.change_reason,
+            previous_roadmap_id=roadmap.previous_roadmap_id,
+            created_at=roadmap.created_at,
+            approval=HumanApproval(
+                decision=HumanApprovalDecision.CHANGES_REQUESTED,
+                decided_at=_now(),
+                decided_by=decided_by,
+                note=note,
+            ),
+            generation=roadmap.generation,
+            field_origins=roadmap.field_origins,
+        )
+        self.store.save_roadmap(reopened)
+        return reopened
+
     def activate_roadmap(self, roadmap_id: str) -> Roadmap:
         """approved → active. Only an approved roadmap can be activated."""
         roadmap = self.store.get_roadmap(roadmap_id)
@@ -863,6 +1110,180 @@ class TutorSession:
         )
         self.store.save_roadmap(active)
         return active
+
+    # ------------------------------------------------------------------
+    # LearningGoal: el "proyecto" que un roadmap sirve (persistido, gateado)
+    # ------------------------------------------------------------------
+
+    def ensure_goal(
+        self,
+        goal_id: str,
+        *,
+        title: str,
+        description: str = "",
+        success_criteria: list[str] | None = None,
+        constraints: list[str] | None = None,
+    ) -> LearningGoal:
+        """Create the goal if missing (status 'proposed'); resurrect cancelled.
+
+        The deterministic scaffold fills the minimum contract fields so a
+        project exists as soon as the learner names a topic — the LLM refines
+        title/description/criteria at proposal time (_refine_goal) and the
+        human gate approves it together with the roadmap (one decision).
+        """
+        existing = self.store.get_goal(goal_id)
+        if existing is not None and existing.status not in (
+            LearningGoalStatus.CANCELLED, LearningGoalStatus.COMPLETED
+        ):
+            return existing
+        now = _now()
+        title = (title or goal_id.removeprefix("goal:").replace("-", " ")).strip()[:200] or goal_id
+        goal = LearningGoal(
+            goal_id=goal_id,
+            title=title,
+            description=(description.strip() or f"Objetivo de aprendizaje: {title}")[:4000],
+            status=LearningGoalStatus.PROPOSED,
+            success_criteria=(
+                [c.strip()[:500] for c in (success_criteria or []) if c.strip()][:20]
+                or [f"Comprender {title} y poder aplicarlo en un caso concreto"]
+            ),
+            created_at=existing.created_at if existing else now,
+            updated_at=now,
+            approval=None,
+            field_origins={
+                "title": "user", "description": "user",
+                "success_criteria": "system", "constraints": "user",
+                "status": "system",
+            },
+            constraints=[c.strip()[:500] for c in (constraints or []) if c.strip()][:20],
+        )
+        self.store.save_goal(goal)
+        return goal
+
+    def _refine_goal(self, goal_id: str, patch: dict[str, Any] | None) -> None:
+        """Fold the LLM's goal fields (from the roadmap proposal JSON) into
+        the persisted LearningGoal — only while it is still 'proposed'.
+
+        A confirmed/active goal is a human-approved record; the model never
+        rewrites it. Fields the proposal actually changes are re-originated
+        as 'generated' with the provider's provenance.
+        """
+        goal = self.store.get_goal(goal_id)
+        if goal is None:
+            goal = self.ensure_goal(goal_id, title="")
+        if goal.status != LearningGoalStatus.PROPOSED or not isinstance(patch, dict):
+            return
+        title = str(patch.get("title") or "").strip()[:200] or goal.title
+        description = str(patch.get("description") or "").strip()[:4000] or goal.description
+        criteria = [
+            str(c).strip()[:500] for c in (patch.get("success_criteria") or [])
+            if str(c).strip()
+        ][:20] or goal.success_criteria
+        constraints = [
+            str(c).strip()[:500] for c in (patch.get("constraints") or [])
+            if str(c).strip()
+        ][:20] or goal.constraints
+        changed = {
+            field: "generated"
+            for field, new, old in (
+                ("title", title, goal.title),
+                ("description", description, goal.description),
+                ("success_criteria", criteria, goal.success_criteria),
+                ("constraints", constraints, goal.constraints),
+            )
+            if new != old
+        }
+        if not changed:
+            return
+        refined = replace(
+            goal,
+            title=title,
+            description=description,
+            success_criteria=criteria,
+            constraints=constraints,
+            field_origins={**goal.field_origins, **changed},
+            generation=GenerationProvenance(
+                generator="tutor-runtime",
+                generated_at=_now(),
+                input_hash="sha256:" + hashlib.sha256(
+                    json.dumps({"goal_id": goal_id, "patch": patch},
+                               sort_keys=True, default=str).encode()
+                ).hexdigest(),
+                model_fingerprint=(
+                    getattr(self.provider, "model_id", "provider")
+                    if self.provider else "tutor-runtime"
+                ),
+            ),
+            updated_at=_now(),
+        )
+        self.store.save_goal(refined)
+
+    def approve_goal(self, goal_id: str, *, decided_by: str,
+                     note: str | None = None) -> LearningGoal | None:
+        """proposed → confirmed. The same human gate that approves the
+        roadmap confirms the goal it serves — one decision, one record."""
+        goal = self.store.get_goal(goal_id)
+        if goal is None or goal.status != LearningGoalStatus.PROPOSED:
+            return goal
+        goal = replace(
+            goal,
+            status=LearningGoalStatus.CONFIRMED,
+            approval=HumanApproval(
+                decision=HumanApprovalDecision.APPROVED,
+                decided_at=_now(), decided_by=decided_by, note=note,
+            ),
+            updated_at=_now(),
+        )
+        self.store.save_goal(goal)
+        return goal
+
+    def activate_goal(self, goal_id: str) -> LearningGoal | None:
+        """confirmed → active (the approval record carries over)."""
+        goal = self.store.get_goal(goal_id)
+        if goal is None or goal.status != LearningGoalStatus.CONFIRMED:
+            return goal
+        goal = replace(goal, status=LearningGoalStatus.ACTIVE, updated_at=_now())
+        self.store.save_goal(goal)
+        return goal
+
+    def reopen_goal(self, goal_id: str, *,
+                    decided_by: str) -> LearningGoal | None:
+        """Decided goal → proposed again (its roadmap reopened for debate).
+
+        Reopening a roadmap re-engages its goal: cancelled also comes back.
+        A completed goal is a closed record and is never reopened.
+        """
+        goal = self.store.get_goal(goal_id)
+        if goal is None or goal.status in (
+            LearningGoalStatus.PROPOSED,
+            LearningGoalStatus.COMPLETED,
+        ):
+            return goal
+        goal = replace(
+            goal,
+            status=LearningGoalStatus.PROPOSED,
+            approval=HumanApproval(
+                decision=HumanApprovalDecision.CHANGES_REQUESTED,
+                decided_at=_now(), decided_by=decided_by,
+            ),
+            updated_at=_now(),
+        )
+        self.store.save_goal(goal)
+        return goal
+
+    def cancel_goal(self, goal_id: str) -> LearningGoal | None:
+        """→ cancelled. The caller checks no other live roadmap version still
+        serves the goal before calling."""
+        goal = self.store.get_goal(goal_id)
+        if goal is None or goal.status == LearningGoalStatus.CANCELLED:
+            return goal
+        goal = replace(goal, status=LearningGoalStatus.CANCELLED, updated_at=_now())
+        self.store.save_goal(goal)
+        return goal
+
+    def goal_for_roadmap(self, roadmap: Any) -> LearningGoal:
+        """Get the persisted goal, synthesizing one for legacy roadmaps."""
+        return goal_for_roadmap(self.store, roadmap)
 
     # ------------------------------------------------------------------
     # ResearchRequest: crear → aprobar (humano) → ejecutar (Fase 1 executor)
@@ -1236,10 +1657,69 @@ class TutorSession:
         return evidence
 
 
+def goal_for_roadmap(store: TutorStore, roadmap: Any) -> LearningGoal:
+    """Get the persisted goal for a roadmap, synthesizing one for legacy
+    roadmaps written before learning_goals existed (bare goal:slug).
+
+    Status mirrors the LATEST version of the goal's roadmap line, and a
+    confirmed/active goal REUSES the roadmap's own HumanApproval — the human
+    decision that approved the roadmap is literally the goal's approval
+    record. Store-level (no session/provider) so read endpoints can use it.
+    """
+    goal = store.get_goal(roadmap.goal_id)
+    if goal is not None:
+        return goal
+    latest = roadmap
+    try:
+        versions = store.list_roadmaps(roadmap.goal_id)  # version DESC
+        if versions:
+            latest = versions[0]
+    except Exception:
+        pass
+    status = {
+        RoadmapStatus.PROPOSED: LearningGoalStatus.PROPOSED,
+        RoadmapStatus.APPROVED: LearningGoalStatus.CONFIRMED,
+        RoadmapStatus.ACTIVE: LearningGoalStatus.ACTIVE,
+        RoadmapStatus.COMPLETED: LearningGoalStatus.COMPLETED,
+        RoadmapStatus.SUPERSEDED: LearningGoalStatus.PROPOSED,
+        RoadmapStatus.REJECTED: LearningGoalStatus.CANCELLED,
+    }.get(latest.status, LearningGoalStatus.PROPOSED)
+    approval = latest.approval
+    if status in (
+        LearningGoalStatus.CONFIRMED,
+        LearningGoalStatus.ACTIVE,
+        LearningGoalStatus.COMPLETED,
+    ) and not (approval and approval.approved):
+        status, approval = LearningGoalStatus.PROPOSED, None
+    now = _now()
+    topic = roadmap.goal_id.removeprefix("goal:").replace("-", " ")
+    goal = LearningGoal(
+        goal_id=roadmap.goal_id,
+        title=topic,
+        description=(
+            latest.change_reason
+            or f"Objetivo de aprendizaje sobre {topic}"
+        )[:4000],
+        status=status,
+        success_criteria=[f"Comprender {topic} y poder aplicarlo en un caso concreto"],
+        created_at=latest.created_at,
+        updated_at=now,
+        approval=approval,
+        field_origins={
+            "title": "system", "description": "system",
+            "success_criteria": "system", "constraints": "user",
+            "status": "system",
+        },
+    )
+    store.save_goal(goal)
+    return goal
+
+
 __all__ = [
     "ABSTENTION_THRESHOLD",
     "DEFAULT_TUTOR_STORE",
     "DiagnosisResult",
     "TutorSession",
     "TutorStore",
+    "goal_for_roadmap",
 ]

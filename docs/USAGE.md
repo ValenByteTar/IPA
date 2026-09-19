@@ -108,9 +108,9 @@ Log auditable: `outputs/web_dashboard/logs/idle_enrichment.log`.
 python -m ipa.mcp.mcp_server
 ```
 
-Tools: `search_knowledge`, `ingest_url`, `ingest_file`, `list_sources`,
-`get_document`. Ver el docstring de `src/ipa/mcp/mcp_server.py` para la
-configuración del cliente MCP.
+Tools: `search_knowledge`, `ingest_url`, `scrape_domain`, `ingest_file`,
+`list_sources`, `get_document`. Ver el docstring de
+`src/ipa/mcp/mcp_server.py` para la configuración del cliente MCP.
 
 ## Variables de entorno
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -30,11 +29,42 @@ if not Path(PYTHON).exists():
     PYTHON = sys.executable
 DASHBOARD_SCRIPT = str(ROOT / "scripts" / "operations" / "web_dashboard.py")
 PID_FILE = ROOT / "outputs" / "web_dashboard" / "dashboard.pid"
+WATCHDOG_PID_FILE = ROOT / "outputs" / "web_dashboard" / "watchdog.pid"
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
-def is_port_responding(host: str, port: int, timeout: float = 2.0) -> bool:
+def _ps_processes(matching: str) -> list[tuple[int, str]]:
+    """(pid, command_line) for processes whose cmdline contains `matching`.
+
+    Uses Get-CimInstance — wmic is deprecated and absent on modern Windows,
+    which previously made this return [] and let stale dashboards pile up.
+    """
     try:
-        req = urllib.request.Request(f"http://{host}:{port}/api/state", method="GET")
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+             "Select-Object ProcessId,CommandLine | "
+             "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_NO_WINDOW,
+        )
+        out = []
+        for line in result.stdout.splitlines():
+            pid_s, _, cmd = line.strip().partition("|")
+            if pid_s.isdigit() and matching in cmd:
+                out.append((int(pid_s), cmd))
+        return out
+    except Exception:
+        return []
+
+
+def is_port_responding(host: str, port: int, timeout: float = 3.0) -> bool:
+    # /api/health is cheap — /api/state reads every DB and takes seconds,
+    # which made a busy-but-healthy dashboard look dead and triggered
+    # spurious restarts.
+    try:
+        req = urllib.request.Request(f"http://{host}:{port}/api/health", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
@@ -43,30 +73,24 @@ def is_port_responding(host: str, port: int, timeout: float = 2.0) -> bool:
 
 def find_dashboard_pids() -> list[int]:
     """Find python/pythonw processes running web_dashboard.py."""
+    return [pid for pid, _ in _ps_processes("web_dashboard.py")]
+
+
+def watchdog_already_running() -> bool:
+    """True if the recorded watchdog PID is alive and still a watchdog."""
     try:
-        # Use wmic to find all python processes (both python.exe and pythonw.exe)
-        result = subprocess.run(
-            ["wmic", "process", "where", "Name='python.exe' or Name='pythonw.exe'", "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        pids = []
-        for line in result.stdout.strip().splitlines():
-            if "web_dashboard.py" in line and "dashboard_watchdog" not in line:
-                parts = line.split(",")
-                if len(parts) >= 2:
-                    try:
-                        pids.append(int(parts[-1]))
-                    except ValueError:
-                        continue
-        return pids
+        pid = int(WATCHDOG_PID_FILE.read_text().strip())
     except Exception:
-        return []
+        return False
+    if pid == os.getpid():
+        return False
+    return any(p == pid and "dashboard_watchdog" in cmd
+               for p, cmd in _ps_processes("dashboard_watchdog"))
 
 
 def kill_pid(pid: int) -> bool:
     try:
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, creationflags=_NO_WINDOW)
         return True
     except Exception:
         return False
@@ -120,16 +144,22 @@ def run_watchdog(host: str, port: int, interval: int) -> None:
     """Main watchdog loop: check periodically and relaunch if down."""
     print(f"[watchdog] Monitoring {host}:{port} every {interval}s (Ctrl+C to stop)", flush=True)
     last_launch_time = 0.0
+    consecutive_failures = 0
     while True:
-        if not is_port_responding(host, port):
+        if is_port_responding(host, port):
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
             now = time.time()
-            # Don't relaunch more than once every 15 seconds to avoid duplicates
-            if now - last_launch_time > 15:
-                print(f"[watchdog] Dashboard is down, restarting...", flush=True)
+            # 3 failed checks in a row before restarting — a single slow
+            # response under load is not a crash. Min 15s between launches.
+            if consecutive_failures >= 3 and now - last_launch_time > 15:
+                print(f"[watchdog] Dashboard is down ({consecutive_failures} checks), restarting...", flush=True)
                 restart_dashboard(host, port)
                 last_launch_time = time.time()
+                consecutive_failures = 0
             else:
-                print(f"[watchdog] Dashboard still down, waiting before retry...", flush=True)
+                print(f"[watchdog] Health check failed ({consecutive_failures}/3)", flush=True)
         time.sleep(interval)
 
 
@@ -144,11 +174,17 @@ def main() -> None:
     if args.restart:
         ok = restart_dashboard(args.host, args.port)
         sys.exit(0 if ok else 1)
-    else:
-        try:
-            run_watchdog(args.host, args.port, args.interval)
-        except KeyboardInterrupt:
-            print("\n[watchdog] Stopped", flush=True)
+
+    if watchdog_already_running():
+        print("[watchdog] Another watchdog is already running — exiting.", flush=True)
+        sys.exit(0)
+    WATCHDOG_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WATCHDOG_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+    try:
+        run_watchdog(args.host, args.port, args.interval)
+    except KeyboardInterrupt:
+        print("\n[watchdog] Stopped", flush=True)
 
 
 if __name__ == "__main__":

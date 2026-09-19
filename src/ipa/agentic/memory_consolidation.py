@@ -280,14 +280,45 @@ def reject_proposal(store: ConsolidationStore, proposal_id: str, *, decided_by: 
     return rejected
 
 
-def apply_approved_memory_consolidation(store: ConsolidationStore, proposal_id: str) -> dict[str, Any]:
-    """Materialize an approved consolidation without deleting source episodes."""
+def apply_approved_memory_consolidation(
+    store: ConsolidationStore, proposal_id: str,
+    *, user_model_store: Any | None = None,
+) -> dict[str, Any]:
+    """Materialize an approved consolidation without deleting source episodes.
+
+    Two payload shapes live under kind='memory_consolidation':
+      - sessfact `{fact, session_id, origin}` (SessionConsolidator) → user_facts
+        in the user model with status 'active' — the only path that reaches
+        the system prompt (render_user_model_context) and the memory index.
+      - legacy `consolidated_summary` (MemoryConsolidator) → memory_consolidations.
+    """
     proposal = store.get_proposal(proposal_id)
     if proposal is None or proposal.status != "approved":
         raise ValueError("only approved consolidation proposals can be applied")
     if proposal.kind != "memory_consolidation":
         raise ValueError("proposal is not a memory consolidation")
     payload = proposal.proposed_payload
+    if "fact" in payload:
+        # sessfact: el gate ya pasó (proposal approved); materializar en el
+        # user model con decided_by para provenance.
+        from ipa.agent.user_model import UserModelStore
+        um = user_model_store if user_model_store is not None else UserModelStore()
+        try:
+            fact = str(payload["fact"]).strip()
+            existing = {f["fact"] for f in um.list_facts(status="active", limit=200)}
+            if fact in existing:
+                return {"proposal_id": proposal.proposal_id, "topic_id": proposal.topic_id,
+                        "fact": fact, "deduplicated": True}
+            fact_id = um.add_fact(
+                fact, source=str(payload.get("origin", "session_consolidation")))
+            um.decide_fact(
+                fact_id, approved=True,
+                decided_by=proposal.decided_by or "human")
+        finally:
+            if user_model_store is None:
+                um.close()
+        return {"proposal_id": proposal.proposal_id, "topic_id": proposal.topic_id,
+                "fact": fact, "fact_id": fact_id, "originals_preserved": True}
     store._conn.execute(
         "INSERT OR REPLACE INTO memory_consolidations VALUES (?, ?, ?, ?, ?)",
         (proposal.proposal_id, proposal.topic_id, payload["consolidated_summary"],

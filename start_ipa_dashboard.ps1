@@ -85,12 +85,18 @@ if ($existing) {
 
 # Launch watchdog to keep dashboard alive (unless disabled)
 if (-not $NoWatchdog -and (Test-Path $Watchdog)) {
-    Write-Host "Iniciando watchdog (auto-restart si el dashboard cae)..." -ForegroundColor Cyan
-    Start-Process -FilePath $DashboardPython `
-        -ArgumentList @("-u", $Watchdog, "--host", "127.0.0.1", "--port", $Port, "--interval", "5") `
-        -WorkingDirectory $Root `
-        -WindowStyle Minimized
-    Write-Host "Watchdog activo." -ForegroundColor Green
+    $watchdogRunning = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*dashboard_watchdog*' }
+    if ($watchdogRunning) {
+        Write-Host "Watchdog ya está corriendo (PID $($watchdogRunning.ProcessId))." -ForegroundColor Green
+    } else {
+        Write-Host "Iniciando watchdog (auto-restart si el dashboard cae)..." -ForegroundColor Cyan
+        Start-Process -FilePath $DashboardPython `
+            -ArgumentList @("-u", $Watchdog, "--host", "127.0.0.1", "--port", $Port, "--interval", "5") `
+            -WorkingDirectory $Root `
+            -WindowStyle Minimized
+        Write-Host "Watchdog activo." -ForegroundColor Green
+    }
 }
 
 if ($StartOrchestrator) {
