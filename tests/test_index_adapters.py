@@ -147,6 +147,135 @@ class TestLanceDBIndex:
                 idx.add_chunks(sample_chunks, sample_vectors[:2])
             idx.close()
 
+    def test_metadata_columns_and_where(self, sample_chunks, sample_vectors):
+        """doc_meta writes scalar columns usable as search pre-filters."""
+        with tempfile.TemporaryDirectory() as td:
+            idx = LanceDBIndex(os.path.join(td, "lance"), vector_dim=1024)
+            meta = {
+                "d1": {"source_domain": "example.com", "published_at": "2026-01-01",
+                       "provenance": "main", "quality_score": 0.9},
+                "d2": {"source_domain": "other.net", "published_at": "2025-01-01",
+                       "provenance": "agent_research", "quality_score": 0.4},
+            }
+            idx.add_chunks(sample_chunks, sample_vectors, doc_meta=meta)
+            assert idx._has_metadata_columns()
+            hits = idx.search(sample_vectors[0], limit=10,
+                              where="provenance = 'agent_research'")
+            assert {h.chunk_id for h in hits} == {"c3"}
+            hits = idx.search(sample_vectors[0], limit=10,
+                              where="quality_score >= 0.5")
+            assert {h.chunk_id for h in hits} == {"c1", "c2"}
+            idx.close()
+
+    def test_sparse_candidate_filter(self, sample_chunks, sample_vectors):
+        """candidate_ids must bound the sparse scan (regression: undefined
+        id_list fell back to a full-table scan and returned out-of-set hits)."""
+        with tempfile.TemporaryDirectory() as td:
+            idx = LanceDBIndex(os.path.join(td, "lance"), vector_dim=1024)
+            sparse = [{"1": 1.0}, {"2": 1.0}, {"1": 5.0}]
+            idx.add_chunks(sample_chunks, sample_vectors, sparse_weights=sparse)
+            hits = idx.search_sparse({"1": 1.0}, limit=10, candidate_ids=["c1"])
+            assert {h.chunk_id for h in hits} == {"c1"}
+            idx.close()
+
+    def test_sync_doc_metadata(self, sample_chunks, sample_vectors):
+        """sync_doc_metadata backfills scalar columns from the canonical store."""
+        class _StubStore:
+            def all_sources(self):
+                return {"d1": {"source_domain": "example.com",
+                               "provenance": "main", "quality_score": 0.7}}
+            def all_document_stored_at(self):
+                return {"d1": "2026-03-01", "d2": "2026-03-02"}
+
+        with tempfile.TemporaryDirectory() as td:
+            idx = LanceDBIndex(os.path.join(td, "lance"), vector_dim=1024)
+            idx.add_chunks(sample_chunks, sample_vectors)
+            n = idx.sync_doc_metadata(_StubStore(), only_missing=False)
+            assert n == 2
+            hits = idx.search(sample_vectors[0], limit=10,
+                              where="source_domain = 'example.com'")
+            assert {h.chunk_id for h in hits} == {"c1", "c2"}
+            idx.close()
+
+
+    def test_legacy_table_schema_evolution(self, sample_chunks, sample_vectors):
+        """Tables that predate the metadata columns get them via add_columns
+        on first add_chunks/sync — the where filter only activates once the
+        columns exist and are populated."""
+        import lancedb as _ldb
+        import pyarrow as _pa
+
+        class _StubStore:
+            def all_sources(self):
+                return {"d1": {"source_domain": "example.com",
+                               "provenance": "main", "quality_score": 0.7}}
+            def all_document_stored_at(self):
+                return {"d1": "2026-03-01", "d2": "2026-03-02"}
+
+        with tempfile.TemporaryDirectory() as td:
+            # Create a table with the pre-metadata schema directly.
+            old_schema = _pa.schema([
+                _pa.field("chunk_id", _pa.string()),
+                _pa.field("document_id", _pa.string()),
+                _pa.field("content_hash", _pa.string()),
+                _pa.field("text", _pa.string()),
+                _pa.field("vector", _pa.list_(_pa.float32(), 1024)),
+                _pa.field("span_json", _pa.string()),
+                _pa.field("sparse_json", _pa.string()),
+            ])
+            rows = [{
+                "chunk_id": c.chunk_id, "document_id": c.document_id,
+                "content_hash": c.content_hash, "text": c.text,
+                "vector": v, "span_json": "{}", "sparse_json": "",
+            } for c, v in zip(sample_chunks, sample_vectors)]
+            db = _ldb.connect(os.path.join(td, "lance"))
+            db.create_table("chunks", rows, schema=old_schema, mode="overwrite")
+
+            idx = LanceDBIndex(os.path.join(td, "lance"), vector_dim=1024)
+            assert not idx._has_metadata_columns()
+            # where is ignored on the legacy schema (no silent empty results)
+            hits = idx.search(sample_vectors[0], limit=10,
+                              where="provenance = 'agent_research'")
+            assert len(hits) == 3
+            n = idx.sync_doc_metadata(_StubStore(), only_missing=False)
+            assert n == 2
+            assert idx._has_metadata_columns()
+            hits = idx.search(sample_vectors[0], limit=10,
+                              where="source_domain = 'example.com'")
+            assert {h.chunk_id for h in hits} == {"c1", "c2"}
+            idx.close()
+
+
+def test_maybe_rerank_passthrough_when_disabled(monkeypatch):
+    """IPA_RERANK=0 (opt-out) → items pass through truncated to top_k, order kept."""
+    monkeypatch.setenv("IPA_RERANK", "0")
+    from ipa.indexes.reranker_adapter import maybe_rerank
+    items = [{"text": "a", "score": 0.5}, {"text": "b", "score": 0.9}]
+    out = maybe_rerank("q", items, 1)
+    assert out == items[:1]
+
+
+def test_rerank_device_gate_uses_physical_vram(monkeypatch):
+    """El gate usa la VRAM física (nvidia-smi): mem_get_info sobreestima en
+    Windows/WDDM (cuenta memoria compartida) y mandaría el reranker a GPU
+    con el LLM cargado ocupando casi toda la VRAM."""
+    import torch
+    from ipa.indexes import reranker_adapter as ra
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info",
+        lambda: (5_000 * 1024 * 1024, 6_140 * 1024 * 1024))
+    # nvidia-smi: el LLM ocupa casi todo → CPU aunque mem_get_info diga que hay lugar.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: 1_655.0)
+    assert ra.RerankerAdapter()._resolve_device() == "cpu"
+    # VRAM física de sobra → CUDA.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: 5_000.0)
+    assert ra.RerankerAdapter()._resolve_device() == "cuda"
+    # Sin nvidia-smi → fallback a mem_get_info.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: None)
+    assert ra.RerankerAdapter()._resolve_device() == "cuda"
+
 
 # ---------- SQLiteVecIndex ----------
 

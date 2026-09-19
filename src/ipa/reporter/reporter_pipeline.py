@@ -78,7 +78,8 @@ class ReporterPipeline:
                 try:
                     import lancedb as _ldb
                     ldb = _ldb.connect(str(lance_path))
-                    tables = ldb.table_names() if hasattr(ldb, "table_names") else []
+                    _resp = ldb.list_tables() if hasattr(ldb, "list_tables") else ldb.table_names()
+                    tables = list(_resp.tables if hasattr(_resp, "tables") else _resp)
                     lance_count = ldb.open_table("chunks").count_rows() if "chunks" in tables else 0
                 except Exception:
                     lance_count = 0
@@ -157,7 +158,8 @@ class ReporterPipeline:
                     import lancedb as _ldb
                     import pyarrow as pa
                     main_lance = _ldb.connect(str(self.main_corpus / "vector" / "lancedb"))
-                    main_tables = main_lance.table_names() if hasattr(main_lance, "table_names") else []
+                    _resp = main_lance.list_tables() if hasattr(main_lance, "list_tables") else main_lance.table_names()
+                    main_tables = list(_resp.tables if hasattr(_resp, "tables") else _resp)
                     if "chunks" in main_tables:
                         main_tbl = main_lance.open_table("chunks")
                         main_arrow = main_tbl.to_arrow()

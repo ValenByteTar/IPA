@@ -885,6 +885,7 @@ function deepDive(categoryId){
   if(nav)nav.classList.add('active');
   const panel=$('#panel-agent');
   if(panel)panel.classList.add('active');
+  mountChatIn('agent');
   loadAgentPanel();
   const input=$('#agent-chat-input');
   if(input){input.value=defaultQ;input.focus()}
@@ -979,18 +980,46 @@ document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.nav-item,.panel').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
   $('#panel-'+b.dataset.panel).classList.add('active');
+  mountChatIn(b.dataset.panel);
   if(b.dataset.panel==='approvals')loadApprovals();
   if(b.dataset.panel==='agent')loadAgentPanel();
   if(b.dataset.panel==='knowledge')loadKnowledge();
+  if(b.dataset.panel==='roadmaps')loadRoadmapsPanel();
 });
+
+// ── Chat omnipresente: UN solo nodo DOM reubicado entre paneles ──────────
+// Mismo historial, mismo stream, misma sesión — nunca clonar (drift). La
+// pestaña Roadmaps lo monta bajo las secciones con rol tutor forzado; al
+// salir, el chat vuelve al panel Agente y el rol previo se restaura.
+let roleBeforeRoadmaps=null;
+function mountChatIn(panel){
+  const chat=document.querySelector('.chat-container');
+  if(!chat)return;
+  const roleRow=$('#chat-role');
+  if(panel==='roadmaps'){
+    const slot=$('#roadmaps-chat-slot');
+    if(slot&&chat.parentElement!==slot)slot.appendChild(chat);
+    roleBeforeRoadmaps=chatRole;
+    setChatRole('tutor');
+    if(roleRow)roleRow.style.display='none';
+  }else{
+    const layout=document.querySelector('#panel-agent .agent-layout');
+    if(layout&&chat.parentElement!==layout)layout.appendChild(chat);
+    if(roleRow)roleRow.style.display='';
+    if(roleBeforeRoadmaps){setChatRole(roleBeforeRoadmaps);roleBeforeRoadmaps=null}
+  }
+}
 
 // ── Agent panel: chat + sesiones ─────────────────────────────────────────
 let agentSessionId=null;
-let chatRole='general';
+let chatRole=localStorage.getItem('ipa_chatRole')||'general';
 let ddContext=null;
 function setChatRole(role){
   chatRole=role;
+  localStorage.setItem('ipa_chatRole',role);
   document.querySelectorAll('#chat-role .role-btn').forEach(b=>b.classList.toggle('active',b.dataset.role===role));
+  // El pin de roadmap solo se muestra en modo Tutor.
+  loadTutorFocus();
 }
 
 async function loadAgentPanel(){
@@ -1000,46 +1029,137 @@ async function loadAgentPanel(){
     if(!agentSessionId&&d.sessions.length){openAgentSession(d.sessions[0].session_id)}
     else if(!agentSessionId)renderChatEmpty();
   }catch(e){$('#chat-messages').innerHTML=`<div class="notice">${esc(e.message)}</div>`}
-  loadTutorRoadmaps();
+  loadTutorFocus();
 }
 
-// ── Roadmap Tutor: stepper visual por unidad ─────────────────────────────
-async function loadTutorRoadmaps(){
-  const el=$('#tutor-roadmaps');
-  if(!el)return;
+// ── Pestaña Roadmaps: proyectos del Tutor (vista del dominio, chat compartido) ──
+// La pestaña es un read-model sobre TutorStore: objetivo (LearningGoal),
+// porqué (rationale del contrato), avance (unit_progress) y el MISMO chat
+// reubicado — ningún estado nuevo vive en el frontend.
+let selectedRoadmapId=null;
+
+async function loadRoadmapsPanel(){
+  const list=$('#roadmap-projects-list');
   try{
-    const d=await api('/api/tutor/roadmaps');
-    renderTutorRoadmaps(d.roadmaps||[]);
-  }catch(e){el.innerHTML=`<div class="muted" style="font-size:12px">${esc(e.message)}</div>`}
+    const d=await api('/api/tutor/projects');
+    renderRoadmapProjects(d.projects||[]);
+    let focusId=null;
+    try{
+      const f=await api('/api/tutor/focus?session_id='+encodeURIComponent(agentSessionId||''));
+      focusId=f&&f.focus?f.focus.roadmap_id:null;
+    }catch{}
+    if(focusId&&focusId!==selectedRoadmapId){selectRoadmap(focusId,{focus:false});return}
+    if(!selectedRoadmapId){
+      const first=(d.projects||[]).flatMap(p=>p.roadmaps)[0];
+      if(first){selectRoadmap(first.roadmap_id,{focus:false});return}
+    }
+    if(selectedRoadmapId)loadRoadmapContext(selectedRoadmapId);
+  }catch(e){if(list)list.innerHTML=`<div class="muted" style="font-size:12px">${esc(e.message)}</div>`}
 }
 
-function renderTutorRoadmaps(roadmaps){
-  const el=$('#tutor-roadmaps');
-  if(!roadmaps.length){el.innerHTML='<div class="muted" style="font-size:12px;padding:6px 0">Sin roadmaps todavía. Activá el rol Tutor y pedí aprender un tema.</div>';return}
-  el.innerHTML=roadmaps.map(r=>{
-    const steps=r.units.map(u=>{
-      const mark=u.status==='done'?'✓':u.status==='current'?'▶':String(u.order);
-      return `<div class="rm-step ${esc(u.status)}" title="${esc(u.reason)}">
-        <span class="rm-num">${mark}</span>
-        <div class="rm-body">
-          <div class="rm-title">${esc(u.title)}</div>
-          <div class="rm-meta">${u.minutes} min · ${esc((u.assessment_types||[]).join(', '))}</div>
-        </div>
-      </div>`;
-    }).join('');
-    const m=r.mastery
-      ?`<div class="rm-mastery">mastery ${esc(r.mastery.status)}${r.mastery.score!=null?' · '+(r.mastery.score*100).toFixed(0)+'%':''} · ${r.mastery.attempts} intentos · ${r.mastery.evidence_count} evidencias</div>`
-      :'';
-    return `<div class="rm-card" onclick="goToTutorChat()" title="Ir al chat del tutor">
-      <div class="rm-head"><span class="rm-topic">${esc(r.topic)}</span>
-        <span class="rm-head-actions">
-          <span class="rm-status ${esc(r.status)}">${esc(r.status)}</span>
-          <button class="icon-btn tiny" title="Archivar roadmap" onclick="event.stopPropagation();archiveTutorRoadmap('${esc(r.roadmap_id)}')">📦</button>
-        </span>
+function renderRoadmapProjects(projects){
+  const el=$('#roadmap-projects-list');
+  if(!el)return;
+  const items=projects.flatMap(p=>(p.roadmaps||[]).map(r=>({r,g:p.goal})));
+  if(!items.length){el.innerHTML='<div class="muted" style="font-size:12px;padding:6px 0">Sin proyectos todavía. Pedile al Tutor aprender un tema en el chat.</div>';return}
+  el.innerHTML=items.map(({r,g})=>{
+    const badge=({active:'▶',approved:'✓',completed:'✓',proposed:'…',rejected:'✗',superseded:'↺'})[r.status]||'•';
+    return `<div class="rmp-item${r.roadmap_id===selectedRoadmapId?' sel':''}" data-rid="${esc(r.roadmap_id)}" onclick="selectRoadmap('${esc(r.roadmap_id)}')" title="${esc(r.status)} · ${r.n_units} unidades">
+      <span class="rmp-item-badge ${esc(r.status)}">${badge}</span>
+      <div class="rmp-item-body">
+        <div class="rmp-item-title">${esc(g.title||'Proyecto')}</div>
+        <div class="rmp-item-meta">v${r.version} · ${esc(r.status)}</div>
       </div>
-      ${steps}${m}
     </div>`;
   }).join('');
+}
+
+function selectRoadmap(roadmapId,{focus=true}={}){
+  selectedRoadmapId=roadmapId;
+  document.querySelectorAll('#roadmap-projects-list .rmp-item').forEach(el=>
+    el.classList.toggle('sel',el.dataset.rid===roadmapId));
+  loadRoadmapContext(roadmapId);
+  // Seleccionar el proyecto ES enfocar la sesión — el chat compartido sigue
+  // ese roadmap (no se abre un hilo nuevo).
+  if(focus)focusTutorRoadmap(roadmapId);
+}
+
+async function loadRoadmapContext(roadmapId){
+  try{
+    const ctx=await api('/api/tutor/roadmap/context?roadmap_id='+encodeURIComponent(roadmapId));
+    if(!ctx.ok)throw new Error(ctx.error||'sin contexto');
+    $('#roadmap-empty').style.display='none';
+    $('#roadmap-content').style.display='';
+    renderRoadmapContext(ctx);
+  }catch(e){toast(e.message)}
+}
+
+function renderRoadmapContext(ctx){
+  const g=ctx.goal||{};
+  $('#rmp-goal-title').textContent=g.title||ctx.goal_id;
+  $('#rmp-goal-sub').textContent=`${ctx.status} · versión ${ctx.version}`;
+  $('#rmp-goal-description').textContent=g.description||'—';
+  $('#rmp-success-criteria').innerHTML=(g.success_criteria||[]).map(c=>`<li>${esc(c)}</li>`).join('')||'<li class="muted">Sin criterios definidos</li>';
+  const cons=g.constraints||[];
+  $('#rmp-constraints-wrap').style.display=cons.length?'':'none';
+  $('#rmp-constraints').innerHTML=cons.map(c=>`<li>${esc(c)}</li>`).join('');
+  $('#rmp-focus-tag').style.display=ctx.is_focus?'':'none';
+  const uiStatus=({approved:'accepted',active:'accepted',completed:'accepted',rejected:'rejected'})[ctx.status]||'proposed';
+  const sel=$('#rmp-status-select');
+  sel.className='rm-status '+uiStatus;
+  sel.innerHTML=['proposed','accepted','rejected'].map(s=>`<option value="${s}"${s===uiStatus?' selected':''}>${s}</option>`).join('');
+  sel.onchange=()=>decideRoadmapStatus(ctx.roadmap_id,sel.value);
+  $('#rmp-archive-btn').onclick=()=>archiveTutorRoadmap(ctx.roadmap_id);
+  // Por qué: racionalidad del contrato (antes invisible en la UI).
+  const rat=ctx.rationale||{};
+  $('#rmp-change-reason').style.display=rat.change_reason?'':'none';
+  if(rat.change_reason)$('#rmp-change-reason').textContent='Motivo del cambio: '+rat.change_reason;
+  const lis=a=>(a||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+  $('#rmp-assumptions').innerHTML=lis(rat.assumptions)||'<li class="muted">Sin asunciones registradas</li>';
+  $('#rmp-uncertainties').innerHTML=lis(rat.uncertainties)||'<li class="muted">Sin dudas abiertas</li>';
+  // Avance: re-render de unit_progress (la barra + el stepper canónico).
+  const p=ctx.progress||{done:0,current:null,total:(ctx.units||[]).length};
+  const pct=p.total?Math.round(100*p.done/p.total):0;
+  $('#rmp-progress-fill').style.width=pct+'%';
+  $('#rmp-progress-label').textContent=`${p.done}/${p.total} unidades · ${pct}%${p.current?` · en unidad ${p.current}`:''}`;
+  $('#rmp-units').innerHTML=(ctx.units||[]).map(u=>{
+    const mark=u.status==='done'?'✓':u.status==='current'?'▶':String(u.order);
+    const t=u.concept&&u.concept.title||'Material del corpus';
+    return `<li class="rm-step ${esc(u.status)}">
+      <span class="rm-num">${mark}</span>
+      <div class="rm-body"><div class="rm-title">${esc(t)}</div>
+      <div class="rm-meta">${u.minutes} min · ${esc((u.assessment_types||[]).join(', '))} — ${esc(u.reason||'')}</div></div>
+    </li>`;
+  }).join('');
+  $('#rmp-mastery').textContent=ctx.mastery?`mastery ${ctx.mastery.status}${ctx.mastery.score!=null?' · '+(ctx.mastery.score*100).toFixed(0)+'%':''} · ${ctx.mastery.attempts} intentos`:'';
+  // Conceptos: material fuente re-derivado del DocumentStore (colapsable).
+  $('#rmp-concepts').innerHTML=(ctx.units||[]).map(u=>{
+    const c=u.concept||{};
+    const link=c.source_url?` <a href="${esc(c.source_url)}" target="_blank" rel="noopener">fuente ↗</a>`:'';
+    return `<div class="rmp-concept">
+      <div class="rmp-concept-head"><strong>U${u.order} · ${esc(c.title||'Material')}</strong>${link}</div>
+      <div class="rmp-concept-excerpt">${esc(c.excerpt||'')}</div>
+    </div>`;
+  }).join('');
+}
+
+function refreshTutorSurfaces(){
+  // Chip del chat + pestaña Roadmaps si está abierta (la pestaña reemplazó
+  // al stepper del aside — una sola vista detallada del avance).
+  loadTutorFocus();
+  if($('#panel-roadmaps')&&$('#panel-roadmaps').classList.contains('active'))loadRoadmapsPanel();
+}
+
+async function decideRoadmapStatus(roadmapId,uiStatus){
+  const decision={proposed:'proposed',accepted:'approve',rejected:'reject'}[uiStatus];
+  if(!decision)return;
+  try{
+    const r=await api('/api/tutor/roadmap/decision',{method:'POST',body:JSON.stringify({
+      roadmap_id:roadmapId,decision,session_id:agentSessionId||''})});
+    if(!r.ok)throw new Error(r.error||'decision failed');
+    toast(`Roadmap → ${uiStatus}`);
+  }catch(e){toast(e.message)}
+  refreshTutorSurfaces();
 }
 
 async function archiveTutorRoadmap(roadmapId){
@@ -1047,21 +1167,46 @@ async function archiveTutorRoadmap(roadmapId){
   try{
     await api('/api/tutor/roadmap/archive',{method:'POST',body:JSON.stringify({roadmap_id:roadmapId,archived:true})});
     toast('Roadmap archivado');
-    loadTutorRoadmaps();
+    if(selectedRoadmapId===roadmapId)selectedRoadmapId=null;
+    refreshTutorSurfaces();
   }catch(e){toast(e.message)}
 }
 
-// Click en la card del roadmap → panel Agente, rol Tutor, input listo.
-function goToTutorChat(){
-  document.querySelectorAll('.nav-item,.panel').forEach(x=>x.classList.remove('active'));
-  const nav=document.querySelector('.nav-item[data-panel="agent"]');
-  if(nav)nav.classList.add('active');
-  const panel=$('#panel-agent');
-  if(panel)panel.classList.add('active');
-  setChatRole('tutor');
-  loadAgentPanel();
-  const input=$('#agent-chat-input');
-  if(input){input.focus();input.placeholder='Seguimos con el roadmap…'}
+// ── Foco de roadmap: el agente sabe sobre qué roadmap trabajamos ─────────
+async function focusTutorRoadmap(roadmapId){
+  try{
+    const r=await api('/api/tutor/roadmap/focus',{method:'POST',body:JSON.stringify({
+      roadmap_id:roadmapId,session_id:agentSessionId||''})});
+    if(!r.ok)throw new Error(r.error||'focus failed');
+    renderTutorFocusChip(r.focus);
+  }catch(e){/* no bloquea la navegación */}
+}
+async function loadTutorFocus(){
+  const chip=$('#tutor-focus-chip');
+  if(!chip)return;
+  try{
+    const d=await api('/api/tutor/focus?session_id='+encodeURIComponent(agentSessionId||''));
+    renderTutorFocusChip(d.focus);
+  }catch{/* sin foco → chip oculto */}
+}
+function renderTutorFocusChip(focus){
+  const el=$('#tutor-focus-chip');
+  if(!el)return;
+  // El pin solo tiene sentido en modo Tutor: en General se oculta siempre.
+  if(chatRole!=='tutor'||!focus||!focus.roadmap_id){el.style.display='none';return}
+  el.innerHTML=`📍 <strong>${esc(focus.topic||'roadmap')}</strong>${focus.unit_current?` · unidad ${focus.unit_current}/${focus.unit_total}`:''}${focus.units_done?` · ${focus.units_done} completadas`:''}`+
+    `<button class="chip-close" title="Quitar el pin de este roadmap" onclick="unpinTutorFocus('${esc(focus.roadmap_id)}')">×</button>`;
+  el.style.display='flex';
+}
+
+async function unpinTutorFocus(roadmapId){
+  try{
+    const r=await api('/api/tutor/roadmap/unfocus',{method:'POST',body:JSON.stringify({
+      roadmap_id:roadmapId,session_id:agentSessionId||''})});
+    if(!r.ok)throw new Error(r.error||'unfocus failed');
+    renderTutorFocusChip(r.focus);
+    refreshTutorSurfaces();
+  }catch(e){toast(e.message)}
 }
 
 async function newAgentSession(){
@@ -1128,8 +1273,11 @@ function renderEpisode(e){
 // nunca re-renderiza lo que ya está (evita duplicar mensajes locales).
 setInterval(async()=>{
   if(!agentSessionId)return;
-  const panel=$('#panel-agent');
-  if(!panel||!panel.classList.contains('active'))return;
+  // El chat es omnipresente: el polling sigue al nodo, no al panel —
+  // en la pestaña Roadmaps los episodios nuevos también llegan.
+  const chat=document.querySelector('.chat-container');
+  const host=chat?chat.closest('.panel'):null;
+  if(!host||!host.classList.contains('active'))return;
   try{
     const d=await api('/api/agent/session?session_id='+encodeURIComponent(agentSessionId));
     const msgs=$('#chat-messages');
@@ -1158,7 +1306,7 @@ setInterval(async()=>{
     }
     scrollChatToBottom();
     const isProactive=fresh.some(e=>e.turn_role==='assistant');
-    if(isProactive&&(document.hidden||!$('#panel-agent').classList.contains('active'))){
+    if(isProactive&&(document.hidden||!host.classList.contains('active'))){
       toast('💬 Tu agente tiene novedades');
     }
   }catch{}
@@ -1223,12 +1371,61 @@ function sendAgentText(text){
   input.value=text;
   sendAgentMessage({preventDefault(){}});
 }
+// ── Quote-reply: seleccionar texto del chat lo cita en el input ─────────
+// Seleccionar dentro de #chat-messages muestra un botón flotante "Citar";
+// al usarlo, el texto se inserta como cita (> ...) en #agent-chat-input y
+// el usuario escribe su respuesta debajo — el agente la recibe como parte
+// del prompt.
+let _quoteBtn=null;
+function _hideQuoteBtn(){if(_quoteBtn){_quoteBtn.remove();_quoteBtn=null}}
+window.addEventListener('scroll',_hideQuoteBtn,true);
+document.addEventListener('selectionchange',()=>{
+  clearTimeout(window.__quoteT);
+  window.__quoteT=setTimeout(()=>{
+    const sel=window.getSelection();
+    const box=$('#chat-messages');
+    const txt=(sel?sel.toString():'').trim();
+    const inChat=sel&&!sel.isCollapsed&&txt&&box
+      &&box.contains(sel.anchorNode)&&box.contains(sel.focusNode);
+    if(!inChat){
+      _hideQuoteBtn();
+      return;
+    }
+    if(!_quoteBtn){
+      _quoteBtn=document.createElement('button');
+      _quoteBtn.className='quote-btn';
+      _quoteBtn.textContent='💬 Citar';
+      _quoteBtn.onmousedown=e=>e.preventDefault(); // no perder la selección
+      _quoteBtn.onclick=quoteSelection;
+      document.body.appendChild(_quoteBtn);
+    }
+    const r=sel.getRangeAt(0).getBoundingClientRect();
+    _quoteBtn.style.left=Math.max(8,Math.min(r.left+r.width/2-34,window.innerWidth-90))+'px';
+    _quoteBtn.style.top=Math.max(8,r.top-36)+'px';
+  },10);
+});
+function quoteSelection(){
+  const sel=window.getSelection();
+  let txt=sel?sel.toString().replace(/\s+/g,' ').trim():'';
+  if(!txt)return;
+  if(txt.length>400)txt=txt.slice(0,397)+'…';
+  const input=$('#agent-chat-input');
+  if(input){
+    // El input es type=text (sin saltos): marcador explícito en una línea —
+    // el agente lo lee como material citado, no como palabras del alumno.
+    input.value='[respondiendo a: «'+txt+'»] '+(input.value||'');
+    input.focus();
+    input.setSelectionRange(input.value.length,input.value.length);
+  }
+  _hideQuoteBtn();
+  if(sel)sel.removeAllRanges();
+}
 // Gate del tutor: card con Aprobar / Rechazar / Debatir. Se re-monta desde
 // /api/agent/approvals después de cada re-render (los gates no son episodios
 // y el re-render canónico los borra).
 function tutorGateCard(kind,id,heading,subHtml){
   return `<div class="tutor-gate" id="gate-${esc(id)}" data-gate-kind="${esc(kind)}">
-    <div style="width:100%;font-size:12px;color:var(--muted)">${kind==='roadmap'?esc(heading||'Roadmap propuesto'):'Investigación propuesta'}${sub||''}</div>
+    <div style="width:100%;font-size:12px;color:var(--muted)">${kind==='roadmap'?esc(heading||'Roadmap propuesto'):'Investigación propuesta'}${subHtml||''}</div>
     <button class="approve" onclick="tutorDecide('${kind}','${esc(id)}','approve')">Aprobar</button>
     <button class="reject" onclick="tutorDecide('${kind}','${esc(id)}','reject')">Rechazar</button>
     ${kind==='roadmap'?`<button class="ghost small" onclick="tutorDebate('${esc(id)}')">Debatir</button>`:''}
@@ -1280,7 +1477,10 @@ async function tutorDecide(kind,id,decision){
     const d=await api(url,{method:'POST',body:JSON.stringify(body)});
     if(!d.ok){toast(d.error||'Error en la decisión');if(gate)gate.querySelectorAll('button').forEach(b=>b.disabled=false);return}
     if(gate){
-      const status=d.status==='approved'?'<span style="color:var(--accent)">Aprobado</span>':'<span style="color:var(--danger)">Rechazado</span>';
+      // decide_roadmap devuelve 'active' al aprobar (el roadmap se activa),
+      // no 'approved' — ambos cuentan como decisión afirmativa.
+      const _ok=d.status==='approved'||d.status==='active';
+      const status=_ok?'<span style="color:var(--accent)">Aprobado</span>':'<span style="color:var(--danger)">Rechazado</span>';
       gate.innerHTML=`<div style="font-size:12px">${status}</div>`;
     }
     if(kind==='research'&&d.status==='approved'){
@@ -1288,7 +1488,7 @@ async function tutorDecide(kind,id,decision){
       if(ind){ind.style.display='flex';$('#research-indicator-text').textContent='Investigación del tutor en curso…'}
     }
     loadApprovals&&loadApprovals();
-    loadTutorRoadmaps();
+    refreshTutorSurfaces();
   }catch(e){
     toast(e.message);
     if(gate)gate.querySelectorAll('button').forEach(b=>b.disabled=false);
@@ -1310,6 +1510,13 @@ async function sendAgentMessage(event){
   }
   // Remover bubbles "streaming" huérfanos del turno anterior
   document.querySelectorAll('.chat-msg.assistant.streaming').forEach(el=>el.remove());
+  // Limpiar placeholders ("Nueva conversación lista", "Escribí un mensaje…")
+  // en el primer Enter: todo hijo que no sea un mensaje real ni un gate del
+  // tutor (texto crudo, .chat-empty, .muted) sale del contenedor.
+  const msgsBox=$('#chat-messages');
+  [...msgsBox.childNodes].forEach(n=>{
+    if(n.nodeType===3||(n.nodeType===1&&!n.classList.contains('chat-msg')&&!n.classList.contains('tutor-gate')))n.remove();
+  });
   appendChatMsg('user',message);
   // Create assistant placeholder for streaming
   const el=$('#chat-messages');
@@ -1321,7 +1528,16 @@ async function sendAgentMessage(event){
   el.scrollTop=el.scrollHeight;
 
   try{
-    const body={message,role:chatRole};
+    // Si hay un gate del tutor pendiente, la sesión está a mitad de una
+    // propuesta: el feedback/approve tipeado tiene que llegar a la state
+    // machine del tutor. Enviarlo como 'general' hace que el agente general
+    // improvise una respuesta sin tocar el roadmap (bug 2026-09-16).
+    let role=chatRole;
+    if(role!=='tutor'&&msgsBox.querySelector('.tutor-gate')){
+      role='tutor';
+      toast('Hay una propuesta del Tutor pendiente — el mensaje va al Tutor');
+    }
+    const body={message,role};
     if(agentSessionId)body.session_id=agentSessionId;
     if(ddContext){
       body.context='deep_dive';
@@ -1349,6 +1565,7 @@ async function sendAgentMessage(event){
     let fullReply='';
     let lastSources=[];
     const pendingTutorGates=[];
+    let doneReceived=false;
     while(true){
       const {done,value}=await reader.read();
       if(done)break;
@@ -1359,7 +1576,7 @@ async function sendAgentMessage(event){
         if(!line.startsWith('data: '))continue;
         try{
           const data=JSON.parse(line.slice(6));
-          if(data.type==='session'){agentSessionId=data.session_id}
+          if(data.type==='session'){agentSessionId=data.session_id;loadTutorFocus()}
           else if(data.type==='token'){fullReply+=data.text;contentEl.textContent=fullReply;el.scrollTop=el.scrollHeight}
           else if(data.type==='retrieval'){
             const stageLabels={
@@ -1408,34 +1625,39 @@ async function sendAgentMessage(event){
           }
           else if(data.type==='error'){contentEl.textContent='[error] '+(data.error||'unknown');assistantDiv.classList.remove('streaming')}
           else if(data.type==='done'){
-            if(data.follow_up){
-              contentEl.innerHTML=renderMarkdown(data.follow_up);
-            }else{
-              fullReply=data.reply||fullReply;
-              contentEl.innerHTML=renderMarkdown(fullReply);
-            }
-            if(lastSources.length){
-              const items=lastSources.map(s=>{
-                const label=s.source_domain||s.document_id||'?';
-                const inner=s.source_url
-                  ?`<a href="${esc(s.source_url)}" target="_blank" rel="noopener">[${s.n}] ${esc(label)}</a>`
-                  :`[${s.n}] ${esc(label)}`;
-                return `<div class="source-item">${inner}</div>`;
-              }).join('');
-              contentEl.innerHTML+=`<div class="sources-block"><div class="sources-title">Fuentes</div>${items}</div>`;
-            }
-            if(pendingTutorGates.length){
-              const gates=pendingTutorGates.map(g=>{
-                const list=g.items?`<ul style="margin:6px 0 0 18px;font-size:12px;color:var(--muted)">${g.items.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>`:'';
-                const sub=g.query?`<div class="muted" style="font-size:12px;margin-top:4px">${esc(g.query)}</div>`:'';
-                return tutorGateCard(g.kind,g.id,g.title,sub+list);
-              }).join('');
-              contentEl.innerHTML+=gates;
-            }
+            try{
+              if(data.follow_up){
+                contentEl.innerHTML=renderMarkdown(data.follow_up);
+              }else{
+                fullReply=data.reply||fullReply;
+                contentEl.innerHTML=renderMarkdown(fullReply);
+              }
+              if(lastSources.length){
+                const items=lastSources.map(s=>{
+                  const label=s.source_domain||s.document_id||'?';
+                  const inner=s.source_url
+                    ?`<a href="${esc(s.source_url)}" target="_blank" rel="noopener">[${s.n}] ${esc(label)}</a>`
+                    :`[${s.n}] ${esc(label)}`;
+                  return `<div class="source-item">${inner}</div>`;
+                }).join('');
+                contentEl.innerHTML+=`<div class="sources-block"><div class="sources-title">Fuentes</div>${items}</div>`;
+              }
+              if(pendingTutorGates.length){
+                const gates=pendingTutorGates.map(g=>{
+                  const list=g.items?`<ul style="margin:6px 0 0 18px;font-size:12px;color:var(--muted)">${g.items.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>`:'';
+                  const sub=g.query?`<div class="muted" style="font-size:12px;margin-top:4px">${esc(g.query)}</div>`:'';
+                  return tutorGateCard(g.kind,g.id,g.title,sub+list);
+                }).join('');
+                contentEl.innerHTML+=gates;
+              }
+            }catch(re){console.error('done render:',re)}
             assistantDiv.classList.remove('streaming');
+            if(chatRole==='tutor')loadTutorFocus();
+            doneReceived=true;
           }
-        }catch{}
+        }catch(e){console.error('sse line:',e)}
       }
+      if(doneReceived)break;
     }
     assistantDiv.classList.remove('streaming');
     // Re-render desde el servidor: la verdad canónica. Elimina duplicados
@@ -1479,6 +1701,30 @@ function appendChatMsg(role,content){
   el.scrollTop=el.scrollHeight;
 }
 
+// ── Perilla idle enrichment (sidebar): ON/OFF global de Tier 1 y Tier 2 ──
+async function loadIdleSwitch(){
+  const sw=$('#idle-switch');
+  if(!sw)return;
+  try{
+    const d=await api('/api/idle/status');
+    sw.checked=!!d.enabled;
+  }catch{/* endpoint ausente → queda el default del HTML */}
+}
+async function toggleIdleEnrichment(enabled){
+  const sw=$('#idle-switch');
+  if(sw)sw.disabled=true;
+  try{
+    const d=await api('/api/idle/toggle',{method:'POST',body:JSON.stringify({enabled})});
+    if(!d.ok)throw new Error(d.error||'error');
+    toast(enabled?'Enriquecimiento idle: ON (Tier 1 y 2)':'Enriquecimiento idle: OFF — Tier 1 y 2 apagados');
+  }catch(e){
+    toast('Error: '+e.message);
+    if(sw)sw.checked=!enabled; // revert visual
+  }finally{
+    if(sw)sw.disabled=false;
+  }
+}
+
 // ── Unified approvals queue (Fase 3) ─────────────────────────────────────
 async function loadApprovals(){
   const el=$('#approvals-queue');
@@ -1508,12 +1754,9 @@ async function loadApprovals(){
 
 async function decideApproval(kind,id,decision){
   try{
-    const endpoint={'memory_consolidation':'/api/agent/approvals/consolidation',
-                    'mastery_inference':'/api/agent/approvals/mastery',
-                    'roadmap':'/api/agent/approvals/roadmap',
-                    'research_request':'/api/agent/approvals/research'}[kind];
-    if(!endpoint){toast('Tipo de aprobación desconocido: '+kind);return}
-    await api(endpoint,{method:'POST',body:JSON.stringify({id,decision:decision,decided_by:'web-user'})});
+    // Gate unificado: el backend resuelve la propuesta por id en todos los
+    // stores (consolidation, tutor). Los endpoints por-kind no existen.
+    await api('/api/agent/approvals/decide',{method:'POST',body:JSON.stringify({id,decision,decided_by:'web-user'})});
     toast(decision==='approved'?'Aprobado':'Rechazado');
     loadApprovals();
   }catch(e){toast(e.message)}
@@ -1720,5 +1963,7 @@ document.addEventListener('contextmenu',e=>{
 document.addEventListener('click',()=>{if(ctxMenu){ctxMenu.remove();ctxMenu=null}});
 
 // Initial connection
+setChatRole(chatRole); // sync button with persisted role
 setConnectionState('connecting');
 refreshAll();
+loadIdleSwitch();

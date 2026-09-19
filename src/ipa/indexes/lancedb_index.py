@@ -29,8 +29,18 @@ from typing import Any
 
 import lancedb
 import pyarrow as pa
+from lancedb.index import FTS
 
 from ipa.contracts import DocumentChunk, SearchHit, SourceSpan
+
+
+def _db_table_names(db: Any) -> list[str]:
+    """Table names via the non-deprecated API, tolerating the response-object
+    shapes seen across LanceDB versions."""
+    if hasattr(db, "list_tables"):
+        resp = db.list_tables()
+        return resp.tables if hasattr(resp, "tables") else list(resp)
+    return list(db.table_names())
 
 
 def _span_to_dict(span: SourceSpan | None) -> dict:
@@ -77,13 +87,7 @@ class LanceDBIndex:
     def _open_existing_table(self) -> None:
         """Open an existing table if it exists in the database."""
         try:
-            # list_tables() returns a ListTablesResponse object in newer
-            # LanceDB versions; table_names() returns a plain list (deprecated).
-            if hasattr(self._db, "table_names"):
-                existing = self._db.table_names()
-            else:
-                resp = self._db.list_tables()
-                existing = resp.tables if hasattr(resp, "tables") else list(resp)
+            existing = _db_table_names(self._db)
             if self.TABLE_NAME in existing:
                 self._table = self._db.open_table(self.TABLE_NAME)
         except Exception:
@@ -93,11 +97,7 @@ class LanceDBIndex:
         """Create the table if it doesn't exist."""
         if self._table is not None:
             return
-        if hasattr(self._db, "table_names"):
-            existing_tables = self._db.table_names()
-        else:
-            resp = self._db.list_tables()
-            existing_tables = resp.tables if hasattr(resp, "tables") else list(resp)
+        existing_tables = _db_table_names(self._db)
         if self.TABLE_NAME in existing_tables:
             self._table = self._db.open_table(self.TABLE_NAME)
         else:
@@ -114,6 +114,12 @@ class LanceDBIndex:
                 # LanceDB has no native sparse index, so these are used for
                 # manual dot-product re-ranking in search_sparse().
                 pa.field("sparse_json", pa.string()),
+                # Scalar metadata for pre-filtering (where clauses). Copied
+                # from the canonical DocumentStore via doc_meta/sync_doc_metadata.
+                pa.field("source_domain", pa.string()),
+                pa.field("published_at", pa.string()),
+                pa.field("provenance", pa.string()),
+                pa.field("quality_score", pa.float64()),
             ])
             self._table = self._db.create_table(
                 self.TABLE_NAME,
@@ -126,6 +132,7 @@ class LanceDBIndex:
         chunks: list[DocumentChunk],
         vectors: list[list[float]],
         sparse_weights: list[dict] | None = None,
+        doc_meta: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Batch-insert chunks with their pre-computed embedding vectors.
 
@@ -135,6 +142,9 @@ class LanceDBIndex:
             sparse_weights: Optional BGE-M3 sparse weights (list of dicts
                 {token_id: weight}). When provided, stored in sparse_json
                 column for use in search_sparse() and 3-way hybrid search.
+            doc_meta: Optional {document_id: {source_domain, published_at,
+                provenance, quality_score}} — scalar metadata for pre-filtering.
+                Missing docs get empty defaults; sync_doc_metadata() backfills.
 
         Idempotent: deletes existing records with matching chunk_id before
         inserting to prevent duplicates on reprocessing."""
@@ -149,6 +159,7 @@ class LanceDBIndex:
                 f"sparse_weights ({len(sparse_weights)}) must match chunks ({len(chunks)})"
             )
         self._ensure_table(vectors[0])
+        meta_ok = self._ensure_metadata_columns()
         # Delete existing records with same chunk_id (idempotency on reprocess)
         chunk_ids = [c.chunk_id for c in chunks]
         if chunk_ids:
@@ -166,7 +177,7 @@ class LanceDBIndex:
                 sparse_json = json.dumps(
                     {str(k): float(v) for k, v in sparse.items()}
                 )
-            records.append({
+            rec = {
                 "chunk_id": chunk.chunk_id,
                 "document_id": chunk.document_id,
                 "content_hash": chunk.content_hash,
@@ -174,10 +185,103 @@ class LanceDBIndex:
                 "vector": vec,
                 "span_json": json.dumps(_span_to_dict(chunk.source_span)),
                 "sparse_json": sparse_json,
-            })
+            }
+            if meta_ok:
+                meta = (doc_meta or {}).get(chunk.document_id) or {}
+                rec["source_domain"] = str(meta.get("source_domain") or "")
+                rec["published_at"] = str(meta.get("published_at") or "")
+                rec["provenance"] = str(meta.get("provenance") or "")
+                rec["quality_score"] = float(meta.get("quality_score") or 0.0)
+            records.append(rec)
         self._table.add(records)
         # FTS index needs to be rebuilt after data changes
         self._fts_indexed = False
+
+    # -- scalar metadata (pre-filtering) -------------------------------------
+
+    _META_COLUMNS = ("source_domain", "published_at", "provenance", "quality_score")
+
+    def _has_metadata_columns(self) -> bool:
+        if self._table is None:
+            return False
+        try:
+            names = set(self._table.schema.names)
+        except Exception:
+            return False
+        return set(self._META_COLUMNS) <= names
+
+    def _ensure_metadata_columns(self) -> bool:
+        """Add scalar metadata columns to pre-existing tables (derived index —
+        schema evolution is safe). False → write/search paths skip metadata."""
+        if self._table is None:
+            return False
+        if self._has_metadata_columns():
+            return True
+        try:
+            self._table.add_columns({
+                "source_domain": "''",
+                "published_at": "''",
+                "provenance": "''",
+                "quality_score": "0.0",
+            })
+        except Exception:
+            return False
+        return self._has_metadata_columns()
+
+    def sync_doc_metadata(
+        self,
+        store: Any,
+        *,
+        only_missing: bool = True,
+    ) -> int:
+        """Backfill scalar metadata columns from the canonical DocumentStore.
+
+        doc sources: document_sources (source_domain/provenance/quality_score)
+        + documents.stored_at → published_at (the canonical store does not track
+        a separate publication date; stored_at is the same proxy the dashboard
+        displays).
+
+        Args:
+            store: DocumentStore bound to the same corpus.
+            only_missing: update only documents whose rows still have empty
+                metadata (cheap incremental sync after each ingestion).
+        Returns the number of documents updated.
+        """
+        if self._table is None or not self._ensure_metadata_columns():
+            return 0
+        sources = store.all_sources()
+        stored_at = store.all_document_stored_at()
+        doc_ids = set(sources) | set(stored_at)
+        if only_missing:
+            try:
+                rows = (
+                    self._table.search()
+                    .where("published_at = '' OR published_at IS NULL")
+                    .select(["document_id"])
+                    .to_list()
+                )
+                missing = {r["document_id"] for r in rows}
+                doc_ids &= missing
+            except Exception:
+                pass  # fall back to updating all known docs
+        updated = 0
+        for doc_id in doc_ids:
+            src = sources.get(doc_id) or {}
+            values = {
+                "source_domain": str(src.get("source_domain") or ""),
+                "published_at": str(stored_at.get(doc_id) or ""),
+                "provenance": str(src.get("provenance") or ""),
+                "quality_score": float(src.get("quality_score") or 0.0),
+            }
+            try:
+                self._table.update(
+                    where=f"document_id = '{doc_id.replace(chr(39), chr(39) * 2)}'",
+                    values=values,
+                )
+                updated += 1
+            except Exception:
+                pass
+        return updated
 
     def create_fts_index(self) -> None:
         """Create a full-text search index on the text column.
@@ -188,7 +292,8 @@ class LanceDBIndex:
         if self._table is None or self._fts_indexed:
             return
         try:
-            self._table.create_fts_index("text")
+            # New unified API (create_fts_index is deprecated as of 0.25).
+            self._table.create_index("text", config=FTS(), replace=True)
             self._fts_indexed = True
         except Exception as e:
             if "already exists" in str(e).lower():
@@ -220,13 +325,21 @@ class LanceDBIndex:
         self,
         query_vector: list[float],
         limit: int = 10,
+        where: str | None = None,
     ) -> list[SearchHit]:
-        """Search by vector similarity (dense only).  Returns SearchHit records."""
+        """Search by vector similarity (dense only).  Returns SearchHit records.
+
+        `where` is a LanceDB SQL pre-filter over the scalar metadata columns
+        (source_domain/published_at/provenance/quality_score) — ignored on
+        indexes that predate those columns."""
         if limit <= 0:
             raise ValueError("limit must be positive")
         if self._table is None:
             return []
-        results = self._table.search(query_vector).limit(limit).to_list()
+        q = self._table.search(query_vector)
+        if where and self._has_metadata_columns():
+            q = q.where(where)
+        results = q.limit(limit).to_list()
         hits: list[SearchHit] = []
         for r in results:
             # LanceDB returns _distance (lower = better for L2, higher = better for cosine).
@@ -246,10 +359,12 @@ class LanceDBIndex:
         self,
         query_text: str,
         limit: int = 10,
+        where: str | None = None,
     ) -> list[SearchHit]:
         """Search by full-text search (BM25 keyword matching).
 
-        Requires create_fts_index() to have been called.
+        Requires create_fts_index() to have been called. `where` pre-filters
+        on the scalar metadata columns (ignored on older indexes).
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -258,8 +373,15 @@ class LanceDBIndex:
         if not self._fts_indexed:
             self.create_fts_index()
         try:
-            results = self._table.search(query_text, query_type="fts").limit(limit).to_list()
+            q = self._table.search(query_text, query_type="fts")
+            if where and self._has_metadata_columns():
+                q = q.where(where)
+            results = q.limit(limit).to_list()
         except Exception:
+            # Some LanceDB versions reject where() on FTS queries — degrade
+            # to the unfiltered search instead of returning nothing.
+            if where:
+                return self.search_fts(query_text, limit=limit)
             return []
         hits: list[SearchHit] = []
         for r in results:
@@ -277,6 +399,7 @@ class LanceDBIndex:
         query_sparse: dict,
         limit: int = 10,
         candidate_ids: list[str] | None = None,
+        where: str | None = None,
     ) -> list[SearchHit]:
         """Search by sparse vector dot product (BGE-M3 learned lexical weights).
 
@@ -290,6 +413,7 @@ class LanceDBIndex:
             limit: max results to return.
             candidate_ids: optional list of chunk_ids to score (from dense
                 search). If None, scans all rows.
+            where: optional SQL pre-filter on the scalar metadata columns.
         """
         if limit <= 0 or self._table is None:
             return []
@@ -297,15 +421,25 @@ class LanceDBIndex:
         # Load candidate rows (to_list() returns list[dict] in current LanceDB)
         if candidate_ids:
             id_set = set(candidate_ids)
+            id_list = ", ".join(f"'{cid}'" for cid in candidate_ids)
+            clause = f"chunk_id IN ({id_list})"
+            if where and self._has_metadata_columns():
+                clause += f" AND ({where})"
             try:
-                rows = self._table.search().where(f"chunk_id IN ({id_list})").to_list()
+                rows = self._table.search().where(clause).to_list()
             except Exception:
                 rows = [
                     row for row in self._table.to_arrow().to_pylist()
                     if row.get("chunk_id") in id_set
                 ]
         else:
-            rows = self._table.to_arrow().to_pylist()
+            try:
+                q = self._table.search()
+                if where and self._has_metadata_columns():
+                    q = q.where(where)
+                rows = q.to_list()
+            except Exception:
+                rows = self._table.to_arrow().to_pylist()
 
         if not rows:
             return []
@@ -351,6 +485,7 @@ class LanceDBIndex:
         query_vector: list[float],
         limit: int = 10,
         query_sparse: dict | None = None,
+        where: str | None = None,
     ) -> list[SearchHit]:
         """Hybrid search combining dense + FTS + sparse with 3-way RRF fusion.
 
@@ -361,6 +496,8 @@ class LanceDBIndex:
           4. 3-way RRF merges all result sets by rank
 
         When query_sparse is None, falls back to 2-way RRF (dense + FTS only).
+        `where` pre-filters every leg on the scalar metadata columns
+        (ignored on indexes that predate them).
 
         RRF formula: score = sum(1 / (k + rank_i)) for each result list i
         Default k=60 (standard from the original RRF paper).
@@ -375,16 +512,20 @@ class LanceDBIndex:
             self.create_fts_index()
 
         # Get dense results (more than limit for better fusion)
-        dense_hits = self.search(query_vector, limit=limit * 3)
+        dense_hits = self.search(query_vector, limit=limit * 3, where=where)
         # Get FTS results
-        fts_hits = self.search_fts(query_text, limit=limit * 3)
+        fts_hits = self.search_fts(query_text, limit=limit * 3, where=where)
         # Get sparse results (if query_sparse provided)
         sparse_hits: list[SearchHit] = []
         if query_sparse:
-            # Use dense candidates to prune sparse search
-            dense_ids = [h.chunk_id for h in dense_hits]
+            # Sparse scoring is a manual dot product — prune the scan to the
+            # dense ∪ FTS candidate pool so lexical-only matches still get
+            # rescored by the learned sparse weights.
+            cand_ids = list(dict.fromkeys(
+                [h.chunk_id for h in dense_hits] + [h.chunk_id for h in fts_hits]
+            ))
             sparse_hits = self.search_sparse(
-                query_sparse, limit=limit * 3, candidate_ids=dense_ids
+                query_sparse, limit=limit * 3, candidate_ids=cand_ids, where=where
             )
 
         # Build rank maps

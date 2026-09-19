@@ -43,11 +43,32 @@ body.no-topbar .sidebar{top:0;height:100vh}
 .nav-icon{font-size:16px;width:22px;text-align:center}
 .nav-label{flex:1;text-align:left}
 .nav-badge{background:var(--warn);color:#0b0d12;font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;min-width:20px;text-align:center}
+/* ── Perilla idle enrichment (sidebar, fija al fondo sobre el toggle) ── */
+.idle-switch-row{display:flex;align-items:center;gap:12px;padding:9px 14px;border-radius:10px;color:var(--muted);font-size:13px;margin-top:auto}
+.idle-switch-row:hover{background:#141a26}
+.idle-switch-row .nav-label{cursor:default}
+.idle-switch-row + .sidebar-toggle{margin-top:6px}
+.switch{position:relative;display:inline-block;width:34px;height:18px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.switch .slider{position:absolute;inset:0;background:#2a3140;border-radius:99px;transition:background .15s;cursor:pointer}
+.switch .slider::before{content:"";position:absolute;width:14px;height:14px;left:2px;top:2px;background:#8b93a3;border-radius:50%;transition:all .15s}
+.switch input:checked+.slider{background:var(--accent)}
+.switch input:checked+.slider::before{transform:translateX(14px);background:#0b0d12}
+.switch input:disabled+.slider{opacity:.5;cursor:wait}
+/* ── Quote-reply: botón flotante sobre la selección del chat ── */
+.quote-btn{position:fixed;z-index:1200;background:var(--accent);color:#0b0d12;border:none;border-radius:8px;padding:5px 12px;font:inherit;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45);transition:filter .15s}
+.quote-btn:hover{filter:brightness(1.12)}
+/* Colapsado / angosto: solo la perilla (ni icono ni label). */
+.sidebar.collapsed .idle-switch-row{justify-content:center;padding:9px 0;gap:0}
+.sidebar.collapsed .idle-switch-row .nav-icon,
+.sidebar.collapsed .idle-switch-row .nav-label{display:none}
+@media(max-width:900px){.idle-switch-row{justify-content:center;padding:9px 0;gap:0}.idle-switch-row .nav-icon,.idle-switch-row .nav-label{display:none}}
 .sum-flag{color:var(--accent);cursor:help}
 .rm-head-actions{display:flex;gap:6px;align-items:center}
-.panel-area{flex:1;padding:24px 32px;max-width:1400px;overflow-y:auto}
+.panel-area{flex:1;padding:24px 32px;overflow-y:auto}
 .panel{display:none}
 .panel.active{display:block}
+.panel:not(#panel-agent){max-width:1400px}
 
 /* ── Section titles ── */
 .section-title{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;gap:16px;flex-wrap:wrap}
@@ -294,14 +315,14 @@ body.no-topbar .agent-sessions-panel{max-height:calc(100vh - 24px)}
 .chat-pipeline-card .pc-bar{height:8px;background:#1a2030;border-radius:4px;overflow:hidden}
 .chat-pipeline-card .pc-fill{height:100%;background:linear-gradient(90deg,#56d6b0,#78a9ff);transition:width .5s}
 
-/* -- Roadmap Tutor: stepper por unidad -- */
-.tutor-roadmaps{display:flex;flex-direction:column;gap:10px;margin-top:6px}
-.rm-card{background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-.rm-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
-.rm-topic{font-size:12px;font-weight:650;text-transform:capitalize}
+/* -- Roadmap Tutor: unidades (pestaña Roadmaps; el stepper del aside fue reemplazado) -- */
 .rm-status{font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
-.rm-status.active{color:var(--accent);border-color:var(--accent)}
+select.rm-status{appearance:none;-webkit-appearance:none;background:var(--surface);font-family:inherit;cursor:pointer}
+select.rm-status:focus{outline:none;border-color:var(--accent)}
+select.rm-status option{background:var(--surface2);color:var(--text);text-transform:uppercase}
+.rm-status.accepted,.rm-status.active{color:var(--accent);border-color:var(--accent)}
 .rm-status.proposed,.rm-status.approved{color:var(--warn);border-color:var(--warn)}
+.rm-status.rejected{color:var(--danger);border-color:var(--danger)}
 .rm-status.completed{color:var(--blue);border-color:var(--blue)}
 .rm-step{display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-top:1px solid #1a2030}
 .rm-step .rm-num{flex:0 0 20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;background:#1a2030;color:var(--muted);margin-top:1px}
@@ -313,11 +334,46 @@ body.no-topbar .agent-sessions-panel{max-height:calc(100vh - 24px)}
 .rm-step.done .rm-title{color:var(--muted);text-decoration:line-through}
 .rm-step .rm-meta{font-size:10px;color:var(--muted);margin-top:1px}
 .rm-mastery{margin-top:8px;padding-top:8px;border-top:1px solid #1a2030;font-size:10px;color:var(--muted);letter-spacing:.04em}
-.rm-card{cursor:pointer;transition:border-color .15s}
-.rm-card:hover{border-color:var(--accent)}
+
+/* -- Pestaña Roadmaps: proyectos del Tutor -- */
+.roadmaps-layout{display:grid;grid-template-columns:240px 1fr;gap:16px;align-items:start}
+.roadmap-projects-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px;position:sticky;top:0}
+.rmp-item{display:flex;gap:8px;align-items:flex-start;padding:8px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+.rmp-item:hover{border-color:var(--line)}
+.rmp-item.sel{border-color:var(--accent);background:var(--surface2)}
+.rmp-item-badge{flex:0 0 20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;background:#1a2030;color:var(--muted);margin-top:1px}
+.rmp-item-badge.active{background:var(--accent);color:#0b0d12}
+.rmp-item-badge.approved,.rmp-item-badge.completed{background:#12372f;color:var(--accent)}
+.rmp-item-badge.rejected{background:#3a1620;color:var(--danger)}
+.rmp-item-title{font-size:12px;font-weight:600;line-height:1.3}
+.rmp-item-meta{font-size:10px;color:var(--muted);margin-top:1px}
+.roadmap-detail{display:flex;flex-direction:column;gap:14px;min-width:0}
+.rmp-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.rmp-head h2{margin:2px 0 0}
+.rmp-head-side{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.rmp-focus-tag{font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:20px;padding:2px 8px;white-space:nowrap}
+.rmp-section{margin:0}
+.rmp-h4{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:12px 0 4px}
+.rmp-list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:13px}
+.rmp-why-cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.rmp-progress-bar{height:8px;background:#1a2030;border-radius:4px;overflow:hidden;margin:10px 0}
+#rmp-progress-fill{height:100%;background:linear-gradient(90deg,#56d6b0,#78a9ff);transition:width .5s}
+.rmp-units{list-style:none;margin:0;padding:0}
+.rmp-concepts-card summary{cursor:pointer;font-size:13px;font-weight:600;padding:2px 0}
+.rmp-concept{padding:8px 0;border-top:1px solid #1a2030}
+.rmp-concept-head{font-size:12px;display:flex;gap:8px;align-items:baseline}
+.rmp-concept-head a{color:var(--accent);font-size:11px}
+.rmp-concept-excerpt{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.45}
+.rmp-chat-slot .chat-container{height:56vh}
+@media(max-width:900px){.roadmaps-layout{grid-template-columns:1fr}.rmp-chat-slot .chat-container{height:520px}}
 
 /* -- Chip de contexto deep dive en el chat -- */
 .dd-chip{display:flex;align-items:center;gap:8px;margin:0 14px 6px;padding:5px 10px;background:linear-gradient(135deg,#0e1f1a,#0b1622);border:1px solid var(--accent);border-radius:20px;width:fit-content;max-width:100%}
+/* ── Indicador de foco de roadmap (chat del tutor) ── */
+.tutor-focus-chip{display:flex;align-items:center;gap:6px;margin:0 14px 6px;padding:5px 12px;background:linear-gradient(135deg,#0e1f1a,#0b1622);border:1px solid var(--accent);border-radius:20px;width:fit-content;max-width:100%;font-size:11px;color:var(--muted)}
+.tutor-focus-chip strong{color:var(--accent);font-weight:600;white-space:nowrap}
+.tutor-focus-chip .chip-close{background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:0 2px;line-height:1}
+.tutor-focus-chip .chip-close:hover{color:var(--danger)}
 .dd-chip .dd-label{font-size:11px;color:var(--accent);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
 .dd-chip .dd-close{background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:0 2px;line-height:1}
 .dd-chip .dd-close:hover{color:var(--danger)}

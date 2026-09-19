@@ -14,6 +14,10 @@ Tools:
       semantic chunk (BGE-M3), embed, and index in LanceDB + FTS.
       Returns document_id and chunk count.
 
+  - scrape_domain(domain, query="", max_results=10, days_back=7)
+      Discover and ingest article links from a domain (deterministic link
+      extraction), then index the new documents.
+
   - ingest_file(path)
       Parse a local file (PDF, HTML, text, JSON), chunk, embed, index.
       Returns document_id and chunk count.
@@ -62,8 +66,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
 
-# Ensure src is on the path when run as module
-_src = Path(__file__).resolve().parent.parent
+# Ensure src is on the path when run as module. NOTE: this must be the src/
+# root (the ipa package's parent), NOT src/ipa — inserting the package dir
+# itself would make `ipa/mcp/` shadow the `mcp` SDK on sys.path and the
+# import below would fail with "No module named 'mcp.server'".
+_src = Path(__file__).resolve().parents[2]
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
@@ -325,7 +332,7 @@ def search_knowledge(query: str, top_k: int = 5) -> str:
             from ipa.indexes.reranker_adapter import RerankCandidate
             rerank_candidates = [
                 RerankCandidate(
-                    id=c["chunk_id"],
+                    chunk_id=c["chunk_id"],
                     text=c["text"],
                     score=c["score"],
                     metadata={"document_id": c["document_id"]},
@@ -337,11 +344,11 @@ def search_knowledge(query: str, top_k: int = 5) -> str:
             results = []
             for r in reranked:
                 results.append({
-                    "chunk_id": r.id,
+                    "chunk_id": r.chunk_id,
                     "text": r.text,
                     "score": r.score,
                     "document_id": r.metadata.get("document_id", ""),
-                    "page": _extract_page_from_id(r.id),
+                    "page": _extract_page_from_id(r.chunk_id),
                 })
         except Exception:
             # Reranker failed â€” return hybrid results without reranking

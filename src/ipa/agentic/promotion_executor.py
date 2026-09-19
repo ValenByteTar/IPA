@@ -189,8 +189,37 @@ def promote_documents_to_main(
 
                 if filtered.num_rows:
                     main_lance._ensure_table(filtered.column("vector")[0].as_py())
+                    # Evolve pre-existing main tables to the scalar-metadata
+                    # schema, then align the source batch to it — LanceDB
+                    # rejects add() on schema mismatch, and source corpora may
+                    # predate (or carry) the metadata columns.
+                    main_lance._ensure_metadata_columns()
+                    main_schema = main_lance._table.schema
+                    src_names = set(filtered.schema.names)
+                    for f in main_schema:
+                        if f.name not in src_names:
+                            if pa.types.is_floating(f.type):
+                                fill = pa.array([0.0] * filtered.num_rows, type=f.type)
+                            elif pa.types.is_string(f.type):
+                                fill = pa.array([""] * filtered.num_rows, type=f.type)
+                            else:
+                                fill = pa.array([None] * filtered.num_rows, type=f.type)
+                            filtered = filtered.append_column(f, fill)
+                    filtered = filtered.select([f.name for f in main_schema])
                     main_lance._table.add(filtered)
                     promoted_vectors = filtered.num_rows
+                    # Backfill real provenance values on the merged rows —
+                    # the canonical DocumentStore (already updated in phase 1)
+                    # owns source_domain/provenance/quality_score/stored_at.
+                    try:
+                        from ipa.storage.document_store import DocumentStore
+                        _sync_store = DocumentStore(main_store_db)
+                        try:
+                            main_lance.sync_doc_metadata(_sync_store, only_missing=True)
+                        finally:
+                            _sync_store.close()
+                    except Exception:
+                        pass
 
             main_lance.close()
             source_lance.close()

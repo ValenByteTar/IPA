@@ -127,6 +127,56 @@ def test_consolidator_accepts_plain_string_provider(memory):
     assert s.consolidated_at is not None
 
 
+def test_consolidator_summary_carries_roadmap_tag(memory, tmp_path, monkeypatch):
+    """El resumen de una sesión que trabajó un roadmap queda taggeado con
+    identificación exacta y avance — recuperable cross-sesión."""
+    import json as _json
+    from ipa.agent.session_consolidator import SessionConsolidator
+    from ipa.tutor.tutor_chat import TutorChatDriver
+    from ipa.tutor.tutor_runtime import TutorStore, TutorSession
+    from ipa.agent import AgentCore
+
+    tutor_store = TutorStore(tmp_path / "tutor.db")
+    # El tag construye TutorStore() con el default: patch a tmp.
+    monkeypatch.setattr(
+        "ipa.tutor.tutor_runtime.TutorStore",
+        lambda *a, **k: TutorStore(tmp_path / "tutor.db"))
+
+    class _R:
+        text = _json.dumps({
+            "units": [
+                {"concept_id": f"doc:{c}", "reason": "base", "estimated_effort_minutes": 30,
+                 "assessment_types": ["explanation"]}
+                for c in ("a", "b", "c")
+            ],
+            "assumptions": [], "uncertainties": [],
+        })
+        error = None
+
+    class _P:
+        model_id = "fake"
+        def generate_chat(self, messages, **kw):
+            return _R()
+
+    core = AgentCore(interface="dashboard", role="tutor", memory=memory)
+    driver = TutorChatDriver(store=tutor_store)
+    driver.handle(core, "s1", "quiero aprender RAG", _P(),
+                  retrieve=lambda q: [
+                      {"document_id": d, "text": f"contenido {d}", "source_domain": "example.com"}
+                      for d in ("doc:a", "doc:b", "doc:c")])
+    # La asociación sesión→roadmap la escribe el driver al proponer.
+    rid = tutor_store.get_session_roadmap("s1")
+    assert rid, "el driver debe registrar la asociación sesión→roadmap"
+
+    tag = SessionConsolidator._roadmap_tag("s1")
+    assert rid in tag
+    assert "tema: rag" in tag
+    assert "unidad 1/3" in tag
+    # Sesión sin roadmap asociado → tag vacío (resúmenes sin tag no rompen).
+    assert SessionConsolidator._roadmap_tag("sess:desconocida") == ""
+    tutor_store.close()
+
+
 def test_consolidator_parses_and_routes(memory, tmp_path, monkeypatch):
     from ipa.agent.session_consolidator import SessionConsolidator
     from ipa.agentic.memory_consolidation import ConsolidationStore as _RealStore

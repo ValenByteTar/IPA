@@ -226,3 +226,44 @@ def test_pending_proposals_listing(store):
     assert len(pending) == 2
     kinds = {p.kind for p in pending}
     assert kinds == {"memory_consolidation", "mastery_inference"}
+
+
+def test_apply_sessfact_routes_to_user_model(store, tmp_path):
+    """Las propuestas sessfact del SessionConsolidator materializan en
+    user_facts (active) — es el único camino que llega al system prompt.
+    Antes morían en un KeyError o en la tabla memory_consolidations."""
+    from ipa.agent.user_model import UserModelStore, render_user_model_context
+    from ipa.agentic.memory_consolidation import ConsolidationProposal
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    proposal = ConsolidationProposal(
+        proposal_id="consolidation:sessfact:test00001",
+        kind="memory_consolidation", topic_id="agent_session:s1",
+        summary="Hecho del usuario detectado en sesión: trabaja en fotónica",
+        source_episode_ids=["e1", "e2"],
+        proposed_payload={"fact": "trabaja en fotónica",
+                          "session_id": "agent_session:s1",
+                          "origin": "session_consolidation",
+                          "originals_preserved": True},
+        status="pending", proposed_at=now,
+    )
+    store.save_proposal(proposal)
+    approve_proposal(store, proposal.proposal_id, decided_by="Valen")
+
+    um = UserModelStore(tmp_path / "user_model.db")
+    try:
+        applied = apply_approved_memory_consolidation(
+            store, proposal.proposal_id, user_model_store=um)
+        assert applied["fact"] == "trabaja en fotónica"
+        active = um.list_facts(status="active")
+        assert [f["fact"] for f in active] == ["trabaja en fotónica"]
+        assert active[0]["decided_by"] == "Valen"
+        # El hecho aprobado entra al contexto del system prompt.
+        ctx = render_user_model_context(um)
+        assert "trabaja en fotónica" in ctx
+        # Re-aplicar no duplica.
+        again = apply_approved_memory_consolidation(
+            store, proposal.proposal_id, user_model_store=um)
+        assert again["deduplicated"] is True
+        assert len(um.list_facts(status="active")) == 1
+    finally:
+        um.close()

@@ -171,6 +171,52 @@ RESEARCH_REVIEW_IDLE = int(os.environ.get("IPA_RESEARCH_REVIEW_IDLE_SECONDS", "6
 # Lock to prevent concurrent enrichment runs (e.g. two dashboard instances).
 ENRICHMENT_LOCK = threading.Lock()
 
+# Perilla del sidebar: apaga TODO el enriquecimiento idle (Tier 1 y Tier 2).
+# El worker consulta este dict en cada ciclo vía _idle(); OFF también aborta
+# pasadas Tier 2 en vuelo (should_abort → _idle()). Persistido en disco para
+# que un restart del dashboard respete la decisión del usuario.
+IDLE_ENABLED = {"enabled": True}
+IDLE_ENABLED_PATH = ROOT / "outputs" / "web_dashboard" / "idle_enabled.json"
+
+
+def idle_enabled_state() -> bool:
+    return bool(IDLE_ENABLED["enabled"])
+
+
+def idle_enabled_state() -> bool:
+    return bool(IDLE_ENABLED["enabled"])
+
+
+def set_idle_enabled(enabled: bool) -> None:
+    IDLE_ENABLED["enabled"] = bool(enabled)
+    try:
+        IDLE_ENABLED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        IDLE_ENABLED_PATH.write_text(
+            json.dumps({"enabled": bool(enabled)}), encoding="utf-8")
+    except OSError:
+        pass
+    # Auditoría en el log del worker (mismo archivo que los ciclos idle).
+    try:
+        _log_path = ROOT / "outputs" / "web_dashboard" / "logs" / "idle_enrichment.log"
+        _log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(_log_path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [idle-sched] "
+                    f"enrichment {'ENABLED' if enabled else 'DISABLED'} by user\n")
+    except OSError:
+        pass
+
+
+def _read_idle_enabled_at_boot() -> None:
+    try:
+        if IDLE_ENABLED_PATH.exists():
+            IDLE_ENABLED["enabled"] = json.loads(
+                IDLE_ENABLED_PATH.read_text(encoding="utf-8")).get("enabled", True)
+    except Exception:
+        pass  # archivo ausente/corrupto → default ON
+
+
+_read_idle_enabled_at_boot()
+
 
 
 def _force_rmtree(path: Path, max_retries: int = 3) -> bool:
@@ -297,7 +343,8 @@ def db_counts(path: Path) -> dict[str, Any]:
 
             db = _lancedb.connect(str(path))
 
-            tables = db.table_names() if hasattr(db, "table_names") else [t for t in (db.list_tables().tables if hasattr(db, "list_tables") else [])]
+            _resp = db.list_tables() if hasattr(db, "list_tables") else db.table_names()
+            tables = list(_resp.tables if hasattr(_resp, "tables") else _resp)
 
             if "chunks" in tables:
 
@@ -1741,7 +1788,8 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
 
                     ldb = _ldb.connect(str(reporter_corpus / "vector" / "lancedb"))
 
-                    tables = ldb.table_names() if hasattr(ldb, "table_names") else []
+                    _resp = ldb.list_tables() if hasattr(ldb, "list_tables") else ldb.table_names()
+                    tables = list(_resp.tables if hasattr(_resp, "tables") else _resp)
 
                     if "chunks" in tables:
 
@@ -1900,7 +1948,14 @@ def main() -> None:
 
             pass
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    class _SingleBindHTTPServer(ThreadingHTTPServer):
+        # SO_REUSEADDR on Windows lets a second process bind an already
+        # listening port — that let runaway watchdog respawns stack N
+        # dashboard instances on 8765. With this off, a duplicate fails
+        # the bind and exits instead of piling up.
+        allow_reuse_address = False
+
+    server = _SingleBindHTTPServer((args.host, args.port), Handler)
 
     print(f"IPA web dashboard: http://{args.host}:{args.port}", flush=True)
 
@@ -1956,6 +2011,18 @@ def main() -> None:
                         _dense, _sparse = adapter.embed_query_hybrid("warmup")
                         _lance.create_fts_index()
                         list(_lance.search_hybrid("warmup", _dense, limit=3, query_sparse=_sparse))
+                        # Backfill scalar metadata columns (source_domain,
+                        # published_at, provenance, quality_score) from the
+                        # canonical store so pre-filtered hybrid search works
+                        # on indexes that predate the metadata schema.
+                        try:
+                            _meta_store = DocumentStore(Path(_corpus / "document_store.db"))
+                            _synced = _lance.sync_doc_metadata(_meta_store, only_missing=True)
+                            _meta_store.close()
+                            if _synced:
+                                print(f"  [warmup] LanceDB metadata sync: {_synced} docs", flush=True)
+                        except Exception as _me:
+                            print(f"  [warmup] metadata sync skip: {_me!r}"[:200], flush=True)
                         print("  [warmup] retrieval pipeline listo (embed + FTS + hybrid)", flush=True)
                     _lance.close()
             except Exception as _exc:
@@ -2256,6 +2323,11 @@ def main() -> None:
                 pass
 
         def _idle() -> bool:
+            # Perilla del sidebar: OFF corta TODO el enriquecimiento idle
+            # (Tier 1 no arranca y las pasadas Tier 2 en vuelo abortan entre
+            # items vía should_abort → _idle()).
+            if not IDLE_ENABLED["enabled"]:
+                return False
             if CHAT_BUSY["flag"]:
                 return False
             with JOBS_LOCK:

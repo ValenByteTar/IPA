@@ -90,6 +90,34 @@ def test_directory_backend_is_reported_without_sqlite_error(tmp_path):
     assert result["files"] == 1
 
 
+# ── Perilla idle enrichment (sidebar): ON/OFF Tier 1 y Tier 2 ───────────────
+
+def test_idle_switch_persists_across_boot(tmp_path, monkeypatch):
+    """set_idle_enabled persiste la decisión; el boot-read la respeta — un
+    restart del dashboard no re-enciende el enrichment silenciosamente."""
+    monkeypatch.setattr(dashboard, "IDLE_ENABLED_PATH", tmp_path / "idle_enabled.json")
+    monkeypatch.setattr(dashboard, "ROOT", tmp_path)
+    dashboard.IDLE_ENABLED["enabled"] = True  # reset estado del proceso
+    dashboard._read_idle_enabled_at_boot()
+    assert dashboard.idle_enabled_state() is True  # default ON
+
+    dashboard.set_idle_enabled(False)
+    assert dashboard.idle_enabled_state() is False
+    persisted = json.loads((tmp_path / "idle_enabled.json").read_text(encoding="utf-8"))
+    assert persisted == {"enabled": False}
+    # Auditoría en el log del worker
+    log = tmp_path / "outputs" / "web_dashboard" / "logs" / "idle_enrichment.log"
+    assert "DISABLED by user" in log.read_text(encoding="utf-8")
+
+    # Restart simulado: el boot-read respeta la decisión persistida.
+    dashboard.IDLE_ENABLED["enabled"] = True
+    dashboard._read_idle_enabled_at_boot()
+    assert dashboard.idle_enabled_state() is False
+
+    dashboard.set_idle_enabled(True)
+    assert dashboard.idle_enabled_state() is True
+
+
 # ── Deep dive consolidado en el chat (context=deep_dive) ────────────────────
 
 def test_deep_dive_context_absent_returns_none():
@@ -170,3 +198,140 @@ def test_sqlite_connection_cross_thread_raises(tmp_path):
     # close() is also thread-bound — the owning thread must close it.
     done.set()
     t.join()
+
+
+# ---------------------------------------------------------------------------
+# Roadmaps tab read model (Fase: pestaña de proyectos del Tutor)
+# ---------------------------------------------------------------------------
+
+def _seed_tutor_store(tmp_path):
+    """Roadmap + LearningGoal sembrados en el store default (cwd-patcheado)."""
+    from datetime import datetime, timezone
+    from ipa.tutor.tutor_runtime import TutorStore
+    from ipa.tutor.tutor_contracts import (
+        AssessmentType, GenerationProvenance, HumanApproval,
+        HumanApprovalDecision, LearningGoal, LearningGoalStatus,
+        Roadmap, RoadmapStatus, RoadmapUnit, SourceRef, SourceType,
+    )
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    gen = GenerationProvenance(
+        generator="t", generated_at=now,
+        input_hash="sha256:" + "a" * 64, model_fingerprint="m",
+    )
+    store = TutorStore(tmp_path / "outputs/agent/tutor.db")
+    goal = LearningGoal(
+        goal_id="goal:demo", title="Proyecto Demo",
+        description="Dominar el tema demo",
+        status=LearningGoalStatus.ACTIVE,
+        success_criteria=["Explicar demo", "Aplicar demo"],
+        constraints=["Nivel avanzado"],
+        created_at=now, updated_at=now,
+        approval=HumanApproval(
+            decision=HumanApprovalDecision.APPROVED,
+            decided_at=now, decided_by="dashboard",
+        ),
+        field_origins={
+            "title": "user", "description": "user",
+            "success_criteria": "generated", "constraints": "user",
+            "status": "system",
+        },
+        generation=gen,
+    )
+    store.save_goal(goal)
+    units = [
+        RoadmapUnit(
+            unit_id=f"roadmap_unit:u{i}", order=i, concept_id=f"doc:c{i}",
+            reason=f"razón {i}", estimated_effort_minutes=30,
+            source_refs=[SourceRef(source_id=f"doc:c{i}", source_type=SourceType.CHUNK)],
+            assessment_types=[AssessmentType.EXPLANATION],
+        )
+        for i in (1, 2, 3)
+    ]
+    rm = Roadmap(
+        roadmap_id="roadmap:demo1", goal_id="goal:demo", version=1,
+        status=RoadmapStatus.ACTIVE, units=units,
+        assumptions=["asunción 1"], uncertainties=["duda 1"],
+        change_reason=None, previous_roadmap_id=None, created_at=now,
+        approval=HumanApproval(
+            decision=HumanApprovalDecision.APPROVED,
+            decided_at=now, decided_by="dashboard",
+        ),
+        generation=gen,
+        field_origins={
+            "goal_id": "user", "units": "generated",
+            "assumptions": "generated", "uncertainties": "generated",
+            "change_reason": "user_or_generated",
+        },
+    )
+    store.save_roadmap(rm)
+    store.set_unit_status("roadmap:demo1", 1, "done")
+    store.set_unit_status("roadmap:demo1", 2, "current")
+    store.set_unit_status("roadmap:demo1", 3, "pending")
+    store.set_focus("roadmap:demo1")
+    return store, rm, goal
+
+
+def test_tutor_projects_lists_goals_with_roadmaps(tmp_path, monkeypatch):
+    """GET /api/tutor/projects: proyectos (goals) con sus roadmaps."""
+    monkeypatch.chdir(tmp_path)
+    from ipa.dashboard.api import tutor_projects_payload
+    store, rm, goal = _seed_tutor_store(tmp_path)
+    store.close()
+    payload = tutor_projects_payload()
+    assert len(payload["projects"]) == 1
+    proj = payload["projects"][0]
+    assert proj["goal"]["goal_id"] == "goal:demo"
+    assert proj["goal"]["title"] == "Proyecto Demo"
+    assert proj["goal"]["status"] == "active"
+    assert proj["goal"]["success_criteria"] == ["Explicar demo", "Aplicar demo"]
+    assert proj["goal"]["approved"] is True
+    assert proj["roadmaps"][0]["roadmap_id"] == rm.roadmap_id
+
+
+def test_tutor_roadmap_context_full_read_model(tmp_path, monkeypatch):
+    """GET /api/tutor/roadmap/context: objetivo + porqué + avance + conceptos
+    + foco — todo lo que la pestaña renderiza."""
+    monkeypatch.chdir(tmp_path)
+    from ipa.dashboard.api import tutor_roadmap_context
+    store, rm, goal = _seed_tutor_store(tmp_path)
+    store.close()
+    ctx = tutor_roadmap_context(rm.roadmap_id)
+    assert ctx["ok"] is True
+    assert ctx["status"] == "active" and ctx["is_focus"] is True
+    # Objetivo (LearningGoal persistido, no sintético)
+    assert ctx["goal"]["title"] == "Proyecto Demo"
+    assert ctx["goal"]["constraints"] == ["Nivel avanzado"]
+    # Porqué del roadmap (racionalidad antes invisible)
+    assert ctx["rationale"]["assumptions"] == ["asunción 1"]
+    assert ctx["rationale"]["uncertainties"] == ["duda 1"]
+    # Avance por unidad (la barra de progreso)
+    assert ctx["progress"] == {"done": 1, "current": 2, "total": 3}
+    statuses = {u["order"]: u["status"] for u in ctx["units"]}
+    assert statuses == {1: "done", 2: "current", 3: "pending"}
+    # Conceptos re-derivados (sin corpus en tmp → label honesto)
+    assert ctx["units"][0]["concept"]["concept_id"] == "doc:c1"
+    assert ctx["units"][0]["concept"]["title"]
+
+
+def test_tutor_roadmap_context_synthesizes_legacy_goal(tmp_path, monkeypatch):
+    """Un roadmap previo a learning_goals recibe goal sintetizado al leerse:
+    active + approval reutilizado del roadmap."""
+    monkeypatch.chdir(tmp_path)
+    from ipa.dashboard.api import tutor_roadmap_context
+    store, rm, _ = _seed_tutor_store(tmp_path)
+    store._conn.execute("DELETE FROM learning_goals")
+    store._conn.commit()
+    store.close()
+    ctx = tutor_roadmap_context(rm.roadmap_id)
+    assert ctx["ok"] is True
+    assert ctx["goal"]["status"] == "active"
+    assert ctx["goal"]["approved"] is True
+    assert ctx["goal"]["title"] == "demo"  # slug → título
+
+
+def test_tutor_roadmap_context_unknown_returns_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from ipa.dashboard.api import tutor_roadmap_context
+    ctx = tutor_roadmap_context("roadmap:inexistente")
+    assert ctx["ok"] is False
+    assert "unknown roadmap" in ctx["error"]

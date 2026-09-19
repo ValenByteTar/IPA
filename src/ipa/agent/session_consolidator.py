@@ -69,6 +69,12 @@ class SessionConsolidator:
         # 1. Derived index: summary + title on the session (auto)
         summary = str(payload.get("summary", "")).strip()[:2000]
         title = str(payload.get("title", "")).strip()[:120]
+        # Tag determinístico de roadmap+avance: hace el resumen recuperable
+        # cross-sesión ("¿en qué estábamos?") con identificación exacta del
+        # roadmap y la unidad en curso — no depende de que el LLM lo mencione.
+        tag = self._roadmap_tag(session_id)
+        if summary and tag:
+            summary = f"{summary}\n\n{tag}"
         if summary:
             self.memory.update_session_summary(session_id, summary, title=title or None)
         # 2. Durable user facts → approval gate (never auto-applied)
@@ -109,6 +115,32 @@ class SessionConsolidator:
             return proposal_ids
         finally:
             store.close()
+
+    @staticmethod
+    def _roadmap_tag(session_id: str) -> str:
+        """Tag determinístico del roadmap trabajado en la sesión — el resumen
+        queda recuperable cross-sesión con identificación exacta y avance."""
+        try:
+            from ipa.tutor.tutor_runtime import TutorStore
+            store = TutorStore()
+            try:
+                rid = store.get_session_roadmap(session_id)
+                if not rid:
+                    return ""
+                rm = store.get_roadmap(rid)
+                if rm is None:
+                    return ""
+                statuses = store.unit_statuses(rid)
+                current = next(
+                    (o for o in sorted(statuses) if statuses.get(o) == "current"),
+                    None)
+                topic = rm.goal_id.removeprefix("goal:").replace("-", " ")
+                return (f"[roadmap:{rid} · tema: {topic} · "
+                        f"unidad {current or 1}/{len(rm.units)} · {rm.status.value}]")
+            finally:
+                store.close()
+        except Exception:
+            return ""
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any] | None:

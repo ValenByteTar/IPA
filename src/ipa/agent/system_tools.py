@@ -1140,7 +1140,7 @@ _SYSTEM_TOOLS: tuple[SystemToolSpec, ...] = (
     SystemToolSpec(
         name="search_corpus",
         description="busca en el corpus. Cita hits como [n].",
-        args_doc='{"query": "texto a buscar", "limit": <int 1-15, opcional>}',
+        args_doc='{"query": "texto a buscar", "limit": <int 1-15, opcional>, "date_from"/"date_to": "YYYY-MM-DD", opcional}',
         fn=tool_search_corpus,
     ),
     SystemToolSpec(

@@ -302,6 +302,22 @@ class DocumentStore:
             return None
         return {"source_url": row[0], "source_domain": row[1], "provenance": row[2], "quality_score": row[3]}
 
+    def document_stored_at(self, document_id: str) -> str | None:
+        """Return stored_at for a live document, or None."""
+        row = self._conn.execute(
+            "SELECT stored_at FROM documents WHERE document_id = ? AND tombstoned = 0",
+            (document_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def all_document_stored_at(self) -> dict[str, str]:
+        """Return {document_id: stored_at} for live documents — used to sync
+        the derived LanceDB metadata columns (published_at proxy)."""
+        rows = self._conn.execute(
+            "SELECT document_id, stored_at FROM documents WHERE tombstoned = 0"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def all_sources(self) -> dict[str, dict]:
         """Return all document provenance records as {document_id: {source_url, source_domain, provenance, quality_score}}."""
         rows = self._conn.execute(

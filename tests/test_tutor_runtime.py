@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "validation"))
 
 from ipa.agent import AgentCore, AgentMemory, ToolContext, load_identity  # noqa: E402
-from ipa.agent import AgentCore, AgentMemory, ToolContext, load_identity  # noqa: E402
 from ipa.tutor.tutor_contracts import (  # noqa: E402
     EvidenceType,
     GenerationProvenance,
@@ -177,8 +176,6 @@ def test_assess_requires_provider(tutor_env):
         tutor.assess("concept:x", "q", "a")
 
 
-def test_assess_full_loop_updates_mastery(tutor_env):
-    """diagnóstico → lección → assessment → mastery update (the Fase 2 loop)."""
 def test_assess_full_loop_updates_mastery(tutor_env):
     """diagnóstico → lección → assessment → mastery update (the Fase 2 loop)."""
     core, store = tutor_env
@@ -451,8 +448,9 @@ def test_roadmap_persists_across_sessions(tutor_env):
     assert len(loaded.units) == 4
 
 
-def test_propose_roadmap_rejects_unknown_concept(tutor_env):
-    """The scaffold validates the LLM proposal: unknown concepts are rejected."""
+def test_propose_roadmap_absorbs_unknown_concepts(tutor_env):
+    """El scaffold absorbe propuestas imperfectas: conceptos desconocidos se
+    descartan y el top-up completa al mínimo del contrato — sin dead-end."""
     core, store = tutor_env
     bad_response = json.dumps({
         "units": [
@@ -466,31 +464,35 @@ def test_propose_roadmap_rejects_unknown_concept(tutor_env):
         "assumptions": [], "uncertainties": [],
     })
     tutor = TutorSession(core, store, provider=FakeProvider(responses=[bad_response]))
-    with pytest.raises(ValueError, match="unknown concept"):
-        tutor.propose_roadmap("goal:x", CONCEPTS)
+    roadmap = tutor.propose_roadmap("goal:x", CONCEPTS)
+    ids = [u.concept_id for u in roadmap.units]
+    assert "concept:nonexistent" not in ids
+    assert len(ids) == 3 and len(set(ids)) == 3
+    assert roadmap.status.value == "proposed"
 
 
-# ---------------------------------------------------------------------------
-# ResearchRequest: crear → aprobar (humano) → ejecutar (Fase 1 executor)
-# ---------------------------------------------------------------------------
-
-def test_propose_roadmap_rejects_unknown_concept(tutor_env):
-    """The scaffold validates the LLM proposal: unknown concepts are rejected."""
+def test_propose_roadmap_truncates_above_contract_maximum(tutor_env):
+    """Un pedido explícito de 9 unidades se ajusta al rango del contrato
+    (3-7): el prompt pide 7 y el scaffold trunca excedentes."""
     core, store = tutor_env
-    bad_response = json.dumps({
+    many_concepts = [
+        {**c, "concept_id": f"{c['concept_id']}:v{i // 5}"}
+        for i, c in enumerate(CONCEPTS * 2, start=1)
+    ]
+    many = json.dumps({
         "units": [
-            {"concept_id": "concept:nonexistent", "reason": "x", "estimated_effort_minutes": 30,
-             "assessment_types": ["explanation"]},
-            {"concept_id": "concept:bm25", "reason": "y", "estimated_effort_minutes": 30,
-             "assessment_types": ["explanation"]},
-            {"concept_id": "concept:embeddings", "reason": "z", "estimated_effort_minutes": 30,
-             "assessment_types": ["explanation"]},
+            {"concept_id": c["concept_id"], "reason": f"u{i}", "estimated_effort_minutes": 30,
+             "assessment_types": ["explanation"]}
+            for i, c in enumerate(many_concepts, start=1)
         ],
         "assumptions": [], "uncertainties": [],
     })
-    tutor = TutorSession(core, store, provider=FakeProvider(responses=[bad_response]))
-    with pytest.raises(ValueError, match="unknown concept"):
-        tutor.propose_roadmap("goal:x", CONCEPTS)
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[many]))
+    roadmap = tutor.propose_roadmap("goal:big", many_concepts, n_units=9)
+    assert len(roadmap.units) == 7
+    assert [u.order for u in roadmap.units] == list(range(1, 8))
+    ids = [u.concept_id for u in roadmap.units]
+    assert len(set(ids)) == len(ids)
 
 
 def test_propose_roadmap_retries_on_invalid_json(tutor_env):
@@ -524,6 +526,70 @@ def test_propose_roadmap_falls_back_deterministically(tutor_env):
     assert "roadmap" in tutor.last_fallback_reason
 
 
+def test_propose_roadmap_dedups_repeated_concepts(tutor_env):
+    """El LLM puede reutilizar un concept_id (el prompt lo invita cuando el
+    alumno pide N unidades); el scaffold deduplica en vez de violar el
+    contrato ('roadmap concept IDs must be unique')."""
+    core, store = tutor_env
+    dup_response = json.dumps({
+        "units": [
+            {"concept_id": "concept:chunking", "reason": "introducción",
+             "estimated_effort_minutes": 30, "assessment_types": ["explanation"]},
+            {"concept_id": "concept:bm25", "reason": "lexical primero",
+             "estimated_effort_minutes": 30, "assessment_types": ["explanation"]},
+            {"concept_id": "concept:chunking", "reason": "aplicación avanzada",
+             "estimated_effort_minutes": 60, "assessment_types": ["application"]},
+            {"concept_id": "concept:embeddings", "reason": "denso después",
+             "estimated_effort_minutes": 45, "assessment_types": ["explanation"]},
+        ],
+        "assumptions": [], "uncertainties": [],
+    })
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[dup_response]))
+    roadmap = tutor.propose_roadmap("goal:dedup", CONCEPTS)
+    concept_ids = [u.concept_id for u in roadmap.units]
+    assert len(concept_ids) == len(set(concept_ids))
+    assert [u.order for u in roadmap.units] == list(range(1, len(concept_ids) + 1))
+    assert roadmap.status.value == "proposed"
+    assert store.get_roadmap(roadmap.roadmap_id) is not None
+
+
+def test_propose_roadmap_tops_up_below_minimum_after_dedup(tutor_env):
+    """Si tras deduplicar quedan menos de 3 unidades, el scaffold completa
+    con conceptos no usados (orden del retrieval); el gate sigue aplicando."""
+    core, store = tutor_env
+    dup_response = json.dumps({
+        "units": [
+            {"concept_id": "concept:bm25", "reason": "a", "estimated_effort_minutes": 30,
+             "assessment_types": ["explanation"]},
+            {"concept_id": "concept:bm25", "reason": "b (repetido)", "estimated_effort_minutes": 30,
+             "assessment_types": ["explanation"]},
+            {"concept_id": "concept:embeddings", "reason": "c",
+             "estimated_effort_minutes": 30, "assessment_types": ["explanation"]},
+        ],
+        "assumptions": [], "uncertainties": [],
+    })
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[dup_response]))
+    roadmap = tutor.propose_roadmap("goal:topup", CONCEPTS)
+    ids = [u.concept_id for u in roadmap.units]
+    assert len(ids) == 3 and len(set(ids)) == 3
+    assert ids[2] == "concept:hybrid"  # top-up: primer concepto no usado
+
+
+def test_diagnose_summary_is_user_facing(tutor_env):
+    """El summary del diagnóstico es dato factual para el alumno: sin la
+    línea de policy (que es instrucción para el LLM de la lección) y sin
+    punto final (el driver lo compone con '. ' → doble punto)."""
+    core, store = tutor_env
+    tutor = TutorSession(core, store)
+    d = tutor.diagnose("concept:rust")
+    assert "Comenzá" not in d.summary
+    assert not d.summary.endswith(".")
+    store.upsert_topic_record(_make_record("concept:asyncio", MasteryStatus.APPLIED, 0.9))
+    d2 = tutor.diagnose("concept:asyncio")
+    assert "Comenzá" not in d2.summary
+    assert not d2.summary.endswith(".")
+
+
 def test_roadmap_archive_hides_from_lists_but_preserves_record(tutor_env):
     """Archive is operational (not a contract status): hidden from lists and
     driver recovery, still fetchable by id, un-archivable."""
@@ -539,6 +605,10 @@ def test_roadmap_archive_hides_from_lists_but_preserves_record(tutor_env):
     store.set_roadmap_archived(roadmap.roadmap_id, archived=False)
     assert any(r.roadmap_id == roadmap.roadmap_id for r in store.list_roadmaps())
 
+
+# ---------------------------------------------------------------------------
+# ResearchRequest: crear → aprobar (humano) → ejecutar (Fase 1 executor)
+# ---------------------------------------------------------------------------
 
 def test_create_research_request_starts_pending(tutor_env):
     core, store = tutor_env
@@ -714,3 +784,137 @@ def test_lesson_without_cluster_store_leaves_null(tutor_env):
     assert result["topic_cluster_id"] is None
     episodes = core.memory.get_episodes(core.session_id)
     assert all(e.topic_cluster_id is None for e in episodes)
+
+
+# ---------------------------------------------------------------------------
+# LearningGoal: el "proyecto" persistido que un roadmap sirve
+# ---------------------------------------------------------------------------
+
+def test_goal_store_roundtrip(tutor_env):
+    core, store = tutor_env
+    tutor = TutorSession(core, store)
+    tutor.ensure_goal("goal:rag", title="RAG avanzado", description="quiero dominar rag")
+    loaded = store.get_goal("goal:rag")
+    assert loaded is not None
+    assert loaded.status.value == "proposed"
+    assert loaded.title == "RAG avanzado"
+    assert loaded.success_criteria
+    assert loaded.approval is None
+    assert [g.goal_id for g in store.list_goals()] == ["goal:rag"]
+
+
+def test_ensure_goal_is_idempotent_and_resurrects_cancelled(tutor_env):
+    core, store = tutor_env
+    tutor = TutorSession(core, store)
+    g1 = tutor.ensure_goal("goal:x", title="X")
+    g2 = tutor.ensure_goal("goal:x", title="Otro título")
+    assert g2.title == "X"  # el goal vivo existente gana
+    tutor.cancel_goal("goal:x")
+    g3 = tutor.ensure_goal("goal:x", title="X")
+    assert g3.status.value == "proposed"
+    assert g3.created_at == g1.created_at  # resucitado, no recreado
+
+
+def test_propose_roadmap_refines_goal_from_llm_block(tutor_env):
+    """El JSON de propuesta puede traer un bloque 'goal'; el scaffold lo
+    vuelca al LearningGoal persistido con origins 'generated'."""
+    core, store = tutor_env
+    response = json.dumps({
+        "goal": {
+            "title": "RAG híbrido",
+            "description": "Dominar retrieval denso+sparse con fusión",
+            "success_criteria": ["Explicar RRF", "Implementar un retriever híbrido"],
+            "constraints": ["Nivel avanzado"],
+        },
+        "units": json.loads(ROADMAP_LLM_RESPONSE)["units"],
+        "assumptions": [], "uncertainties": [],
+    })
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[response]))
+    tutor.ensure_goal("goal:rag", title="rag")
+    tutor.propose_roadmap("goal:rag", CONCEPTS)
+    goal = store.get_goal("goal:rag")
+    assert goal.title == "RAG híbrido"
+    assert goal.success_criteria == ["Explicar RRF", "Implementar un retriever híbrido"]
+    assert goal.constraints == ["Nivel avanzado"]
+    assert goal.field_origins["title"] == "generated"
+    assert goal.generation is not None
+
+
+def test_propose_roadmap_prompt_requests_goal_block(tutor_env):
+    core, store = tutor_env
+    provider = FakeProvider(responses=[ROADMAP_LLM_RESPONSE])
+    tutor = TutorSession(core, store, provider=provider)
+    tutor.propose_roadmap("goal:rag", CONCEPTS)
+    prompt = provider.calls[0]["messages"][-1]["content"]
+    assert '"goal"' in prompt
+    assert "success_criteria" in prompt
+
+
+def test_goal_gate_mirrors_roadmap_approval(tutor_env):
+    """Un solo gate: aprobar+activar el roadmap confirma+activa su goal
+    con el mismo decided_by."""
+    core, store = tutor_env
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[ROADMAP_LLM_RESPONSE]))
+    roadmap = tutor.propose_roadmap("goal:rag", CONCEPTS)
+    tutor.approve_roadmap(roadmap.roadmap_id, decided_by="Valen")
+    tutor.activate_roadmap(roadmap.roadmap_id)
+    tutor.approve_goal(roadmap.goal_id, decided_by="Valen")
+    tutor.activate_goal(roadmap.goal_id)
+    goal = store.get_goal(roadmap.goal_id)
+    assert goal.status.value == "active"
+    assert goal.approval.approved and goal.approval.decided_by == "Valen"
+
+
+def test_confirmed_goal_requires_human_approval(tutor_env):
+    """Invariante del contrato: confirmed/active/completed sin approval → error."""
+    from ipa.tutor.tutor_contracts import LearningGoal, LearningGoalStatus
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with pytest.raises(ValueError, match="require human approval"):
+        LearningGoal(
+            goal_id="goal:x", title="x", description="d",
+            status=LearningGoalStatus.ACTIVE,
+            success_criteria=["c"], created_at=now, updated_at=now,
+            approval=None,
+            field_origins={"title": "user", "description": "user",
+                           "success_criteria": "system"},
+        )
+
+
+def test_goal_validates_against_schema(tutor_env):
+    """El payload persistido pasa el schema autoritativo LearningGoal."""
+    from dataclasses import asdict
+    from validate_tutor_contract import validate as validate_tutor
+    core, store = tutor_env
+    tutor = TutorSession(core, store)
+    goal = tutor.ensure_goal("goal:rag", title="RAG", description="d")
+    payload = asdict(goal)
+    payload["status"] = goal.status.value
+    assert validate_tutor("LearningGoal", payload) == []
+
+
+def test_refine_never_rewrites_confirmed_goal(tutor_env):
+    """Un goal aprobado es récord humano: el LLM no lo reescribe."""
+    core, store = tutor_env
+    tutor = TutorSession(core, store)
+    tutor.ensure_goal("goal:rag", title="RAG")
+    tutor.approve_goal("goal:rag", decided_by="Valen")
+    tutor._refine_goal("goal:rag", {"title": "override"})
+    assert store.get_goal("goal:rag").title == "RAG"
+
+
+def test_goal_for_roadmap_backfills_legacy(tutor_env):
+    """Roadmaps previos a learning_goals reciben un goal sintetizado al leerse,
+    reusando el approval del propio roadmap para el estado active."""
+    core, store = tutor_env
+    tutor = TutorSession(core, store, provider=FakeProvider(responses=[ROADMAP_LLM_RESPONSE]))
+    roadmap = tutor.propose_roadmap("goal:legacy", CONCEPTS)
+    tutor.approve_roadmap(roadmap.roadmap_id, decided_by="Valen")
+    tutor.activate_roadmap(roadmap.roadmap_id)
+    # Simula un roadmap legacy: sin fila en learning_goals.
+    store._conn.execute("DELETE FROM learning_goals WHERE goal_id = ?", (roadmap.goal_id,))
+    store._conn.commit()
+    goal = tutor.goal_for_roadmap(roadmap)
+    assert goal.status.value == "active"
+    assert goal.approval.decided_by == "Valen"
+    assert store.get_goal("goal:legacy") is not None  # persistido para la próxima lectura

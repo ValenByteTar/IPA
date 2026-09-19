@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -266,8 +267,26 @@ def _execute_tool(
 
 # --- search_corpus ---------------------------------------------------------
 
+def _date_where(date_from: str, date_to: str) -> str | None:
+    """SQL pre-filter on the LanceDB published_at metadata column.
+
+    Documents without a date are kept (same permissive semantics as before);
+    values are sanitized to ISO-date characters only.
+    """
+    parts = []
+    for op, raw in ((">=", date_from), ("<=", date_to)):
+        v = re.sub(r"[^0-9TtZz:\-.+ ]", "", raw.strip())[:25]
+        if v:
+            parts.append(f"published_at {op} '{v}'")
+    if not parts:
+        return None
+    return "(published_at = '' OR published_at IS NULL OR (" + " AND ".join(parts) + "))"
+
+
 def _search_corpus(args: dict[str, Any], ctx: ToolContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Search the corpus via LanceDB dense search, with BM25 fallback.
+    """Search the corpus via LanceDB hybrid search (dense + FTS + sparse,
+    3-way RRF) — same pipeline as the dashboard auto-retrieval. BM25Index
+    stays the first_queryable fallback for corpora without a vector index.
 
     Arguments:
         query: str (required) — natural language query
@@ -287,17 +306,20 @@ def _search_corpus(args: dict[str, Any], ctx: ToolContext) -> tuple[dict[str, An
     if store is None:
         raise ValueError("corpus document store is not available; set corpus_dir in ToolContext")
 
-    # Try LanceDB dense search first; fall back to BM25 if no vector index.
-    # Con filtro de fechas se recuperan más hits y se filtran después.
-    fetch_limit = limit * 4 if (date_from or date_to) else limit
+    # Over-fetch for RRF fusion, doc-level dedup and optional reranking.
+    fetch_limit = limit * 3
     hits = []
     retrieval_backend = "none"
     lance = ctx.lance_index()
     if lance is not None and lance.is_queryable():
         embed = ctx.embedding_adapter()
-        dense_vec, _sparse = embed.embed_query_hybrid(query)
-        hits = lance.search(dense_vec, limit=fetch_limit)
-        retrieval_backend = "lancedb_dense"
+        dense_vec, sparse_weights = embed.embed_query_hybrid(query)
+        hits = lance.search_hybrid(
+            query, dense_vec, limit=fetch_limit,
+            query_sparse=sparse_weights,
+            where=_date_where(date_from, date_to),
+        )
+        retrieval_backend = "lancedb_hybrid"
     else:
         bm25 = ctx.bm25_index()
         if bm25 is not None and bm25.is_queryable():
@@ -308,36 +330,48 @@ def _search_corpus(args: dict[str, Any], ctx: ToolContext) -> tuple[dict[str, An
                 "no queryable index available; need either LanceDB or BM25 in corpus_dir"
             )
 
-    store = ctx.document_store()
     results = []
-    source_refs = []
+    seen_docs: set[str] = set()
     for hit in hits:
-        if len(results) >= limit:
-            break
-        chunk = store.get_chunk(hit.chunk_id) if store else None
+        chunk = store.get_chunk(hit.chunk_id)
         doc_id = chunk.document_id if chunk else "unknown"
-        doc = store.get_document(doc_id) if (store and doc_id != "unknown") else None
-        # Filtro de fechas (published_at del documento)
-        if (date_from or date_to) and doc is not None:
-            published = str(getattr(doc, "published_at", "") or "")
-            if date_from and published and published < date_from:
-                continue
-            if date_to and published and published[:10] > date_to[:10]:
-                continue
+        # Dedup por documento: cobertura de fuentes distintas sobre varios
+        # chunks del mismo doc (mismo criterio que el retrieval del dashboard).
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        src = store.get_source(doc_id) if doc_id != "unknown" else None
         text_preview = (chunk.text[:200] + "...") if chunk and len(chunk.text) > 200 else (chunk.text if chunk else "")
         results.append({
             "chunk_id": hit.chunk_id,
             "document_id": doc_id,
             "score": round(hit.score, 4),
             "retrieval_backend": hit.retrieval_backend,
-            "published_at": str(getattr(doc, "published_at", "") or "") if doc else None,
+            "published_at": store.document_stored_at(doc_id) if doc_id != "unknown" else None,
+            "source_domain": (src or {}).get("source_domain"),
+            "provenance": (src or {}).get("provenance"),
             "text_preview": text_preview,
+            "_text": chunk.text if chunk else "",
+            "_content_hash": chunk.content_hash if chunk else None,
         })
-        source_refs.append({
-            "source_id": hit.chunk_id,
+
+    # Stage-2 rerank (default activo, opt-out IPA_RERANK=0): cross-encoder
+    # sobre el texto completo del chunk — el preview de 200 chars no alcanza
+    # para rerankear.
+    from ipa.indexes.reranker_adapter import maybe_rerank
+    results = maybe_rerank(query, results, limit, text_key="_text")[:limit]
+    # source_refs se derivan del resultado final (post-rerank/dedup).
+    source_refs = [
+        {
+            "source_id": r["chunk_id"],
             "source_type": "chunk",
-            "content_hash": chunk.content_hash if chunk else None,
-        })
+            "content_hash": r["_content_hash"],
+        }
+        for r in results
+    ]
+    for r in results:
+        r.pop("_text", None)
+        r.pop("_content_hash", None)
 
     return {"query": query, "hits": results, "total": len(results),
             "date_filter": {"from": date_from or None, "to": date_to or None} if (date_from or date_to) else None}, source_refs

@@ -414,6 +414,37 @@ def main() -> None:
     total_chunks = 0
     last_activity = time.monotonic()
 
+    def _lance_doc_meta(corpus_dir: Path) -> dict:
+        """Scalar metadata for LanceDB rows, read from the canonical store.
+
+        {document_id: {source_domain, published_at, provenance, quality_score}}
+        — published_at proxies documents.stored_at (the canonical store has no
+        separate publication date).
+        """
+        import sqlite3 as _sq
+        meta: dict[str, dict] = {}
+        conn = _sq.connect(str(corpus_dir / "document_store.db"))
+        try:
+            for did, stored in conn.execute(
+                "SELECT document_id, stored_at FROM documents WHERE tombstoned=0"
+            ):
+                meta[did] = {"published_at": stored or "", "source_domain": "",
+                             "provenance": "", "quality_score": 0.0}
+            try:
+                for did, dom, prov, qs in conn.execute(
+                    "SELECT document_id, source_domain, provenance, quality_score FROM document_sources"
+                ):
+                    m = meta.setdefault(did, {"published_at": "", "source_domain": "",
+                                              "provenance": "", "quality_score": 0.0})
+                    m["source_domain"] = dom or ""
+                    m["provenance"] = prov or ""
+                    m["quality_score"] = float(qs or 0.0)
+            except Exception:
+                pass  # document_sources may not exist on older corpora
+        finally:
+            conn.close()
+        return meta
+
     # --- Backlog embedding: embed chunks already in store but not in LanceDB ---
     if lancedb_index and lancedb_embedding:
         import sqlite3 as _sqlite3
@@ -432,13 +463,14 @@ def main() -> None:
             _conn.close()
             if _backlog:
                 print(f"  Backlog: {len(_backlog)} chunks to embed (from previous runs)...")
+                _doc_meta = _lance_doc_meta(corpus)
                 _bs = args.lancedb_batch_size
                 for _i in range(0, len(_backlog), _bs):
                     _batch = _backlog[_i:_i + _bs]
                     _chunks = [DocumentChunk(chunk_id=r[0], document_id=r[1], text=r[2], content_hash=r[3]) for r in _batch]
                     _texts = [c.text for c in _chunks]
                     _vectors, _sparse = lancedb_embedding.embed_texts_hybrid(_texts)
-                    lancedb_index.add_chunks(_chunks, _vectors, sparse_weights=_sparse)
+                    lancedb_index.add_chunks(_chunks, _vectors, sparse_weights=_sparse, doc_meta=_doc_meta)
                     _done = _i + len(_batch)
                     print(f"    [backlog] {_done}/{len(_backlog)} â†’ {lancedb_index._table.count_rows()} rows", flush=True)
                 print(f"  Backlog complete: {lancedb_index._table.count_rows()} total rows")
@@ -540,12 +572,13 @@ def main() -> None:
                             _new = [r for r in _doc_chunks if r[0] not in _existing]
                             if _new:
                                 _batch_size = args.lancedb_batch_size
+                                _doc_meta = _lance_doc_meta(corpus)
                                 for _i in range(0, len(_new), _batch_size):
                                     _batch = _new[_i:_i + _batch_size]
                                     _chunks = [DocumentChunk(chunk_id=r[0], document_id=r[1], text=r[2], content_hash=r[3]) for r in _batch]
                                     _texts = [c.text for c in _chunks]
                                     _vectors, _sparse = lancedb_embedding.embed_texts_hybrid(_texts)
-                                    lancedb_index.add_chunks(_chunks, _vectors, sparse_weights=_sparse)
+                                    lancedb_index.add_chunks(_chunks, _vectors, sparse_weights=_sparse, doc_meta=_doc_meta)
                                 print(f"    [LanceDB incremental] +{len(_new)} chunks â†’ {lancedb_index._table.count_rows()} total rows")
                     except Exception as e:
                         print(f"    [LanceDB incremental] ERROR: {e}")

@@ -19,6 +19,7 @@ Model: BAAI/bge-reranker-v2-m3
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,86 @@ from ipa.contracts import SearchHit
 
 
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+
+# Env gates (rerank ON by default — measured in E10-rerank: +20.5pp recall@1
+# on lancedb_hybrid for ~+0.65s/query GPU, ~+0.7s/query on the CPU fallback):
+#   IPA_RERANK=0            opt-out — disables reranking in the retrieval paths
+#   IPA_RERANK_DEVICE       auto|cuda|cpu (default auto)
+#   IPA_RERANK_MIN_FREE_MB  min free VRAM to run on GPU (default 2048) else CPU
+
+
+def rerank_enabled() -> bool:
+    return os.environ.get("IPA_RERANK", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def physical_free_vram_mb() -> float | None:
+    """VRAM libre física según el driver (nvidia-smi).
+
+    torch.cuda.mem_get_info() sobreestima en Windows/WDDM (cuenta la memoria
+    compartida del sistema como libre): con el LLM ocupando ~4.5 GB reporta
+    ~5 GB libres y el gate mandaría el reranker a GPU igual. None si
+    nvidia-smi no está disponible (el caller cae a mem_get_info).
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        used, total = (
+            float(x) for x in out.stdout.strip().splitlines()[0].split(",")
+        )
+        return total - used
+    except Exception:
+        return None
+
+
+_SHARED_RERANKER: "RerankerAdapter | None" = None
+
+
+def get_shared_reranker() -> "RerankerAdapter":
+    """Process-wide lazy singleton — the model is ~2.1 GB, load it once."""
+    global _SHARED_RERANKER
+    if _SHARED_RERANKER is None:
+        _SHARED_RERANKER = RerankerAdapter(
+            device=os.environ.get("IPA_RERANK_DEVICE", "auto")
+        )
+    return _SHARED_RERANKER
+
+
+def maybe_rerank(
+    query: str,
+    items: list[dict[str, Any]],
+    top_k: int,
+    *,
+    text_key: str = "text",
+) -> list[dict[str, Any]]:
+    """Rerank a list of hit dicts unless IPA_RERANK=0; passthrough otherwise.
+
+    Each item needs a text field (text_key) and keeps its original payload —
+    only the order and the score change (score becomes the cross-encoder
+    score, and 'reranked': True marks the ordering provenance).
+    """
+    if not rerank_enabled() or not items:
+        return items[:top_k]
+    try:
+        cands = [
+            RerankCandidate(
+                chunk_id=str(i),
+                text=str(it.get(text_key) or ""),
+                score=float(it.get("score") or 0.0),
+            )
+            for i, it in enumerate(items)
+        ]
+        ranked = get_shared_reranker().rerank(query, cands, top_k=top_k)
+        return [
+            {**items[int(c.chunk_id)], "score": round(c.score, 4), "reranked": True}
+            for c in ranked
+        ]
+    except Exception:
+        return items[:top_k]
 
 
 @dataclass(frozen=True)
@@ -85,8 +166,18 @@ class RerankerAdapter:
         try:
             import torch
             if torch.cuda.is_available():
-                return "cuda"
-        except ImportError:
+                # VRAM headroom gate: the chat LLM owns the GPU — run the
+                # reranker on CPU when there isn't room, rather than
+                # contending for VRAM mid-conversation. Usa la VRAM física
+                # (nvidia-smi): mem_get_info sobreestima en WDDM y el gate
+                # mandaría el reranker a GPU con el LLM cargado.
+                min_free_mb = float(os.environ.get("IPA_RERANK_MIN_FREE_MB", "2048"))
+                free_mb = physical_free_vram_mb()
+                if free_mb is None:
+                    free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+                if free_mb >= min_free_mb:
+                    return "cuda"
+        except Exception:
             pass
         return "cpu"
 
@@ -95,6 +186,7 @@ class RerankerAdapter:
             return
         from FlagEmbedding import FlagReranker
         self._device_resolved = self._resolve_device()
+        print(f"[rerank] cross-encoder loading on {self._device_resolved}", flush=True)
         fp16 = self.use_fp16 and self._device_resolved == "cuda"
         self._model = FlagReranker(
             self.model_name,

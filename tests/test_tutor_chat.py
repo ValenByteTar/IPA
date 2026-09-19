@@ -207,6 +207,56 @@ def test_debate_reproposes_and_supersedes(env):
     assert new.previous_roadmap_id == first_id
 
 
+def test_debate_reply_has_single_heading(env):
+    """El reply del debate tiene un solo encabezado — no 'Roadmap revisado
+    (v2)...' seguido de 'Roadmap propuesto:'."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    driver.handle(core, "s1", "quiero aprender RAG", provider,
+                  retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    provider2 = FakeProvider(responses=[_roadmap_json("doc:c", "doc:b", "doc:a")])
+    out2 = driver.handle(core, "s1", "más práctica", provider2,
+                         retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    assert out2["reply"].count("Roadmap") == 1
+
+
+def test_diagnosis_reply_no_double_period_no_policy_leak(env):
+    """El diagnóstico que ve el alumno no contiene '..' ni la instrucción de
+    policy del LLM ('Comenzá con un diagnóstico antes de explicar')."""
+    core, store, driver = env
+    out = driver.handle(
+        core, "s1", "quiero aprender transformers",
+        FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")]),
+        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"),
+    )
+    assert ".." not in out["reply"]
+    assert "Comenzá con un diagnóstico" not in out["reply"]
+
+
+def test_topic_mismatch_adds_transparency_note(env):
+    """Si ningún hit del corpus menciona el tema pedido, el reply lo dice:
+    las unidades salen del material más cercano y el alumno puede corregir
+    el rumbo antes de aprobar."""
+    core, store, driver = env
+    out = driver.handle(
+        core, "s1", "quiero aprender a2a",
+        FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")]),
+        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"),  # texto sin "a2a"
+    )
+    assert "no menciona" in out["reply"]
+    # Con material que sí menciona el tema, la nota no aparece.
+    out2 = driver.handle(
+        core, "s2", "quiero aprender transformers",
+        FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")]),
+        retrieve=lambda q: [
+            {"document_id": d, "text": f"todo sobre transformers en {d}",
+             "source_domain": "example.com"}
+            for d in ("doc:a", "doc:b", "doc:c")
+        ],
+    )
+    assert "no menciona" not in out2["reply"]
+
+
 def test_roadmap_gate_by_typed_approval(env):
     core, store, driver = env
     provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
@@ -230,6 +280,90 @@ def test_roadmap_gate_by_button_endpoint(env):
     assert driver.state("s1").phase == "active"
 
 
+def test_focus_adopts_across_sessions(env):
+    """Activar un roadmap (o enfocarlo desde la card) deja foco persistente:
+    una sesión NUEVA que escribe 'dale' sin tema adopta ese roadmap y sigue
+    la lección — no vuelve a preguntar qué querés aprender."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s1", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+    driver.decide_roadmap("s1", rid, "approve")
+    assert store.get_focus() == rid  # activar ES indicar foco
+
+    # Sesión NUEVA (otra conversación): 'dale' sin tema → adopta el foco.
+    out2 = driver.handle(core, "s2", "dale", FakeProvider())
+    st2 = driver.state("s2")
+    assert st2.phase == "active"
+    assert st2.roadmap_id == rid
+    assert "rag" in st2.topic.lower()
+
+    # El indicador del chat refleja el foco con unidad y avance.
+    info = driver.get_focus("s2")
+    assert info["ok"] and info["focus"]["roadmap_id"] == rid
+    assert info["focus"]["unit_current"] == 1
+    assert info["focus"]["unit_total"] == 3
+
+
+def test_focus_roadmap_points_session_and_persists(env):
+    """Click en la card → la sesión actual adopta el roadmap y el foco
+    global queda persistido para otras sesiones."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s1", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+    driver.decide_roadmap("s1", rid, "approve")
+
+    res = driver.focus_roadmap("s2", rid)
+    assert res["ok"]
+    assert res["focus"]["roadmap_id"] == rid
+    assert res["focus"]["topic"] == "rag"
+    assert res["focus"]["unit_current"] == 1
+    assert store.get_focus() == rid
+    # La sesión enfocada quedó en modo lección.
+    assert driver.state("s2").phase == "active"
+    # get_focus de una sesión fresca cae al foco global.
+    fresh = driver.get_focus("s-nueva")
+    assert fresh["focus"]["roadmap_id"] == rid
+
+
+def test_unfocus_roadmap_unpins_session_and_global(env):
+    """El × del chip: desadopta la sesión y limpia el foco global si apuntaba
+    a ese roadmap. El topic se conserva — la sesión no vuelve a pedir tema."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s1", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+    driver.decide_roadmap("s1", rid, "approve")
+    assert store.get_focus() == rid
+
+    res = driver.unfocus_roadmap("s1", rid)
+    assert res["ok"] and res["focus"] is None
+    assert store.get_focus() is None
+    assert store.get_session_roadmap("s1") is None
+    st = driver.state("s1")
+    assert st.roadmap_id is None
+    assert st.phase == "active"  # topic conservado, no vuelve a "idle"
+    assert st.topic_id == "rag"
+
+
+def test_reject_clears_focus(env):
+    """Rechazar el roadmap enfocado limpia el foco — no queda apuntando a
+    un roadmap muerto."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s1", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+    driver.decide_roadmap("s1", rid, "approve")
+    assert store.get_focus() == rid
+    driver.decide_roadmap("s1", rid, "reject")
+    assert store.get_focus() is None
+
+
 def test_roadmap_rejection_returns_to_idle(env):
     core, store, driver = env
     provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
@@ -240,6 +374,44 @@ def test_roadmap_rejection_returns_to_idle(env):
     assert res["ok"] and res["status"] == "rejected"
     st = driver.state("s1")
     assert st.phase == "idle" and st.roadmap_id is None
+
+
+def test_sidebar_gate_cycle_reject_then_reopen(env):
+    """The interactive badge can move a roadmap rejected → proposed → accepted."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s1", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+
+    res = driver.decide_roadmap("s1", rid, "reject")
+    assert res["ok"] and res["status"] == "rejected"
+    assert driver.state("s1").phase == "idle"
+
+    res = driver.decide_roadmap("s1", rid, "proposed")
+    assert res["ok"] and res["status"] == "proposed"
+    st = driver.state("s1")
+    assert st.phase == "roadmap_proposed" and st.roadmap_id == rid
+    assert store.get_roadmap(rid).status.value == "proposed"
+
+    res = driver.decide_roadmap("s1", rid, "approve")
+    assert res["ok"] and res["status"] == "active"
+    assert driver.state("s1").phase == "active"
+    assert store.get_roadmap(rid).status.value == "active"
+
+
+def test_sidebar_gate_retargets_session(env):
+    """Accepting a roadmap from the sidebar points the session at it."""
+    core, store, driver = env
+    provider = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    out = driver.handle(core, "s2", "quiero aprender RAG", provider,
+                        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    rid = out["roadmap_proposal"]["roadmap_id"]
+    res = driver.decide_roadmap("s1", rid, "approve")
+    assert res["ok"] and res["status"] == "active"
+    st1 = driver.state("s1")
+    assert st1.phase == "active" and st1.roadmap_id == rid
+    assert st1.topic_id == "rag"
 
 
 def test_insufficient_concepts_proposes_research(env):

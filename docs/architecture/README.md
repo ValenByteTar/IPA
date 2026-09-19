@@ -7,5 +7,10 @@ reports.
 - `system-overview.md` — current platform and lifecycle.
 - `boundaries.md` — ownership between materialization, runtime, Reporter, Tutor and EKS.
 - `runtime-map.md` — execution/data-flow map and public entrypoints.
-- `github-surface.md` — what is public versus local/externalized.
+- `agent-runtime.md` — agent core, memory, idle scheduler, cognitive layer, MCP boundary.
+- `retrieval.md` — hybrid retrieval pipeline, LanceDB metadata, rerank gate.
+- `tutor.md` — Tutor contracts, roadmap gate, focus, unit progress, lessons.
+- `reporter.md` — Reporter pipeline and decoupled promotion.
 - `dashboard.md` — dashboard state, HTTP API, jobs and orchestration modules.
+- `github-surface.md` — what is public versus local/externalized.
+- `migration-status.md` — migration state of the orchestration surface.
