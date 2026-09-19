@@ -1373,9 +1373,12 @@ function sendAgentText(text){
 }
 // ── Quote-reply: seleccionar texto del chat lo cita en el input ─────────
 // Seleccionar dentro de #chat-messages muestra un botón flotante "Citar";
-// al usarlo, el texto se inserta como cita (> ...) en #agent-chat-input y
-// el usuario escribe su respuesta debajo — el agente la recibe como parte
-// del prompt.
+// al usarlo se inserta un puntero compacto — las primeras palabras del
+// pasaje, NO el texto completo. El usuario marca qué sección del chat debe
+// mirar el agente y escribe su pedido debajo. El snippet es literal, así
+// que además sirve como clave para recall_conversation (filtro substring).
+const QUOTE_MAX_WORDS=3;
+const QUOTE_MAX_CHARS=20;
 let _quoteBtn=null;
 function _hideQuoteBtn(){if(_quoteBtn){_quoteBtn.remove();_quoteBtn=null}}
 window.addEventListener('scroll',_hideQuoteBtn,true);
@@ -1404,16 +1407,25 @@ document.addEventListener('selectionchange',()=>{
     _quoteBtn.style.top=Math.max(8,r.top-36)+'px';
   },10);
 });
+function quoteSnippet(txt){
+  const words=txt.split(' ').filter(Boolean);
+  let cut=words.length>QUOTE_MAX_WORDS;
+  let s=words.slice(0,QUOTE_MAX_WORDS).join(' ');
+  if(s.length>QUOTE_MAX_CHARS){s=s.slice(0,QUOTE_MAX_CHARS).trimEnd();cut=true}
+  return cut?s+'…':s;
+}
 function quoteSelection(){
   const sel=window.getSelection();
-  let txt=sel?sel.toString().replace(/\s+/g,' ').trim():'';
+  const txt=sel?sel.toString().replace(/\s+/g,' ').trim():'';
   if(!txt)return;
-  if(txt.length>400)txt=txt.slice(0,397)+'…';
+  const snippet=quoteSnippet(txt);
   const input=$('#agent-chat-input');
   if(input){
-    // El input es type=text (sin saltos): marcador explícito en una línea —
-    // el agente lo lee como material citado, no como palabras del alumno.
-    input.value='[respondiendo a: «'+txt+'»] '+(input.value||'');
+    // El input es type=text (sin saltos): puntero explícito en una línea —
+    // el agente lo lee como referencia al pasaje citado, no como palabras
+    // del usuario. Corto para que el chat quede legible: el agente puede
+    // recuperar el episodio completo con recall_conversation(query=snippet).
+    input.value='[cita: «'+snippet+'»] '+(input.value||'');
     input.focus();
     input.setSelectionRange(input.value.length,input.value.length);
   }

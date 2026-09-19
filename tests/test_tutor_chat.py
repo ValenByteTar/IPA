@@ -447,6 +447,108 @@ def test_research_gate_typed_approval_and_reject(env):
     assert store.get_research_request(rid2).status.value == "cancelled"
 
 
+def test_awaiting_topic_accepts_bare_answer(env):
+    """Bug real (2026-09-19): 'hagamos un roadmap' → el Tutor pregunta el
+    tema → la respuesta literal 'De X a Y' no matcheaba la regex imperativa
+    y volvía a preguntar en loop. awaiting_topic la acepta como tema."""
+    core, store, driver = env
+    out = driver.handle(core, "s1", "hagamos un roadmap muy completo", FakeProvider())
+    assert "aprender" in out["reply"].lower()
+    assert driver.state("s1").awaiting_topic is True
+    driver.handle(
+        core, "s1", "De IA Engineer Senior a CTO en etapas tempranas",
+        FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")]),
+        retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"),
+    )
+    st = driver.state("s1")
+    assert st.awaiting_topic is False
+    assert st.topic == "IA Engineer Senior a CTO en etapas tempranas"
+    assert st.phase == "roadmap_proposed"
+
+
+def test_awaiting_topic_ignores_commands_and_questions(env):
+    """'hola', 'dale' o una pregunta de vuelta no son temas — sigue
+    preguntando en vez de adoptar basura como tema."""
+    core, store, driver = env
+    driver.handle(core, "s1", "hagamos un roadmap", FakeProvider())
+    for msg in ("hola", "dale", "¿qué temas hay?", "hagamos otro roadmap"):
+        out = driver.handle(core, "s1", msg, FakeProvider())
+        assert "aprender" in out["reply"].lower()
+    assert driver.state("s1").awaiting_topic is True
+
+
+def test_roadmap_intent_uses_topic_from_context(env):
+    """'hagamos un roadmap' sin tema → el contexto reciente lo provee:
+    una cita a la propuesta previa que contenía el tema adentro."""
+    core, store, driver = env
+    core.memory.open_session(
+        interface="dashboard", role="tutor",
+        identity_hash=core.identity.identity_hash, session_id="s1",
+    )
+    core.memory.record_episode(
+        "s1", turn_role="user",
+        content="[respondiendo a: «¿te gustaría que investiguemos cómo se "
+                "estructura típicamente la transición de ingeniero senior a "
+                "CTO en etapas tempranas»]",
+        identity_hash=core.identity.identity_hash,
+    )
+    driver.handle(
+        core, "s1", "mejor hagamos un roadmap muy completo", FakeProvider(),
+        retrieve=lambda q: _hits("doc:a"),
+    )
+    st = driver.state("s1")
+    assert st.topic == "ingeniero senior a CTO en etapas tempranas"
+    assert st.phase == "research_pending"
+
+
+def test_url_limit_flows_to_research_budget(env):
+    """'límite de 20 URLs' en el pedido → budget.max_urls del
+    research_request, con dominios amplios (el default tech-only del
+    runtime no sirve para temas generales)."""
+    core, store, driver = env
+    driver.handle(core, "s1", "hagamos un roadmap con límite de 20 URLs", FakeProvider())
+    out = driver.handle(
+        core, "s1", "liderazgo técnico en startups", FakeProvider(),
+        retrieve=lambda q: _hits("doc:a"),
+    )
+    req = store.get_research_request(out["research_proposal"]["request_id"])
+    assert req.budget.max_urls == 20
+    assert req.budget.max_seconds >= 800  # el tiempo escala con el volumen
+    assert "wikipedia.org" in req.allowed_domains
+    assert "hbr.org" in req.allowed_domains
+
+
+def test_citation_only_approves_roadmap_gate(env):
+    """Una respuesta solo-cita a la propuesta = aceptación (regla de
+    identidad): activa el roadmap, no entra en modo debate."""
+    core, store, driver = env
+    p = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])
+    driver.handle(core, "s1", "quiero aprender RAG", p,
+                  retrieve=lambda q: _hits("doc:a", "doc:b", "doc:c"))
+    assert driver.state("s1").phase == "roadmap_proposed"
+    out = driver.handle(
+        core, "s1", "[respondiendo a: «Aprobá o rechazá el roadmap»]",
+        FakeProvider(),
+    )
+    assert driver.state("s1").phase == "active"
+    assert "activo" in out["reply"].lower()
+
+
+def test_citation_only_approves_research_gate(env):
+    """Misma regla en el gate de investigación: cita sola = aprobada."""
+    core, store, driver = env
+    out = driver.handle(core, "s1", "quiero aprender cocina molecular",
+                        FakeProvider(), retrieve=lambda q: _hits("doc:a"))
+    assert out["research_proposal"] is not None
+    out2 = driver.handle(
+        core, "s1", "[cita: «Propongo una investigación web primero»]",
+        FakeProvider(),
+    )
+    rid = out["research_proposal"]["request_id"]
+    assert "aprobada" in out2["reply"].lower()
+    assert store.get_research_request(rid).status.value == "approved"
+
+
 def test_parallel_sessions_have_independent_state(env):
     core, store, driver = env
     p1 = FakeProvider(responses=[_roadmap_json("doc:a", "doc:b", "doc:c")])

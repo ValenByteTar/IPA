@@ -42,7 +42,7 @@ _DOCKER_DESKTOP_CANDIDATES = [
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
-def _ps_processes(matching: str) -> list[tuple[int, str]]:
+def _ps_processes(matching: str, name_like: str = "python%") -> list[tuple[int, str]]:
     """(pid, command_line) for processes whose cmdline contains `matching`.
 
     Uses Get-CimInstance — wmic is deprecated and absent on modern Windows,
@@ -51,7 +51,7 @@ def _ps_processes(matching: str) -> list[tuple[int, str]]:
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+             f"Get-CimInstance Win32_Process -Filter \"Name like '{name_like}'\" | "
              "Select-Object ProcessId,CommandLine | "
              "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
             capture_output=True, text=True, timeout=15,
@@ -146,6 +146,35 @@ def _compose_up() -> tuple[bool, str]:
         return False, str(exc)[:300]
 
 
+def _ollama_api_up(timeout: float = 3.0) -> bool:
+    url = os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434")
+    try:
+        with urllib.request.urlopen(f"{url}/api/version", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def sweep_orphan_llama_servers(state: dict) -> None:
+    """Mata llama-server.exe huérfanos cuando la API de Ollama está caída.
+
+    Hallazgo real: al matar/reiniciar Ollama, los runners llama-server
+    sobreviven al padre y retienen GB de VRAM — el auto-fit del próximo
+    arranque ve esa VRAM ocupada y manda la mitad del modelo a CPU
+    (18/34 capas → 10 tok/s en vez de 30/34 → 20 tok/s). Solo actúa si la
+    API no responde: con Ollama vivo, sus runners son legítimos.
+    """
+    if _ollama_api_up():
+        state["ollama_was_up"] = True
+        return
+    if state.get("ollama_was_up"):
+        print("[watchdog] Ollama API is down — sweeping orphan llama-server runners", flush=True)
+        state["ollama_was_up"] = False
+    for pid, cmd in _ps_processes("llama-server", name_like="llama-server%"):
+        print(f"[watchdog] Killing orphan llama-server PID {pid}", flush=True)
+        kill_pid(pid)
+
+
 def ensure_searxng(state: dict) -> None:
     """Keep local SearXNG alive: start Docker Desktop if needed, compose up.
 
@@ -186,16 +215,50 @@ def ensure_searxng(state: dict) -> None:
         print(f"[watchdog] SearXNG compose up failed: {err}", flush=True)
 
 
-def watchdog_already_running() -> bool:
-    """True if the recorded watchdog PID is alive and still a watchdog."""
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
-        pid = int(WATCHDOG_PID_FILE.read_text().strip())
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
+        ).stdout
+        return str(pid) in out
     except Exception:
         return False
-    if pid == os.getpid():
-        return False
-    return any(p == pid and "dashboard_watchdog" in cmd
-               for p, cmd in _ps_processes("dashboard_watchdog"))
+
+
+def claim_watchdog_slot() -> bool:
+    """Reclama el slot de watchdog de forma ATÓMICA (O_EXCL sobre el pid file).
+
+    Dos problemas resueltos acá:
+      - Antes se leía el pid file y se decidía: dos arranques casi simultáneos
+        (launcher + /api/restart) lo pasaban los dos → watchdogs duplicados.
+      - El escaneo de procesos NO sirve en este venv: python.exe es un
+        trampolín que spawnea el intérprete real, así que PowerShell reporta
+        el padre y os.getpid() el hijo → el watchdog se veía a sí mismo como
+        "otro watchdog" y salía.
+    Un pid file de un proceso muerto se reclama solo.
+    """
+    WATCHDOG_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(WATCHDOG_PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                pid = int(WATCHDOG_PID_FILE.read_text().strip())
+            except Exception:
+                pid = -1
+            if pid > 0 and pid != os.getpid() and _pid_alive(pid):
+                return False
+            try:
+                WATCHDOG_PID_FILE.unlink()
+            except Exception:
+                return False
+    return False
 
 
 def kill_pid(pid: int) -> bool:
@@ -218,6 +281,14 @@ def launch_dashboard(host: str, port: int) -> subprocess.Popen | None:
         # Default the research web-search backend to the managed local SearXNG
         # (ensure_searxng keeps it alive). Explicit IPA_SEARXNG_URL wins.
         "IPA_SEARXNG_URL": os.environ.get("IPA_SEARXNG_URL", SEARXNG_URL_DEFAULT),
+        # KV cache cuantizado para el `ollama serve` que el dashboard pueda
+        # spawnar (hereda este env). q8_0 ≈ mitad de VRAM de KV vs fp16;
+        # OLLAMA_FLASH_ATTENTION=1 ya está seteada a nivel máquina.
+        "OLLAMA_KV_CACHE_TYPE": os.environ.get("OLLAMA_KV_CACHE_TYPE", "q8_0"),
+        # El provider manda num_gpu por request (IPA_OLLAMA_NUM_GPU): el
+        # auto-fit deja ~1.4 GB libres y manda media VRAM a CPU. 30/34 capas
+        # ≈ 2x decode en la RTX 4050. Vacío = auto.
+        "IPA_OLLAMA_NUM_GPU": os.environ.get("IPA_OLLAMA_NUM_GPU", "30"),
     }
     try:
         proc = subprocess.Popen(
@@ -265,6 +336,13 @@ def run_watchdog(host: str, port: int, interval: int) -> None:
     searxng_state: dict = {}
     searxng_interval = float(os.environ.get("IPA_SEARXNG_CHECK_INTERVAL", "60"))
     last_searxng_check = 0.0
+    # Grace de warmup: el dashboard carga BGE-M3 + el modelo estrella al
+    # arrancar (~1-2 min) y no bindea el puerto hasta terminar. Sin esta
+    # ventana, el watchdog lo mataba a los 15s y lo relanzaba en loop —
+    # cada ciclo recargaba los modelos (CPU/GPU al 100%) y apilaba
+    # dashboards. Bug real de lentitud.
+    grace_until = 0.0
+    grace_s = float(os.environ.get("IPA_WATCHDOG_GRACE_SECONDS", "240"))
     while True:
         now = time.time()
         if now - last_searxng_check >= searxng_interval:
@@ -272,9 +350,17 @@ def run_watchdog(host: str, port: int, interval: int) -> None:
                 ensure_searxng(searxng_state)
             except Exception as exc:
                 print(f"[watchdog] ensure_searxng error: {exc}", flush=True)
+            try:
+                sweep_orphan_llama_servers(searxng_state)
+            except Exception as exc:
+                print(f"[watchdog] sweep_orphan_llama_servers error: {exc}", flush=True)
             last_searxng_check = now
         if is_port_responding(host, port):
             consecutive_failures = 0
+            grace_until = 0.0
+        elif now < grace_until:
+            # Dentro de la ventana de warmup: no contar fallos ni reiniciar.
+            pass
         else:
             consecutive_failures += 1
             # 3 failed checks in a row before restarting — a single slow
@@ -283,6 +369,7 @@ def run_watchdog(host: str, port: int, interval: int) -> None:
                 print(f"[watchdog] Dashboard is down ({consecutive_failures} checks), restarting...", flush=True)
                 restart_dashboard(host, port)
                 last_launch_time = time.time()
+                grace_until = time.time() + grace_s
                 consecutive_failures = 0
             else:
                 print(f"[watchdog] Health check failed ({consecutive_failures}/3)", flush=True)
@@ -301,11 +388,9 @@ def main() -> None:
         ok = restart_dashboard(args.host, args.port)
         sys.exit(0 if ok else 1)
 
-    if watchdog_already_running():
+    if not claim_watchdog_slot():
         print("[watchdog] Another watchdog is already running — exiting.", flush=True)
         sys.exit(0)
-    WATCHDOG_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WATCHDOG_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
 
     try:
         run_watchdog(args.host, args.port, args.interval)

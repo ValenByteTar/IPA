@@ -77,6 +77,57 @@ py -3.12 -m venv .venv
 # Env: IPA_SEARXNG_URL defaults to http://127.0.0.1:8888 in watchdog/launcher;
 #      IPA_SEARXNG_MANAGED=0 disables watchdog management (e.g. remote instance).
 
+# Caches y VRAM (medido 2026-09; ver docs/USAGE.md §Caches y convivencia)
+# PT cache Ollama: prompt = [system inmutable] + [historia] + [volátil al tail]
+#   (evidencia RAG/memoria/catálogo). Medido 72-90% reuse/turno.
+#   Métrica directa: prompt_eval_cached_count en
+#   outputs/web_dashboard/logs/llm_perf.jsonl (una línea por generación).
+# PT cache ExL3: automático (hash de páginas del generator). TTFT 3.7s→0.34s.
+# Cache ExL3 roto: cache_tokens = max(context_length, mtp_cache_tokens) — el
+#   min() dejaba el cache en 4096 con ctx 6144 → prompts >4096 fallaban con
+#   "Job requires N pages" (salida vacía) o divagaban al cruzar el límite.
+# Caches de app: embeddings de query (IPA_EMBED_CACHE_SIZE), reranker
+#   (IPA_RERANK_CACHE_SIZE), retrieval TTL (IPA_RETRIEVAL_CACHE_*), tools
+#   read-only (IPA_TOOL_CACHE_TTL; get_system_status nunca), respuestas del
+#   chat opt-in (IPA_RESPONSE_CACHE=1, match exacto).
+# Lock de VRAM ExL3↔Ollama: outputs/agent/vram.lock. ExL3.load() descarga
+#   Ollama y toma el lock; el chat devuelve "GPU ocupada por exl3" mientras
+#   dura (en 6 GB no conviven: OOM en rep_pen.cu). Ollama solo lo respeta.
+# Batch ExL3 en 6 GB: batch 6 + ctx 6144 = OOM al cargar; con ctx 2048 el
+#   colapso era MTP, no páginas (17.5 vs 83.2 tok/s sin MTP). Sweet spot 3-4.
+# ExL3 en el pase Tier 2 profundo (EXP-008 §11):
+#   _t2_deep (≥30 min idle, IPA_IDLE_DEEP_ENRICHMENT=1 default) carga ExL3
+#   (IPA_T2_ENGINE=exl3, ctx 2048, batch 4) — es el único punto que ya pagaba
+#   el costo de cargar un modelo desde frío, así que el switch se amortiza
+#   sobre la cola. Split por longitud: labels + review (128 tok) van batched;
+#   cog_principles_llm (~500 tok) se saltea. Guard: batch > 2 → MTP off
+#   (medido: batch 6 con MTP 17.5 tok/s vs 83.2 sin MTP — realineación del
+#   speculative decoding; arXiv 2510.22876). Helper: ipa/agentic/batch_llm.py
+#   (generate_many: batch si el provider lo soporta, serial si no).
+#   Tarea enrich_chunks (prio 25, ipa/agentic/chunk_enrichment.py): ex-job
+#   "enrichment" del Orchestrator — corre sobre el 9B del pase, no carga su
+#   propio modelo. min_chars=400 (corpus ~512 chars uniformes; 800 → 0 cand).
+# Conmutación chat↔T2 (verificada): el provider del pase va marcado
+#   _t2_owned; un chat a mitad del pase lo descarga y monta el interactivo
+#   (~29s frío: unload + reload GGUF). El worker solo descarga si la
+#   instancia sigue siendo la suya (identidad + DEEP_DIVE_LOCK). El warmup
+#   del boot carga Ollama — el pase profundo lo baja antes de cargar ExL3
+#   (deep_done separado de level2_done).
+# Ollama num_keep: default llama.cpp = 4 → al llenarse el contexto el system
+#   prompt se evapora primero. El provider manda 2048 (IPA_OLLAMA_NUM_KEEP).
+# Scripts de medición: scripts/operations/_measure_llm.py (Ollama),
+#   _ollama_ab_test.py (sampler), _exl3_fatigue_test.py (drift/configs),
+#   _exl3_cache_fix_check.py, _exl3_prefix_check.py, _exl3_batch_tuning.py.
+
+# Research (research_topic): dedup + URLs explícitas
+#   Dedup para TODOS los llamados (no solo safety-net): query igual o muy
+#   parecida (contención de tokens >= 0.6, stopwords fuera) investigada en la
+#   ventana de 10 min -> no relanza, devuelve puntero al material ingerido.
+#   force=true fuerza. URLs en la query (o en el mensaje del usuario, que la
+#   tool reinyecta) se scrapean directo como seeds: saltean el snippet stage,
+#   pasan por scrape/calidad/juicio/ingesta. Query solo-URL deriva la búsqueda
+#   del slug. Con seeds, un fallo del backend de búsqueda no invalida la corrida.
+
 # Agent CLI (sessions, episodic memory, research)
 .venv/Scripts/python.exe scripts/cli/agent.py chat -m "mensaje"
 .venv/Scripts/python.exe scripts/cli/agent.py sessions
@@ -90,7 +141,7 @@ py -3.12 -m venv .venv
 
 # Dashboard (watchdog + Ollama are handled by the launcher)
 .venv/Scripts/python.exe scripts/operations/web_dashboard.py --host 127.0.0.1 --port 8765
-.\start_ipa_dashboard.bat            # one-click; -StartOrchestrator optional
+.\start_ipa_dashboard.bat            # one-click (el Orchestrator de consola está DEPRECADO)
 
 # Compile the ExLlamaV3 native extension (only after changing ExLlamaV3,
 # Python, PyTorch, CUDA or GPU)

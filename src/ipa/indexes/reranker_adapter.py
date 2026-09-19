@@ -19,7 +19,9 @@ Model: BAAI/bge-reranker-v2-m3
 """
 from __future__ import annotations
 
+import hashlib
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +35,65 @@ DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 #   IPA_RERANK=0            opt-out — disables reranking in the retrieval paths
 #   IPA_RERANK_DEVICE       auto|cuda|cpu (default auto)
 #   IPA_RERANK_MIN_FREE_MB  min free VRAM to run on GPU (default 2048) else CPU
+#   IPA_RERANK_CACHE_SIZE   entradas del cache query→ranking (default 128, 0 off)
+
+
+class _RerankCache:
+    """LRU de rankings (query + set de candidatos → orden).
+
+    El cross-encoder re-scorea los MISMOS chunks en queries repetidas o muy
+    similares (turnos seguidos del chat re-consultan lo mismo). La clave
+    incluye el hash del texto de los candidatos, así un corpus distinto no
+    reusa un ranking viejo.
+    """
+
+    def __init__(self, maxsize: int = 128) -> None:
+        self.maxsize = maxsize
+        self._data: OrderedDict[str, Any] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(query: str, texts: list[str], top_k: int) -> str:
+        h = hashlib.sha256()
+        h.update(query.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+        h.update(str(top_k).encode())
+        for t in texts:
+            h.update(b"\x01")
+            h.update(t[:400].encode("utf-8", "ignore"))
+        return h.hexdigest()
+
+    def get(self, key: str) -> Any | None:
+        if self.maxsize <= 0:
+            return None
+        if key in self._data:
+            self._data.move_to_end(key)
+            self.hits += 1
+            return self._data[key]
+        self.misses += 1
+        return None
+
+    def put(self, key: str, value: Any) -> None:
+        if self.maxsize <= 0:
+            return
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+    def stats(self) -> dict[str, int]:
+        return {"size": len(self._data), "maxsize": self.maxsize,
+                "hits": self.hits, "misses": self.misses}
+
+
+_rerank_cache = _RerankCache(
+    maxsize=int(os.environ.get("IPA_RERANK_CACHE_SIZE", "128") or 128))
+
+
+def rerank_cache_stats() -> dict[str, int]:
+    """Hits/misses del cache de reranking (observabilidad)."""
+    return _rerank_cache.stats()
 
 
 def rerank_enabled() -> bool:
@@ -92,6 +153,14 @@ def maybe_rerank(
     if not rerank_enabled() or not items:
         return items[:top_k]
     try:
+        texts = [str(it.get(text_key) or "") for it in items]
+        ckey = _rerank_cache.key(query, texts, top_k)
+        cached = _rerank_cache.get(ckey)
+        if cached is not None:
+            return [
+                {**items[idx], "score": score, "reranked": True}
+                for idx, score in cached
+            ]
         cands = [
             RerankCandidate(
                 chunk_id=str(i),
@@ -101,6 +170,7 @@ def maybe_rerank(
             for i, it in enumerate(items)
         ]
         ranked = get_shared_reranker().rerank(query, cands, top_k=top_k)
+        _rerank_cache.put(ckey, [(int(c.chunk_id), round(c.score, 4)) for c in ranked])
         return [
             {**items[int(c.chunk_id)], "score": round(c.score, 4), "reranked": True}
             for c in ranked

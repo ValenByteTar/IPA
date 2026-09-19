@@ -508,7 +508,16 @@ class Orchestrator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IPA Orchestrator.")
+    print(
+        f"{C.YELLOW}[DEPRECATED]{C.RESET} El pipeline del Orchestrator "
+        "(scraper → fast_path → lancedb → hammer → enrichment) está deprecado: "
+        "los jobs se lanzan desde el dashboard (run_ingestion, scraper, "
+        "reporter) y el trabajo LLM en background corre por el idle scheduler "
+        "(Tiers 1/2). Esta consola sigue funcionando por compatibilidad pero "
+        "no recibe nuevas funciones.",
+        flush=True,
+    )
+    parser = argparse.ArgumentParser(description="IPA Orchestrator (DEPRECATED).")
     parser.add_argument("--no-scraper", action="store_true")
     parser.add_argument("--no-pipeline", action="store_true")
     parser.add_argument("--no-lancedb", action="store_true")

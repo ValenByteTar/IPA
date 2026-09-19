@@ -32,16 +32,88 @@ DEFAULT_TUTOR_STORE = Path("outputs") / "agent" / "tutor.db"
 # ── deterministic matchers ────────────────────────────────────────────────
 
 # Topic detection: "quiero aprender X", "enseñame X", "un roadmap de X",
-# "estudiar X". The topic is the trailing phrase.
+# "estudiar X", "hagamos un roadmap (muy completo) de X",
+# "transición de X a Y", "quiero pasar de X a Y". El tema es la cola.
 _TOPIC_RE = re.compile(
     r"(?:quiero\s+(?:aprender|estudiar)|quisiera\s+(?:aprender|estudiar)|"
     r"me\s+gustar[ií]a\s+(?:aprender|estudiar)|"
     r"ense[ñn]ame|enseñame|aprendizaje\s+de|aprender\s+(?:sobre\s+)?|"
     r"estudiar\s+(?:sobre\s+)?|roadmap\s+(?:de|para|sobre)\s+|"
-    r"mapa\s+de\s+estudio\s+(?:de|sobre)\s+)"
+    r"mapa\s+de\s+estudio\s+(?:de|sobre)\s+|"
+    r"(?:hagamos|armemos|hacemos|armamos|hacer|armar|armame|arm[aá]me|"
+    r"haceme|hac[eé]me|crear|creame|cre[aá]me|dise[ñn]ar|dise[ñn]ame|"
+    r"necesito|quiero|quisiera)\s+(?:un\s+|una\s+|el\s+|la\s+)?"
+    r"(?:roadmap|plan\s+de\s+estudio|mapa\s+de\s+estudio|temario|ruta|plan)"
+    r"(?:\s+\w+){0,3}?\s+(?:de|sobre|para)\s+|"
+    r"transici[óo]n\s+de\s+|"
+    r"(?:quiero|quisiera|me\s+gustar[ií]a)\s+(?:pasar|ir|llegar|cambiar|"
+    r"transicionar|crecer)\s+de\s+)"
     r"(.+)",
     re.IGNORECASE,
 )
+
+# Límite de fuentes pedido por el usuario: "límite de 20 URLs", "20 fuentes".
+_URL_LIMIT_RE = re.compile(
+    r"(\d{1,3})\s*(?:urls?|enlaces|links?|fuentes|p[aá]ginas|sitios)\b",
+    re.IGNORECASE,
+)
+
+# Marcadores de cita del chat: [respondiendo a: «…»] (viejo) y [cita: «…»].
+_CITATION_RE = re.compile(r"«([^»]{4,500}?)»")
+
+# Mensaje que es SOLO una cita a la propuesta del agente, sin texto extra:
+# regla de identidad — citar mi propuesta sin agregar nada = aceptación.
+_CITATION_ONLY_RE = re.compile(
+    r"^\s*\[(?:respondiendo\s+a|cita)\s*:\s*«[^»]*»\]\s*$",
+    re.IGNORECASE,
+)
+
+# Pedido de roadmap/aprendizaje sin tema explícito → el tema puede estar
+# en el contexto reciente (cita a la propuesta, mensaje anterior).
+_ROADMAP_INTENT_RE = re.compile(
+    r"\b(?:roadmap|mapa\s+de\s+estudio|plan\s+de\s+estudio|temario|"
+    r"ruta\s+de\s+aprendizaje|lecci[óo]n|aprendizaje|aprender|estudiar|"
+    r"enseñame|curso)\b",
+    re.IGNORECASE,
+)
+
+# Respuestas que NO son un tema aunque lleguen tras la pregunta
+# (saludos, relleno, comandos de continuación).
+_NOT_A_TOPIC_RE = re.compile(
+    r"^\s*(?:no\s*sé|nose|nada|cualquiera|lo\s+que\s+sea|dale|segu[ií]|"
+    r"continu[aá]|bueno|bueh|ok|vale|mmm?|eh+|como\s+quieras|da\s+igual|"
+    r"el\s+que\s+sea|lo\s+de\s+antes|eso|ese|hola|buenas|hey|gracias|"
+    r"buen\s+d[ií]a|buenas\s+(?:tardes|noches))[\s\w,.¡!]*$",
+    re.IGNORECASE,
+)
+
+# Andamiaje interrogativo dentro de una cita: el tema suele estar en la
+# cola tras el último marcador ("¿te gustaría que investiguemos cómo se
+# estructura típicamente la transición de X" → "X").
+_CITATION_BOUNDARY_RE = re.compile(
+    r"\b(?:te\s+gustar[íi]a|quer[íi]as|quisieras|investiguemos|investigar|"
+    r"investigaci[óo]n|cómo|como|qué|estructura(?:mos|r)?|típicamente|"
+    r"tipicamente|normalmente|usualmente|generalmente|explicame|contame|"
+    r"hablame|sobre|acerca\s+de|aprender|estudiar|transici[óo]n|"
+    r"me\s+gusta)\b",
+    re.IGNORECASE,
+)
+
+# Dominios permitidos para la investigación del Tutor: el default del
+# runtime (docs de programación) no sirve para temas generales. El gate
+# humano es la aprobación real; esta lista solo sesga hacia fuentes de
+# calidad (substring-match contra el dominio del resultado).
+_TUTOR_RESEARCH_DOMAINS = [
+    "docs.python.org", "arxiv.org", "github.com", "wikipedia.org",
+    "britannica.com", "stackoverflow.com", "stackexchange.com",
+    "coursera.org", "edx.org", "mit.edu", "stanford.edu", "nature.com",
+    "sciencedirect.com", "springer.com", "ieee.org", "acm.org",
+    "hbr.org", "forbes.com", "economist.com", "bbc.com", "nytimes.com",
+    "techcrunch.com", "wired.com", "medium.com", "substack.com",
+    "ycombinator.com", "firstround.com", "a16z.com", "fastcompany.com",
+    "inc.com", "entrepreneur.com", "youtube.com", "ted.com",
+    "com.ar", "clarin.com", "lanacion.com.ar",
+]
 
 # Instruction tail: "MTP, armame un roadmap de 6 fases" — the artifact
 # request is a constraint on the roadmap, not part of the topic.
@@ -136,6 +208,12 @@ class TutorChatState:
     phase: str = "idle"  # idle | roadmap_proposed | active | research_pending
     pending_request_id: str | None = None
     requested_units: int | None = None
+    # True tras emitir "¿Qué querés aprender?": el próximo mensaje que no
+    # sea comando/pregunta se toma como el tema literal (la respuesta a
+    # la pregunta). Rompe el loop de la regex imperativa.
+    awaiting_topic: bool = False
+    # "límite de N URLs" pedido por el usuario → budget del research_request.
+    requested_max_urls: int | None = None
 
 
 class TutorChatDriver:
@@ -227,7 +305,7 @@ class TutorChatDriver:
         m = _TOPIC_RE.search(message.strip())
         if not m:
             return None
-        topic = m.group(m.lastindex).strip().rstrip("?.!").strip()
+        topic = m.group(m.lastindex).strip().rstrip("?.!»]").strip()
         # "punto de partida N" / "desde cero" es contexto del alumno, no tema.
         topic = re.sub(
             r"[,\s]+(?:punto\s+de\s+partida\s+\S+|desde\s+cero|empezando\s+de\s+cero)\s*$",
@@ -235,7 +313,14 @@ class TutorChatDriver:
         ).strip()
         # "armame un roadmap de N fases" es una instrucción del artefacto.
         topic = _INSTRUCTION_TAIL_RE.sub("", topic).strip().rstrip(",")
+        # "roadmap con límite de 20 URLs" — el límite de fuentes es un
+        # parámetro del research, no parte del tema.
+        topic = _URL_LIMIT_RE.sub("", topic).strip().rstrip(",;.")
+        topic = re.sub(r"\s+(?:de|del|con|para|sobre|en)\s*$", "", topic, flags=re.IGNORECASE).strip()
         topic = re.sub(r"^(?:sobre|de|acerca\s+de|el|la|los|las)\s+", "", topic, flags=re.IGNORECASE)
+        # "roadmap de 6 fases" → "6 fases" es un conteo de unidades, no tema.
+        if re.fullmatch(r"\d{1,2}\s*(?:fases?|pasos?|unidades|etapas?)", topic, flags=re.IGNORECASE):
+            return None
         return topic[:120] or None
 
     @staticmethod
@@ -246,6 +331,87 @@ class TutorChatDriver:
             return None
         n = int(m.group(1))
         return n if 2 <= n <= 12 else None
+
+    @staticmethod
+    def _detect_url_limit(message: str) -> int | None:
+        """'límite de 20 URLs' / '20 fuentes' → 20. Clamped 1-100."""
+        m = _URL_LIMIT_RE.search(message)
+        if not m:
+            return None
+        n = int(m.group(1))
+        return n if 1 <= n <= 100 else None
+
+    @staticmethod
+    def _roadmap_intent(message: str) -> bool:
+        return bool(_ROADMAP_INTENT_RE.search(message))
+
+    def _topic_from_citation(self, payload: str) -> str | None:
+        """Extrae el tema del interior de una cita: el andamiaje de la
+        propuesta citada ("¿te gustaría que investiguemos…") se corta en
+        el último marcador — la cola suele ser el tema literal."""
+        text = payload.strip().rstrip("…?.!").strip()
+        if not text:
+            return None
+        topic = self._detect_topic(text)
+        if topic:
+            return topic
+        matches = list(_CITATION_BOUNDARY_RE.finditer(text))
+        tail = text[matches[-1].end():] if matches else text
+        tail = re.sub(
+            r"^(?:es|son|sobre|de|del|acerca\s+de|el|la|los|las|un|una|se)\s+",
+            "", tail.strip(), flags=re.IGNORECASE,
+        ).strip().rstrip(",;.:")
+        words = tail.split()
+        if len(tail) < 8 or len(words) < 2:
+            return None
+        return tail[:120]
+
+    def _topic_from_answer(self, message: str) -> str | None:
+        """El usuario está respondiendo "¿Qué querés aprender?": el mensaje
+        literal ES el tema — no exigir la frase imperativa. Comandos,
+        preguntas y nuevos pedidos de roadmap no son temas."""
+        text = message.strip()
+        if (not text or _APPROVE_RE.match(text) or _REJECT_RE.match(text)
+                or _NOT_A_TOPIC_RE.match(text)
+                or text.startswith("¿") or text.endswith("?")):
+            return None
+        m = _CITATION_RE.search(text)
+        if m:
+            return self._topic_from_citation(m.group(1))
+        if self._roadmap_intent(text):
+            return None  # nuevo pedido sin tema: seguir esperando el tema
+        if len(text) > 200:
+            return None
+        topic = re.sub(
+            r"^(?:sobre|de|acerca\s+de|el|la|los|las|un|una)\s+", "",
+            text, flags=re.IGNORECASE,
+        ).strip().rstrip("?.!")
+        return topic[:120] if len(topic) >= 4 else None
+
+    def _topic_from_context(self, core: Any, session_id: str) -> str | None:
+        """El pedido de roadmap llegó sin tema: buscar en los últimos
+        mensajes del usuario (p. ej. una cita a la propuesta anterior)."""
+        try:
+            eps = core.memory.get_episodes(session_id, limit=40)
+        except Exception:
+            return None
+        seen = 0
+        for ep in reversed(eps):
+            if getattr(ep, "turn_role", "") != "user":
+                continue
+            seen += 1
+            if seen > 6:
+                break
+            text = getattr(ep, "content", "") or ""
+            topic = self._detect_topic(text)
+            if topic:
+                return topic
+            m = _CITATION_RE.search(text)
+            if m:
+                topic = self._topic_from_citation(m.group(1))
+                if topic:
+                    return topic
+        return None
 
     def _concepts_from_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Corpus hits → concept candidates for roadmap proposal."""
@@ -390,6 +556,15 @@ class TutorChatDriver:
         """
         st = self.state(session_id)
         out: dict[str, Any] = {"reply": "", "roadmap_proposal": None, "research_proposal": None}
+        # Preferencias persistentes de la sesión: "límite de N URLs" y
+        # "roadmap de M fases" aplican aunque el tema llegue en otro
+        # mensaje (el flujo pregunta el tema por separado).
+        _nu = self._detect_url_limit(message)
+        if _nu:
+            st.requested_max_urls = _nu
+        _nunits = self._detect_unit_count(message)
+        if _nunits:
+            st.requested_units = _nunits
 
         with self._store() as store:
             session = TutorSession(core=core, store=store, provider=_tutor_provider(provider))
@@ -416,7 +591,9 @@ class TutorChatDriver:
                 except Exception:
                     pass
             if st.phase == "research_pending":
-                if st.pending_request_id and _APPROVE_RE.match(message):
+                if st.pending_request_id and (
+                    _APPROVE_RE.match(message) or _CITATION_ONLY_RE.match(message)
+                ):
                     res = self.decide_research(session_id, st.pending_request_id, "approve")
                     out["reply"] = (
                         "Investigación aprobada — corre en segundo plano. "
@@ -459,7 +636,7 @@ class TutorChatDriver:
                 except Exception:
                     pass
             if st.phase == "roadmap_proposed" and st.roadmap_id:
-                if _APPROVE_RE.match(message):
+                if _APPROVE_RE.match(message) or _CITATION_ONLY_RE.match(message):
                     try:
                         session.approve_roadmap(st.roadmap_id, decided_by="dashboard")
                         session.activate_roadmap(st.roadmap_id)
@@ -624,6 +801,15 @@ class TutorChatDriver:
 
             # ── Idle: detect topic or ask ───────────────────────────────
             topic = self._detect_topic(message)
+            if topic is None and st.awaiting_topic:
+                # Respuesta a "¿Qué querés aprender?": el mensaje literal ES
+                # el tema (o la cita que lo contiene). Comandos, preguntas
+                # y nuevos pedidos de roadmap sin tema no lo son.
+                topic = self._topic_from_answer(message)
+            if topic is None and self._roadmap_intent(message):
+                # "hagamos un roadmap" sin tema explícito: el contexto
+                # reciente puede tenerlo (cita, mensaje anterior).
+                topic = self._topic_from_context(core, session_id)
             if topic is None and st.topic_id:
                 # Resume pendiente: si una investigación aprobada para este
                 # tema ya completó, el próximo mensaje ("dale", "seguí")
@@ -640,14 +826,15 @@ class TutorChatDriver:
                 except Exception:
                     pass
             if topic is None:
+                st.awaiting_topic = True
                 out["reply"] = "¿Qué querés aprender? Decime el tema y armo el diagnóstico."
                 self._record(core, session_id, message, out["reply"])
                 return out
+            st.awaiting_topic = False
 
             st.topic = topic
             st.topic_id = _slug(topic)
             st.goal_id = f"goal:{st.topic_id}"
-            st.requested_units = self._detect_unit_count(message)
             try:
                 # El "proyecto" nace con el topic: scaffold determinístico,
                 # el LLM lo refina al proponer el roadmap (_refine_goal).
@@ -665,10 +852,24 @@ class TutorChatDriver:
                 # Corpus can't support a roadmap — research gate (the Tutor may
                 # call research_topic; the human approves before it executes).
                 try:
+                    from ipa.tutor.tutor_contracts import ResearchBudget
+                    _max_urls = st.requested_max_urls or 15
                     req = session.create_research_request(
                         st.topic_id,
                         f"Material de estudio sobre {topic}",
                         goal_id=st.goal_id,
+                        # El default del runtime (docs de programación) no
+                        # sirve para temas generales — la aprobación humana
+                        # es el gate real; la lista solo sesga a calidad.
+                        allowed_domains=_TUTOR_RESEARCH_DOMAINS,
+                        # "límite de N URLs" del usuario → budget; el tiempo
+                        # escala con el volumen pedido.
+                        budget=ResearchBudget(
+                            max_urls=_max_urls,
+                            max_seconds=max(300, min(3600, _max_urls * 40)),
+                            max_bytes=20971520,
+                            max_depth=1,
+                        ),
                     )
                     st.phase = "research_pending"
                     st.pending_request_id = req.request_id
@@ -838,38 +1039,6 @@ class TutorChatDriver:
                     session.core.memory.close()
                 except Exception:
                     pass
-
-    @staticmethod
-    def _point_session_at(st: TutorChatState, rm: Any, *, phase: str) -> None:
-        """Sidebar gate decisions re-target the session at that roadmap —
-        the human's latest decision defines what the tutor teaches next."""
-        st.roadmap_id = rm.roadmap_id
-        st.goal_id = rm.goal_id
-        st.topic_id = rm.goal_id.removeprefix("goal:")
-        st.topic = st.topic_id.replace("-", " ")
-        st.phase = phase
-
-    def _adopt_focus(self, store: Any, st: TutorChatState, session_id: str) -> bool:
-        """Adoptar el foco global si apunta a un roadmap ACTIVE — continuidad
-        cross-sesión sin tocar sesiones que ya tienen rumbo propio."""
-        try:
-            fid = store.get_focus()
-            if not fid:
-                return False
-            rm = store.get_roadmap(fid)
-            if rm is None or rm.status != RoadmapStatus.ACTIVE:
-                return False
-            self._point_session_at(st, rm, phase="active")
-            # Cleanup de slugs viejos con instrucción pegada (mismo criterio
-            # que el recovery de state()).
-            st.topic = re.sub(
-                r"-(?:armame|haceme|creame|generame|dise[ñn]ame|dame|"
-                r"preparame|quiero)\b.*$", "", st.topic_id or "",
-            ).replace("-", " ")
-            store.set_session_roadmap(session_id, rm.roadmap_id)
-            return True
-        except Exception:
-            return False
 
     @staticmethod
     def _point_session_at(st: TutorChatState, rm: Any, *, phase: str) -> None:

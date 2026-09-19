@@ -329,6 +329,48 @@ def query_gpu_info() -> dict:
 # ExL3Provider
 # ---------------------------------------------------------------------------
 
+def _unload_ollama_models(timeout_s: float = 20.0) -> None:
+    """Pide a Ollama que descargue sus modelos (libera VRAM para ExL3).
+
+    El dashboard puede haber recargado qwen3.5 en background; sin esto, la
+    carga de ExL3 muere con "Insufficient VRAM in split for model and cache".
+    La liberación es async (el llama-server tarda unos segundos en devolver
+    la VRAM): hay que esperar a que /api/ps quede vacío antes de medir la
+    libre para el split.
+    """
+    import json as _json
+    import urllib.request as _ur
+    base = os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    try:
+        with _ur.urlopen(f"{base}/api/ps", timeout=3) as resp:
+            loaded = _json.loads(resp.read()).get("models", [])
+    except Exception:
+        return
+    if not loaded:
+        return
+    for m in loaded:
+        name = m.get("name") or m.get("model")
+        if not name:
+            continue
+        body = _json.dumps({"model": name, "keep_alive": 0}).encode()
+        req = _ur.Request(f"{base}/api/generate", data=body,
+                          headers={"Content-Type": "application/json"})
+        try:
+            with _ur.urlopen(req, timeout=15):
+                pass
+        except Exception:
+            pass
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            with _ur.urlopen(f"{base}/api/ps", timeout=3) as resp:
+                if not _json.loads(resp.read()).get("models", []):
+                    return
+        except Exception:
+            return  # server caído: no hay nada que liberar
+
+
 class ExL3Provider:
     """Provider para ExLlamaV3 con modelos EXL3.
 
@@ -388,6 +430,22 @@ class ExL3Provider:
         self.rep_p = rep_p
         self.batch_size = batch_size
         self.use_mtp = use_mtp
+        # MTP y batch son incompatibles a partir de batch ~3 (medido + literatura:
+        # el overhead de realineación del speculative decoding en batch crece
+        # superlinealmente — arXiv 2510.22876 lo mide en 40% del cómputo a
+        # batch 8; arXiv 2310.18813: "larger batch sizes require a smaller
+        # speculation length"). Medido en RTX 4050: batch 6 con MTP = 17.5
+        # tok/s (thrashing, secuencias de 3 a 31 tok/s); sin MTP = 83.2 tok/s
+        # uniforme. A batch 1 el MTP da +14% (37.1 vs 32.5). Guard automático:
+        # batch > 2 → MTP off (IPA_EXL3_FORCE_MTP=1 lo fuerza).
+        if self.use_mtp and self.batch_size > 2 and \
+                os.environ.get("IPA_EXL3_FORCE_MTP", "0") != "1":
+            print(
+                f"  [EXL3] batch_size={self.batch_size} > 2 -> MTP desactivado "
+                "(medido: thrashing por realineación; el MTP aporta solo a batch 1)",
+                flush=True,
+            )
+            self.use_mtp = False
         self.mtp_draft_tokens = mtp_draft_tokens
         self.mtp_cache_tokens = mtp_cache_tokens
         # KV cache cuantizado: 0 = fp16 (default). 8 = q8 (mitad de VRAM).
@@ -411,6 +469,28 @@ class ExL3Provider:
 
     def load(self) -> float:
         """Carga el modelo en GPU. Retorna segundos de carga."""
+        # Lock de VRAM: ExL3 y Ollama no conviven en 6 GB. Si otro motor lo
+        # tiene, fallamos claro en vez de morir con OOM a mitad de generación.
+        from . import vram_lock
+        if not vram_lock.acquire("exl3"):
+            h = vram_lock.holder() or {}
+            raise RuntimeError(
+                f"VRAM ocupada por {h.get('owner', '?')} (pid {h.get('pid', '?')}); "
+                "esperá a que termine o limpiá outputs/agent/vram.lock")
+        try:
+            return self._load_locked()
+        except Exception:
+            # No filtrar el lock si la carga falla (OOM, VRAM ocupada por el
+            # dashboard, etc.): el próximo intento debe poder tomarlo.
+            vram_lock.release("exl3")
+            raise
+
+    def _load_locked(self) -> float:
+        """Carga con el lock de VRAM ya tomado."""
+        try:
+            _unload_ollama_models()
+        except Exception:
+            pass
         _init_cuda()
         from exllamav3 import Config, Model, Cache, Tokenizer
 
@@ -432,10 +512,15 @@ class ExL3Provider:
 
         # mtp_cache_tokens: permite override del cache limit.
         # CRÃTICO: default 2048 causa outputs vacÃ­os en prompts >750 tokens.
+        # mtp_cache_tokens solo puede AMPLIAR el cache, nunca recortarlo por
+        # debajo del contexto declarado. Recortarlo causaba el fallo real
+        # "Job requires N pages (only M available) and cannot be enqueued"
+        # → salida vacía en prompts grandes (6144 ctx + 4096 cache = todo
+        # prompt >4096 tokens fallaba en silencio).
         if self.mtp_cache_tokens > 0:
-            cache_tokens = min(self.context_length, self.mtp_cache_tokens)
+            cache_tokens = max(self.context_length, self.mtp_cache_tokens)
         else:
-            cache_tokens = min(self.context_length, 2048) if self.use_mtp else self.context_length
+            cache_tokens = self.context_length
 
         # KV cache cuantizado (opcional): reduce VRAM del cache principal.
         # El cache MTP queda en fp16: el speculative decoding depende de él.
@@ -535,6 +620,9 @@ class ExL3Provider:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+        # Liberar el lock de VRAM: Ollama puede volver a cargar.
+        from . import vram_lock
+        vram_lock.release("exl3")
 
     def is_loaded(self) -> bool:
         return self._generator is not None and self._model is not None
@@ -944,19 +1032,31 @@ class ExL3Provider:
 
 def create_star_provider(
     model_path: str = "models/Qwen3.5-4B-exl3-4bpw",
-    batch_size: int = 6,
+    batch_size: int = 4,
     interactive: bool = False,
 ) -> ExL3Provider:
     """Crea el provider con la configuración óptima del modelo estrella.
 
     Qwen3.5-4B EXL3 4.0bpw — más chico pero más estable en chat libre.
-    El 9B cuantizado (3.0bpw y 4.0bpw) se degrada después de ~80 tokens en
-    chat libre. El 4B 4.0bpw sostiene coherencia mejor por ser más chico
-    (menos capas = menos acumulación de error).
+
+    NOTA (2026-09, medido): la atribución vieja "el 9B se degrada después de
+    ~80 tokens" era en gran parte un artefacto de configuración, no del
+    modelo: el cache real quedaba en min(context_length, mtp_cache_tokens) y
+    un prompt que cruzaba ese límite a mitad de generación hacía perder el
+    inicio del contexto (divagación) o fallaba entero con salida vacía.
+    Con el cache alineado al contexto declarado, 27+ generaciones de 300
+    tokens con contexto de hasta ~4.4k tokens dieron 0 drift a 24-42 tok/s
+    (MTP on). Ver scripts/operations/_exl3_fatigue_test.py.
+
+    batch_size=4 (medido, sweep en RTX 4050 / 6 GB, ctx 2048): throughput
+    agregado 81 tok/s con varianza mínima; 6 thrashea (reencola por presión
+    de páginas, 17.5 tok/s) y 5 no mejora a 4. Ver
+    scripts/operations/_exl3_batch_sweep.py.
 
     Args:
         model_path: Path al directorio del modelo.
-        batch_size: 6 para deliberación/paralelo, 1 para interactivo.
+        batch_size: 4 para deliberación/paralelo (sweet spot medido), 1 para
+            interactivo.
         interactive: Si True, usa batch_size=1 (modo interactivo).
     """
     if interactive:

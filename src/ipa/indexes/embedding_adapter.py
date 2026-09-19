@@ -20,7 +20,9 @@ It separates embedding cost from storage/search cost, as required by E7.
 """
 from __future__ import annotations
 
+import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,43 @@ from ipa.contracts import DocumentChunk
 # chunks to 256 tokens and had weaker retrieval quality.
 DEFAULT_MODEL = "BAAI/bge-m3"
 DEFAULT_DIM = 1024
+
+
+class _QueryEmbeddingCache:
+    """LRU de embeddings de query (query → dense/sparse).
+
+    Las queries repetidas (misma pregunta, retrieval de turnos seguidos,
+    herramientas que re-consultan) pagaban BGE-M3 completo cada vez:
+    ~100-300ms + GPU por repetida. Desactivar con IPA_EMBED_CACHE_SIZE=0.
+    """
+
+    def __init__(self, maxsize: int = 256) -> None:
+        self.maxsize = maxsize
+        self._data: OrderedDict[str, Any] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> Any | None:
+        if self.maxsize <= 0:
+            return None
+        if key in self._data:
+            self._data.move_to_end(key)
+            self.hits += 1
+            return self._data[key]
+        self.misses += 1
+        return None
+
+    def put(self, key: str, value: Any) -> None:
+        if self.maxsize <= 0:
+            return
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+    def stats(self) -> dict[str, int]:
+        return {"size": len(self._data), "maxsize": self.maxsize,
+                "hits": self.hits, "misses": self.misses}
 
 
 class EmbeddingAdapter:
@@ -54,6 +93,13 @@ class EmbeddingAdapter:
         self.model_name = model_name
         self.batch_size = batch_size
         self.show_progress = show_progress
+        # IPA_EMBED_DEVICE permite forzar el device cuando el caller no lo
+        # especifica (device="auto"): los tests lo setean a "cpu" para ser
+        # herméticos — cargar BGE-M3 en una GPU ya ocupada por el dashboard
+        # agota la VRAM y congela la UI (el compositor de Windows se queda
+        # sin memoria de video).
+        if device == "auto":
+            device = os.environ.get("IPA_EMBED_DEVICE", device) or device
         self.device = device
         self.use_fp16 = use_fp16
         # BGE-M3 supports query instruction prefixes for asymmetric retrieval
@@ -64,15 +110,37 @@ class EmbeddingAdapter:
         self._model = None
         self._dim = None
         self._device_resolved = None
+        # Cache de embeddings de query: queries repetidas no re-corren BGE-M3.
+        # IPA_EMBED_CACHE_SIZE=0 lo desactiva.
+        _size = os.environ.get("IPA_EMBED_CACHE_SIZE", "").strip()
+        self._query_cache = _QueryEmbeddingCache(
+            maxsize=int(_size) if _size.isdigit() else 256)
 
     def _resolve_device(self) -> str:
-        """Resolve 'auto' to 'cuda' if available, else 'cpu'."""
+        """Resolve 'auto' to 'cuda' solo con headroom de VRAM, si no 'cpu'.
+
+        Gate igual al del reranker: el LLM del chat es dueño de la GPU.
+        Cargar BGE-M3 (~2.2 GB) en una GPU casi llena agotó la VRAM y congeló
+        la UI completa (el compositor de Windows se quedó sin memoria de
+        video) — bug real medido en EXP-008 §10. En Windows/WDDM
+        torch.cuda.mem_get_info() sobreestima la libre: usar nvidia-smi.
+        """
         if self.device != "auto":
             return self.device
         try:
             import torch
             if torch.cuda.is_available():
-                return "cuda"
+                from ipa.indexes.reranker_adapter import physical_free_vram_mb
+                min_free_mb = float(os.environ.get("IPA_EMBED_MIN_FREE_MB", "2048"))
+                free_mb = physical_free_vram_mb()
+                if free_mb is None:
+                    free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+                if free_mb >= min_free_mb:
+                    return "cuda"
+                print(
+                    f"[embed] VRAM libre {free_mb:.0f} MiB < {min_free_mb:.0f} "
+                    "— BGE-M3 en CPU (gate de VRAM)", flush=True,
+                )
         except ImportError:
             pass
         return "cpu"
@@ -142,12 +210,17 @@ class EmbeddingAdapter:
         If query_instruction is set, the instruction is prepended to the
         query before encoding (asymmetric retrieval improvement).
         """
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            return list(cached[0])
         text = self._apply_query_instruction(query)
         result = self._encode(
             [text], return_dense=True, return_sparse=False,
             show_progress=False,
         )
-        return result["dense_vecs"][0].tolist()
+        dense = result["dense_vecs"][0].tolist()
+        self._query_cache.put(query, (dense, None))
+        return list(dense)
 
     def embed_query_hybrid(
         self,
@@ -158,6 +231,9 @@ class EmbeddingAdapter:
         Returns (dense_vector, sparse_weights).
         If query_instruction is set, it is prepended to the query.
         """
+        cached = self._query_cache.get(query)
+        if cached is not None and cached[1] is not None:
+            return list(cached[0]), dict(cached[1])
         text = self._apply_query_instruction(query)
         result = self._encode(
             [text], return_dense=True, return_sparse=True,
@@ -165,7 +241,12 @@ class EmbeddingAdapter:
         )
         dense = result["dense_vecs"][0].tolist()
         sparse = result["lexical_weights"][0]
-        return dense, sparse
+        self._query_cache.put(query, (dense, sparse))
+        return list(dense), dict(sparse)
+
+    def query_cache_stats(self) -> dict[str, int]:
+        """Hits/misses del cache de queries (observabilidad)."""
+        return self._query_cache.stats()
 
     def _apply_query_instruction(self, query: str) -> str:
         """Prepend query instruction if configured."""

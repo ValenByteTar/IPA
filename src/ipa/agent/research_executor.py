@@ -33,7 +33,7 @@ from .judge import (
     _content_quality,
     _snippet_relevance,
 )
-from .web_search import search_web, SearchSummary
+from .web_search import search_web, SearchResult, SearchSummary
 
 
 @dataclass(frozen=True)
@@ -332,12 +332,45 @@ def execute_research(
     judgments: list[SourceJudgment] = []
 
     try:
-        # 1. Web search
-        search_summary = search_web(query, max_results=max_urls * 3, timeout=15)
+        # 1. URLs embebidas en la query (pegadas por el usuario, o reinyectadas
+        #    desde su mensaje por tool_research_topic): son fuentes explícitas.
+        #    Se scrapean directo — saltean el snippet stage (no hay snippet que
+        #    juzgar) pero pasan igual por scrape → calidad → juicio de contenido
+        #    → ingesta. El remanente textual va a la búsqueda complementaria.
+        from urllib.parse import urlparse as _urlparse
+        from .web_search import extract_urls, query_from_url, strip_urls
+        seed_urls = extract_urls(query)
+        text_query = strip_urls(query)
+        if not text_query and seed_urls:
+            # Query solo-URL: derivar la búsqueda complementaria del slug.
+            text_query = query_from_url(seed_urls[0]) or seed_urls[0]
+        judge_query = text_query or query
+        seed_results = [
+            SearchResult(url=u, title=query_from_url(u) or u, snippet="",
+                         domain=_urlparse(u).netloc)
+            for u in seed_urls[:max_urls]
+        ]
+        seed_url_set = {s.url for s in seed_results}
+        for sr in seed_results:
+            judgments.append(SourceJudgment(
+                url=sr.url, stage="seed", verdict="accept",
+                reason="URL explícita en la query (fuente provista por el usuario)",
+                judge="heuristic", confidence=1.0,
+            ))
+
+        # 1a. Web search sobre el remanente textual
+        search_summary = search_web(judge_query, max_results=max_urls * 3, timeout=15)
         research.search_results_count = len(search_summary.results)
 
-        if search_summary.error:
+        # Con seeds, un fallo de búsqueda no invalida la investigación: las
+        # fuentes explícitas se procesan igual (se registra el error).
+        if search_summary.error and not seed_results:
             raise RuntimeError(f"web search failed: {search_summary.error}")
+        if search_summary.error:
+            judgments.append(SourceJudgment(
+                url="(web search)", stage="search", verdict="error",
+                reason=search_summary.error, judge="heuristic",
+            ))
 
         candidates = search_summary.results
         if allowed_domains:
@@ -350,15 +383,15 @@ def execute_research(
         #    only send plausible candidates to the LLM (cheap → expensive).
         prefiltered = [
             r for r in candidates
-            if _snippet_relevance(query, r.title, r.snippet) >= SNIPPET_RELEVANCE_THRESHOLD
+            if _snippet_relevance(judge_query, r.title, r.snippet) >= SNIPPET_RELEVANCE_THRESHOLD
         ]
-        if not prefiltered:
+        if not prefiltered and not seed_results:
             raise RuntimeError("no search results passed the deterministic snippet pre-filter")
 
         snippet_payloads = [
             {"url": r.url, "title": r.title, "snippet": r.snippet} for r in prefiltered
         ]
-        snippet_judgments = judge.judge_snippets(query, snippet_payloads)
+        snippet_judgments = judge.judge_snippets(judge_query, snippet_payloads) if snippet_payloads else []
         for payload, j in zip(snippet_payloads, snippet_judgments):
             judgments.append(SourceJudgment(
                 url=payload["url"], stage="snippet", verdict=j.verdict,
@@ -369,9 +402,11 @@ def execute_research(
         # order. max_urls counts successful ingestions, not attempts — when a
         # candidate fails (scrape/date/quality/duplicate), the next one is
         # tried, so rejections rotate instead of shrinking the result set.
-        accepted_candidates = [
+        # Seeds primero (fuentes explícitas del usuario), después los
+        # candidatos aceptados por snippet — sin duplicar URLs ya seedeadas.
+        accepted_candidates = seed_results + [
             result for result, j in zip(prefiltered, snippet_judgments)
-            if j.verdict == "accept"
+            if j.verdict == "accept" and result.url not in seed_url_set
         ]
         if not accepted_candidates:
             raise RuntimeError("agent rejected all search results at the snippet stage")
@@ -426,7 +461,7 @@ def execute_research(
                     ))
 
                 # Deterministic scaffold first (cheap): structure + date.
-                quality, reason = _content_quality(scrape_result.text, query)
+                quality, reason = _content_quality(scrape_result.text, judge_query)
                 if quality < CONTENT_QUALITY_THRESHOLD:
                     rejected_count += 1
                     msg = f"{result.url}: {reason} (quality={quality:.2f})"
@@ -437,7 +472,7 @@ def execute_research(
                     ))
                     _enqueue_review(
                         result.url, scrape_result.title or result.title,
-                        scrape_result.text, msg, query, research_request_id,
+                        scrape_result.text, msg, judge_query, research_request_id,
                     )
                     continue
 
@@ -456,7 +491,7 @@ def execute_research(
                     ))
                     _enqueue_review(
                         result.url, scrape_result.title or result.title,
-                        scrape_result.text, msg, query, research_request_id,
+                        scrape_result.text, msg, judge_query, research_request_id,
                     )
                     continue
 
@@ -464,7 +499,7 @@ def execute_research(
                 # heuristic fallback). This is the direct-reading capability:
                 # the text never needs to be ingested first to be evaluated.
                 content_judgment: Judgment = judge.judge_content(
-                    query, scrape_result.title or result.title, scrape_result.text,
+                    judge_query, scrape_result.title or result.title, scrape_result.text,
                     age_days=age_days,
                 )
                 judgments.append(SourceJudgment(
@@ -477,7 +512,7 @@ def execute_research(
                     rejection_reasons.append(f"{result.url}: {content_judgment.reason}")
                     _enqueue_review(
                         result.url, scrape_result.title or result.title,
-                        scrape_result.text, content_judgment.reason, query,
+                        scrape_result.text, content_judgment.reason, judge_query,
                         research_request_id,
                     )
                     continue
@@ -625,7 +660,7 @@ def execute_research(
         if ctx.corpus_dir and ingested > 0:
             try:
                 from ipa.agent.agent_tools import _search_corpus
-                result_dict, _ = _search_corpus({"query": query, "limit": 5}, ctx)
+                result_dict, _ = _search_corpus({"query": judge_query, "limit": 5}, ctx)
                 retrieval_hits = result_dict.get("hits", [])
             except Exception as exc:
                 research._retrieval_error = str(exc)  # non-fatal
@@ -636,6 +671,7 @@ def execute_research(
             "max_seconds": max_seconds,
             "elapsed_seconds": round(time.monotonic() - t0, 2),
             "urls_searched": research.search_results_count,
+            "seed_urls": len(seed_results),
             "urls_prefiltered": len(prefiltered),
             "urls_attempted": attempted_count,
             "urls_scraped": scraped_count,

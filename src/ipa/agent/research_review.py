@@ -152,14 +152,10 @@ _REVIEW_SYSTEM = (
 )
 
 
-def review_doc_with_llm(provider: Any, item: dict[str, Any]) -> dict[str, Any]:
-    """Ask the LLM whether a rejected doc deserves promotion.
-
-    Returns {"promote": bool, "reason": str, "error": str|None}.
-    Bounded call: JSON verdict only, deterministic temperature.
-    """
+def _review_messages(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Mensajes del veredicto de un doc rechazado (128 tok de salida)."""
     excerpt = (item.get("text") or "")[:6000]
-    messages = [
+    return [
         {"role": "system", "content": _REVIEW_SYSTEM},
         {"role": "user", "content": (
             f"Consulta original: {item.get('query') or '?'}\n"
@@ -169,22 +165,63 @@ def review_doc_with_llm(provider: Any, item: dict[str, Any]) -> dict[str, Any]:
             f"--- DOCUMENTO ---\n{excerpt}"
         )},
     ]
+
+
+def _parse_verdict(raw: str) -> dict[str, Any]:
+    from .judge import _extract_json
+    parsed = _extract_json(raw)
+    return {
+        "promote": bool(parsed.get("promote")),
+        "reason": str(parsed.get("reason", ""))[:300],
+        "error": None,
+    }
+
+
+def review_doc_with_llm(provider: Any, item: dict[str, Any]) -> dict[str, Any]:
+    """Ask the LLM whether a rejected doc deserves promotion.
+
+    Returns {"promote": bool, "reason": str, "error": str|None}.
+    Bounded call: JSON verdict only, deterministic temperature.
+    """
     try:
         result = provider.generate_chat(
-            messages, max_new_tokens=128, temperature=0.0,
+            _review_messages(item), max_new_tokens=128, temperature=0.0,
         )
         raw = result.text if hasattr(result, "text") else str(result or "")
         if getattr(result, "error", None):
             return {"promote": False, "reason": "", "error": result.error}
-        from .judge import _extract_json
-        parsed = _extract_json(raw)
-        return {
-            "promote": bool(parsed.get("promote")),
-            "reason": str(parsed.get("reason", ""))[:300],
-            "error": None,
-        }
+        return _parse_verdict(raw)
     except Exception as exc:
         return {"promote": False, "reason": "", "error": str(exc)[:200]}
+
+
+def review_docs_with_llm(
+    provider: Any, items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Veredictos para N docs en un pase batched (ExL3) o serial (Ollama).
+
+    Mismo contrato por ítem que `review_doc_with_llm`. Con ExL3 y batch 3-4 el
+    throughput agregado es ~2.4x el serial (EXP-008 §8); la cola de review es
+    el caso de uso: veredictos de 128 tok, muchos ítems.
+    """
+    from ipa.agentic.batch_llm import generate_many
+
+    if not items:
+        return []
+    pairs = generate_many(
+        provider, [_review_messages(it) for it in items],
+        max_new_tokens=128, temperature=0.0,
+    )
+    verdicts: list[dict[str, Any]] = []
+    for raw, error in pairs:
+        if error:
+            verdicts.append({"promote": False, "reason": "", "error": error})
+            continue
+        try:
+            verdicts.append(_parse_verdict(raw))
+        except Exception as exc:
+            verdicts.append({"promote": False, "reason": "", "error": str(exc)[:200]})
+    return verdicts
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +333,19 @@ def ingest_reviewed_doc(
 
 _RECENT_PATH = _ROOT / "outputs" / "web_dashboard" / "research_recent.json"
 DEDUP_MINUTES_DEFAULT = 10
+DEDUP_SIMILARITY_DEFAULT = 0.6
+
+# Stopwords español + términos genéricos de pedidos de investigación: se
+# excluyen del matching para que "dame toda la informacion" no matchee
+# cualquier query previa.
+_QUERY_STOPWORDS = frozenset({
+    "de", "la", "el", "en", "y", "a", "que", "los", "las", "un", "una",
+    "por", "para", "con", "del", "sobre", "su", "sus", "al", "lo", "como",
+    "mas", "o", "e", "u", "se", "es", "son", "me", "mi", "te", "tu", "nos",
+    "les", "le", "fue", "hay",
+    "investigar", "investigacion", "buscar", "busqueda", "tema", "info",
+    "informacion", "dame", "toda", "todo", "quiero", "saber", "porque",
+})
 
 
 def _norm_query(text: str) -> str:
@@ -306,6 +356,11 @@ def _norm_query(text: str) -> str:
     return _re.sub(r"\s+", " ", t)[:200]
 
 
+def _query_tokens(norm: str) -> set[str]:
+    """Content tokens de una query normalizada (sin stopwords ni 1-char)."""
+    return {t for t in norm.split() if t not in _QUERY_STOPWORDS and len(t) > 1}
+
+
 def recently_researched(
     query: str,
     *,
@@ -313,15 +368,51 @@ def recently_researched(
     path: Path = _RECENT_PATH,
 ) -> bool:
     """True if a research run for this query started within the window."""
+    return find_recent_research(query, minutes=minutes, path=path) is not None
+
+
+def find_recent_research(
+    query: str,
+    *,
+    minutes: int = DEDUP_MINUTES_DEFAULT,
+    threshold: float = DEDUP_SIMILARITY_DEFAULT,
+    path: Path = _RECENT_PATH,
+) -> dict | None:
+    """Most recent stored research that matches `query`, or None.
+
+    Matching: exact normalized equality OR token containment — the model
+    reformulates queries between turns ("IA big techs" → "IA tres grandes
+    tecnologicas"), so exact match alone misses re-launches. Containment =
+    |intersection| / min(|a|, |b|) over content tokens: a shorter query
+    that is a subset of a stored one counts as the same research. Queries
+    with no content tokens only match exactly.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        ts = data.get(_norm_query(query))
-        if not ts:
-            return False
-        t0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - t0).total_seconds() < minutes * 60
     except Exception:
-        return False
+        return None
+    now = datetime.now(timezone.utc)
+    qn = _norm_query(query)
+    qt = _query_tokens(qn)
+    best: dict | None = None
+    for stored_q, ts in data.items():
+        try:
+            t0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            age = (now - t0).total_seconds()
+        except Exception:
+            continue
+        if age >= minutes * 60:
+            continue
+        exact = stored_q == qn
+        similar = False
+        if not exact and qt:
+            st = _query_tokens(stored_q)
+            if st:
+                similar = len(qt & st) / min(len(qt), len(st)) >= threshold
+        if (exact or similar) and (best is None or ts > best["ts"]):
+            best = {"query": stored_q, "ts": ts,
+                    "age_minutes": max(0, int(age // 60)), "exact": exact}
+    return best
 
 
 def mark_researched(query: str, *, path: Path = _RECENT_PATH) -> None:
@@ -341,7 +432,9 @@ def mark_researched(query: str, *, path: Path = _RECENT_PATH) -> None:
 __all__ = [
     "ResearchReviewStore",
     "review_doc_with_llm",
+    "review_docs_with_llm",
     "ingest_reviewed_doc",
     "recently_researched",
+    "find_recent_research",
     "mark_researched",
 ]

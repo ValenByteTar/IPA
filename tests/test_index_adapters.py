@@ -277,6 +277,34 @@ def test_rerank_device_gate_uses_physical_vram(monkeypatch):
     assert ra.RerankerAdapter()._resolve_device() == "cuda"
 
 
+def test_embed_device_gate_uses_physical_vram(monkeypatch):
+    """Mismo gate que el reranker para BGE-M3: con el LLM del chat ocupando
+    la GPU, cargar BGE-M3 en CUDA agotó la VRAM y congeló la UI (EXP-008 §10)
+    — debe caer a CPU aunque mem_get_info sobreestime la libre."""
+    import torch
+    from ipa.indexes import embedding_adapter as ea
+    from ipa.indexes import reranker_adapter as ra
+
+    # El conftest fuerza CPU (hermeticidad); este test prueba el gate, así
+    # que restaura "auto" para que el adapter llegue a la lógica del gate.
+    monkeypatch.setenv("IPA_EMBED_DEVICE", "auto")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info",
+        lambda: (5_000 * 1024 * 1024, 6_140 * 1024 * 1024))
+    # nvidia-smi: el LLM ocupa casi todo → CPU aunque mem_get_info diga que hay lugar.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: 1_655.0)
+    assert ea.EmbeddingAdapter()._resolve_device() == "cpu"
+    # VRAM física de sobra → CUDA.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: 5_000.0)
+    assert ea.EmbeddingAdapter()._resolve_device() == "cuda"
+    # Sin nvidia-smi → fallback a mem_get_info.
+    monkeypatch.setattr(ra, "physical_free_vram_mb", lambda: None)
+    assert ea.EmbeddingAdapter()._resolve_device() == "cuda"
+    # Device explícito nunca lo pisa el gate.
+    assert ea.EmbeddingAdapter(device="cpu")._resolve_device() == "cpu"
+
+
 # ---------- SQLiteVecIndex ----------
 
 class TestSQLiteVecIndex:

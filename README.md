@@ -146,8 +146,9 @@ dependencies for reproducible installs live in `requirements.lock`
 ## Dashboard and orchestrator
 
 IPA ships a local web dashboard for corpus inspection, curation, and job
-control, plus a console orchestrator that launches and monitors ingestion,
-indexing, enrichment, and query workloads in parallel.
+control. The console orchestrator (scraper → fast_path → lancedb → hammer →
+enrichment chain) is **deprecated**: jobs are launched from the dashboard and
+background LLM work runs through the idle scheduler.
 
 ```powershell
 # Web dashboard (HTTP + dynamic refresh + curation actions)
@@ -155,12 +156,9 @@ indexing, enrichment, and query workloads in parallel.
 
 # One-click launcher: starts dashboard and opens browser
 .\start_ipa_dashboard.bat
-# Optional: also start the console orchestrator alongside the dashboard
-.\start_ipa_dashboard.bat -StartOrchestrator
 
-# Console orchestrator (parallel pipeline + LanceDB + hammer + enrichment)
+# DEPRECATED — console orchestrator (kept for compatibility only)
 .venv\Scripts\python.exe scripts\operations\orchestrator.py
-.venv\Scripts\python.exe scripts\operations\orchestrator.py --no-scraper --no-hammer
 ```
 
 The orchestrator launches jobs through a shared `JobSpec` / `JobRunner` model

@@ -245,6 +245,161 @@ def test_research_topic_fails_when_no_results(memory, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Research executor — URLs explícitas en la query (seeds)
+# ---------------------------------------------------------------------------
+
+PAGINA12 = ("https://www.pagina12.com.ar/2026/09/12/"
+            "las-big-tech-de-la-ia-dicen-estar-de-acuerdo-en-frenar-su-desarrollo/")
+_ARTICLE = "Las big tech de la IA dicen estar de acuerdo en frenar su desarrollo. " * 40
+
+
+def _fake_scraper(monkeypatch, seen: dict):
+    """WebScraper fake: registra las URLs scrapeadas y devuelve un artículo."""
+    from ipa.acquisition import web_scraper as ws_module
+
+    class _Scrape:
+        success = True
+        error = None
+        title = "Las big tech y la IA"
+        date = None
+        canonical_url = None
+        content_hash = ""
+        metadata = {"engine": "requests"}
+
+        def __init__(self):
+            self.text = _ARTICLE
+
+    class _Scraper:
+        def __init__(self, **kwargs):
+            pass
+
+        def extract_article(self, url, days_back=0):
+            seen.setdefault("urls", []).append(url)
+            return _Scrape()
+
+        def save_article(self, scrape_result):
+            pass
+
+    monkeypatch.setattr(ws_module, "WebScraper", _Scraper)
+
+
+def _run(memory, tmp_path, query, **kw):
+    ctx = ToolContext(memory=memory)
+    identity = load_identity()
+    sid = memory.open_session(interface="cli", role="general",
+                              identity_hash=identity.identity_hash)
+    ep = memory.record_episode(sid, turn_role="user", content=query,
+                               identity_hash=identity.identity_hash)
+    return execute_research(
+        query, ctx, session_id=sid, episode_id=ep.episode_id,
+        max_urls=kw.pop("max_urls", 3), max_seconds=kw.pop("max_seconds", 10),
+        landing_dir=tmp_path / "landing", **kw,
+    )
+
+
+def test_seed_url_is_scraped_directly_without_search_results(memory, tmp_path, monkeypatch):
+    """Una URL en la query se scrapea directo (fuente explícita) aunque la
+    búsqueda no devuelva nada: saltea el snippet stage, no el juicio."""
+    from ipa.agent import research_executor as re_module
+
+    seen: dict = {}
+
+    def mock_search_web(query, **kwargs):
+        seen["query"] = query
+        return SearchSummary(query=query, results=[])
+
+    monkeypatch.setattr(re_module, "search_web", mock_search_web)
+    _fake_scraper(monkeypatch, seen)
+
+    call, result, research = _run(
+        memory, tmp_path,
+        f"las big tech de la ia acuerdan frenar su desarrollo {PAGINA12}",
+    )
+
+    assert call.status == "completed", result.error
+    assert seen["urls"] == [PAGINA12]
+    assert PAGINA12 not in seen["query"]  # la búsqueda fue sobre el remanente
+    stages = {j["stage"] for j in result.result["judgments"]}
+    assert "seed" in stages
+    assert len(research.web_sources) == 1
+    assert research.web_sources[0].source_url == PAGINA12
+    assert result.result["budget_used"]["seed_urls"] == 1
+
+
+def test_seed_url_survives_search_failure(memory, tmp_path, monkeypatch):
+    """Con seeds, un fallo del backend de búsqueda no invalida la corrida."""
+    from ipa.agent import research_executor as re_module
+
+    seen: dict = {}
+
+    def mock_search_web(query, **kwargs):
+        return SearchSummary(query=query, error="no search backend available")
+
+    monkeypatch.setattr(re_module, "search_web", mock_search_web)
+    _fake_scraper(monkeypatch, seen)
+
+    call, result, research = _run(memory, tmp_path, f"nota sobre IA {PAGINA12}")
+
+    assert call.status == "completed", result.error
+    assert seen["urls"] == [PAGINA12]
+    search_errors = [j for j in result.result["judgments"]
+                     if j["stage"] == "search" and j["verdict"] == "error"]
+    assert search_errors and "no search backend" in search_errors[0]["reason"]
+
+
+def test_search_failure_without_seeds_still_fails(memory, tmp_path, monkeypatch):
+    from ipa.agent import research_executor as re_module
+
+    monkeypatch.setattr(
+        re_module, "search_web",
+        lambda query, **kw: SearchSummary(query=query, error="no search backend available"),
+    )
+    call, result, _ = _run(memory, tmp_path, "consulta sin urls")
+    assert call.status == "failed"
+    assert "web search failed" in (result.error or "")
+
+
+def test_url_only_query_derives_search_from_slug(memory, tmp_path, monkeypatch):
+    """Query solo-URL: la búsqueda complementaria usa el slug de la URL."""
+    from ipa.agent import research_executor as re_module
+
+    seen: dict = {}
+
+    def mock_search_web(query, **kwargs):
+        seen["query"] = query
+        return SearchSummary(query=query, results=[])
+
+    monkeypatch.setattr(re_module, "search_web", mock_search_web)
+    _fake_scraper(monkeypatch, seen)
+
+    call, result, _ = _run(memory, tmp_path, PAGINA12)
+
+    assert call.status == "completed", result.error
+    assert seen["query"] == (
+        "las big tech de la ia dicen estar de acuerdo en frenar su desarrollo"
+    )
+
+
+def test_seed_urls_respect_budget(memory, tmp_path, monkeypatch):
+    """Las seeds consumen el presupuesto de max_urls como cualquier candidato."""
+    from ipa.agent import research_executor as re_module
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        re_module, "search_web",
+        lambda query, **kw: SearchSummary(query=query, results=[]),
+    )
+    _fake_scraper(monkeypatch, seen)
+
+    urls = " ".join(f"https://example.com/nota-{i}-sobre-ia" for i in range(5))
+    call, result, research = _run(memory, tmp_path, f"ia {urls}", max_urls=2)
+
+    assert call.status == "completed", result.error
+    assert len(seen["urls"]) == 2
+    assert result.result["budget_used"]["seed_urls"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Research executor — end-to-end with real network (skipped by default)
 # ---------------------------------------------------------------------------
 

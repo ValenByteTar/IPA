@@ -13,7 +13,36 @@ import os
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Any, Optional, List
+
+
+def _perf_log_path() -> Path:
+    return Path(os.environ.get(
+        "IPA_LLM_PERF_LOG", "outputs/web_dashboard/logs/llm_perf.jsonl"))
+
+
+def _log_perf(model: str, data: dict) -> None:
+    """Append one JSONL line per completed generation with Ollama's own
+    metrics. prompt_eval_cached_count es la métrica DIRECTA del PT cache:
+    cuántos tokens del prompt se reusaron del slot en vez de re-evaluarse."""
+    try:
+        path = _perf_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "model": model,
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "prompt_eval_cached_count": data.get("prompt_eval_cached_count"),
+            "eval_count": data.get("eval_count"),
+            "prompt_eval_ms": round((data.get("prompt_eval_duration") or 0) / 1e6),
+            "eval_ms": round((data.get("eval_duration") or 0) / 1e6),
+            "total_ms": round((data.get("total_duration") or 0) / 1e6),
+        })
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 class OllamaProvider:
@@ -31,6 +60,10 @@ class OllamaProvider:
         seed: Optional[int] = None,
         no_think: bool = True,
         rep_p: float = 1.15,
+        keep_alive: Optional[str] = None,
+        num_keep: Optional[int] = None,
+        repeat_last_n: Optional[int] = None,
+        num_batch: Optional[int] = None,
     ) -> None:
         self.model = model
         self.model_id = model
@@ -45,6 +78,25 @@ class OllamaProvider:
         self.seed = seed
         self.no_think = no_think
         self.rep_p = rep_p
+        # keep_alive: cuánto retiene Ollama el modelo cargado tras cada request.
+        # Default 30m: cubre sesiones interactivas espaciadas sin pinneo eterno
+        # de VRAM (ExL3 necesita esa memoria cuando se usa). -1 = nunca
+        # descargar; 0 = descargar al terminar la request.
+        self.keep_alive = keep_alive or os.environ.get(
+            "IPA_OLLAMA_KEEP_ALIVE", "30m")
+        # num_keep: tokens del INICIO que Ollama preserva cuando el contexto se
+        # llena. Default de llama.cpp = 4 → al desbordar, el system prompt
+        # (identidad, grounding, user model) es lo PRIMERO en evaporarse y el
+        # modelo pierde el hilo. 2048 ≈ tamaño del system prompt real.
+        _nk = num_keep if num_keep is not None else os.environ.get("IPA_OLLAMA_NUM_KEEP")
+        self.num_keep = int(_nk) if _nk else 2048
+        # repeat_last_n: ventana hacia atrás del repetition penalty (default
+        # llama.cpp = 64). Más ancha = más contexto penalizado.
+        _rln = repeat_last_n if repeat_last_n is not None else os.environ.get("IPA_OLLAMA_REPEAT_LAST_N")
+        self.repeat_last_n = int(_rln) if _rln else None
+        # num_batch: batch de prefill (default servidor = OLLAMA_NUM_BATCH).
+        _nb = num_batch if num_batch is not None else os.environ.get("IPA_OLLAMA_NUM_BATCH")
+        self.num_batch = int(_nb) if _nb else None
         self._loaded = False
 
     def load(self) -> None:
@@ -53,7 +105,18 @@ class OllamaProvider:
         If the server is not responding, try to spawn ``ollama serve``
         detached and wait for readiness — the dashboard should not depend
         on Ollama having been started manually.
+
+        Si ExL3 tiene el lock de VRAM (batch en curso), falla claro: cargar
+        Ollama encima en 6 GB mata a ExL3 con OOM. Ollama NO toma el lock:
+        su modelo queda cargado con keep_alive y tomarlo bloquearía a ExL3
+        para siempre — solo lo respeta.
         """
+        from . import vram_lock
+        h = vram_lock.holder()
+        if h is not None and h.get("owner") != "ollama":
+            raise RuntimeError(
+                f"VRAM ocupada por {h.get('owner', '?')} (pid {h.get('pid', '?')}): "
+                "el chat queda sin backend hasta que termine el batch ExL3")
         self._ensure_server()
         try:
             resp = urllib.request.urlopen(f"{self.base_url}/api/tags", timeout=10)
@@ -143,14 +206,27 @@ class OllamaProvider:
 
     def _build_options(self, max_new_tokens: int, temperature: float | None) -> dict:
         temp = temperature if temperature is not None else self.temperature
-        return {
+        options = {
             "temperature": temp,
             "top_p": self.top_p,
             "top_k": self.top_k,
             "num_predict": max_new_tokens,
             "repeat_penalty": self.rep_p,
             "num_ctx": self.context_length,
+            "num_keep": self.num_keep,
         }
+        if self.repeat_last_n is not None:
+            options["repeat_last_n"] = self.repeat_last_n
+        if self.num_batch is not None:
+            options["num_batch"] = self.num_batch
+        # num_gpu: el auto-fit de Ollama es conservador (deja ~1.4 GB libres y
+        # manda la mitad del modelo a CPU). Forzarlo sube el decode ~2x en la
+        # RTX 4050 (18/34 → 30/34 capas, 10.4 → 20 tok/s). Configurable por
+        # máquina: sin la var, Ollama decide solo.
+        n_gpu = os.environ.get("IPA_OLLAMA_NUM_GPU", "").strip()
+        if n_gpu.isdigit():
+            options["num_gpu"] = int(n_gpu)
+        return options
 
     def _build_body(
         self,
@@ -164,6 +240,7 @@ class OllamaProvider:
             "messages": messages,
             "stream": True,
             "think": not self.no_think,
+            "keep_alive": self.keep_alive,
             "options": self._build_options(max_new_tokens, temperature),
         }
         if stop_sequences:
@@ -180,6 +257,15 @@ class OllamaProvider:
         """Stream tokens from Ollama. Yields {"text": ..., "done": bool}."""
         if not self.is_loaded():
             yield {"text": "", "error": "model not loaded", "done": True}
+            return
+        # Un request HTTP dispara la carga del modelo server-side aunque el
+        # provider ya esté "loaded": si ExL3 tiene el lock, cortamos acá para
+        # no matarlo con OOM.
+        from . import vram_lock
+        _h = vram_lock.holder()
+        if _h is not None and _h.get("owner") not in (None, "ollama"):
+            yield {"text": "", "done": True,
+                   "error": f"GPU ocupada por {_h.get('owner')} (batch ExL3 en curso)"}
             return
 
         max_tokens = max_new_tokens or self.max_output_tokens
@@ -217,7 +303,17 @@ class OllamaProvider:
                 except (ValueError, json.JSONDecodeError):
                     continue
                 if data.get("done"):
-                    yield {"text": "", "done": True}
+                    _log_perf(self.model, data)
+                    yield {
+                        "text": "", "done": True,
+                        "metrics": {
+                            "prompt_eval_count": data.get("prompt_eval_count"),
+                            "prompt_eval_cached_count": data.get("prompt_eval_cached_count"),
+                            "eval_count": data.get("eval_count"),
+                            "prompt_eval_ms": round((data.get("prompt_eval_duration") or 0) / 1e6),
+                            "eval_ms": round((data.get("eval_duration") or 0) / 1e6),
+                        },
+                    }
                     conn.close()
                     return
                 msg = data.get("message", {})
@@ -271,9 +367,13 @@ def create_star_provider(
         model: Nombre del modelo en Ollama.
         interactive: Sin efecto (compatibilidad con ExL3 interface).
     """
+    # num_ctx 6144: los prompts reales del chat miden 2.3-4.1k tokens; 6144
+    # cubre con margen y libera ~68 MiB de KV por slot (q8) → más margen de
+    # VRAM para capas GPU. Override: IPA_OLLAMA_NUM_CTX.
+    _ctx = os.environ.get("IPA_OLLAMA_NUM_CTX", "").strip()
     return OllamaProvider(
         model=model,
-        context_length=8192,
+        context_length=int(_ctx) if _ctx.isdigit() else 6144,
         max_output_tokens=512,
         temperature=0.1,
         top_p=0.9,

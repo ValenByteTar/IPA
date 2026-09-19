@@ -305,10 +305,11 @@ button.icon-btn.tiny{padding:2px 6px;font-size:11px;border-radius:6px;line-heigh
 .title-inline h2{margin:0;font-size:16px}
 #panel-agent{margin:-24px -32px;padding:12px}
 .agent-layout .chat-container{height:calc(100vh - 96px)}
-.agent-sessions-panel{max-height:calc(100vh - 96px)}
+.agent-sessions-panel{height:calc(100vh - 96px);max-height:calc(100vh - 96px);display:flex;flex-direction:column}
+.agent-sessions-panel .session-list{flex:1;min-height:0;max-height:none;overflow-y:auto}
 body.no-topbar .agent-layout .chat-container{height:calc(100vh - 24px)}
-body.no-topbar .agent-sessions-panel{max-height:calc(100vh - 24px)}
-@media(max-width:900px){.agent-layout .chat-container{height:600px}}
+body.no-topbar .agent-sessions-panel{height:calc(100vh - 24px);max-height:calc(100vh - 24px)}
+@media(max-width:900px){.agent-layout .chat-container{height:600px}.agent-sessions-panel{height:auto;max-height:none}}
 /* -- Card de pipeline en vivo (chat) -- */
 .chat-pipeline-card{align-self:stretch;background:linear-gradient(135deg,#0e1f1a,#0b1622);border:1px solid var(--accent);border-radius:12px;padding:12px 16px;margin:4px 0}
 .chat-pipeline-card .pc-stage{font-size:14px;font-weight:650;margin:4px 0 8px}

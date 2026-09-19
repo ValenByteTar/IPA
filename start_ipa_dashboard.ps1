@@ -26,6 +26,15 @@ if (-not (Test-Path $Dashboard)) {
     exit 1
 }
 
+# KV cache cuantizado para Ollama: q8_0 ≈ mitad de VRAM de KV vs fp16.
+# Seteado acá para que el `ollama serve` que este script pueda spawnear lo
+# herede. Si Ollama ya corre (tray app), aplica desde su próximo reinicio.
+if (-not $env:OLLAMA_KV_CACHE_TYPE) { $env:OLLAMA_KV_CACHE_TYPE = "q8_0" }
+# num_gpu: el auto-fit de Ollama es conservador y manda ~la mitad del modelo a
+# CPU (18/34 capas ≈ 10 tok/s). Forzar 30/34 ≈ 20 tok/s en la RTX 4050.
+# Ajustar por máquina; vacío = auto.
+if (-not $env:IPA_OLLAMA_NUM_GPU) { $env:IPA_OLLAMA_NUM_GPU = "30" }
+
 # Ensure Ollama is running (LLM backend for the agent; also the CPU fallback target)
 $ollamaUp = $false
 try {
@@ -147,9 +156,14 @@ if (-not $NoWatchdog -and (Test-Path $Watchdog)) {
 }
 
 if ($StartOrchestrator) {
+    Write-Host "DEPRECADO: el Orchestrator de consola (scraper → fast_path → lancedb → hammer → enrichment) no recibe nuevas funciones." -ForegroundColor Yellow
+    Write-Host "Los jobs se lanzan desde el dashboard; el trabajo LLM en background corre por el idle scheduler." -ForegroundColor Yellow
     $Orchestrator = Join-Path $Root "scripts\orchestrator.py"
+    if (-not (Test-Path $Orchestrator)) {
+        $Orchestrator = Join-Path $Root "scripts\operations\orchestrator.py"
+    }
     if (Test-Path $Orchestrator) {
-        Write-Host "Iniciando orquestador del corpus principal..." -ForegroundColor Cyan
+        Write-Host "Iniciando orquestador del corpus principal (compatibilidad)..." -ForegroundColor Cyan
         Start-Process -FilePath $Python `
             -ArgumentList @("-u", $Orchestrator) `
             -WorkingDirectory $Root

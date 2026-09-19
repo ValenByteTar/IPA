@@ -588,25 +588,22 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
     """
     session_id = args.pop("_session_id", None)
     auto = bool(args.pop("_auto", False))
+    user_message = str(args.pop("_user_message", "") or "").strip()
     query = str(args.get("query", "") or "").strip()
     if not query:
         return SystemToolResult(
             tool_name="research_topic", ok=False, summary="", data={},
             error="se requiere 'query' (tema a investigar)",
         )
-    # Dedup de disparos automáticos: si el safety-net ya lanzó esta query
-    # hace poco, no repetir (las llamadas explícitas del usuario pasan).
-    if auto:
-        from ipa.agent.research_review import recently_researched
-        if recently_researched(query):
-            return SystemToolResult(
-                tool_name="research_topic", ok=True,
-                summary=(
-                    f"Ya investigué '{query}' hace poco — los resultados "
-                    "recientes están arriba en el chat o en el corpus."
-                ),
-                data={"dedup": True, "query": query},
-            )
+    # URLs que el usuario pegó en su mensaje: el modelo suele parafrasear la
+    # query y descartarlas. Se reinyectan acá — el executor las detecta y las
+    # scrapea directo como seeds (fuentes explícitas), además de buscar el
+    # remanente textual.
+    if user_message:
+        from ipa.agent.web_search import extract_urls
+        extra = [u for u in extract_urls(user_message) if u not in query]
+        if extra:
+            query = (query + " " + " ".join(extra)).strip()
     try:
         max_urls = max(1, min(20, int(args.get("max_urls", 5))))
     except (TypeError, ValueError):
@@ -615,6 +612,8 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
         max_seconds = max(30, min(600, int(args.get("max_seconds", 120))))
     except (TypeError, ValueError):
         max_seconds = 120
+    _force_raw = args.get("force")
+    force = _force_raw if isinstance(_force_raw, bool) else str(_force_raw or "").strip().lower() in ("1", "true", "yes", "si", "sí")
 
     state = _research_progress()
     if state.get("status") == "running":
@@ -643,6 +642,26 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
             summary=f"Ya hay una investigación corriendo: '{state.get('query', '?')}'. Pidime el estado en unos minutos.",
             data={"already_running": True, "state": state},
         )
+    # Dedup: aplica a TODOS los llamados (auto y explícitos). Si una query
+    # igual o muy parecida ya se investigó dentro de la ventana, no relanzar —
+    # el material está ingerido en el corpus. El modelo reformula la query
+    # entre turnos ("IA big techs" → "IA tres grandes tecnológicas"), así que
+    # el match exacto no alcanza. `force: true` fuerza una corrida nueva.
+    if not force:
+        from ipa.agent.research_review import find_recent_research
+        recent = find_recent_research(query)
+        if recent:
+            return SystemToolResult(
+                tool_name="research_topic", ok=True,
+                summary=(
+                    f"Ya investigué '{recent['query']}' hace {recent['age_minutes']} min — "
+                    "ese material ya está en el corpus: usá search_corpus o compile_report "
+                    "sobre lo ingerido en vez de relanzar la búsqueda. Si necesitás una "
+                    "corrida nueva igual, volvé a llamarme con force=true."
+                ),
+                data={"dedup": True, "query": query, "matched_query": recent["query"],
+                      "age_minutes": recent["age_minutes"]},
+            )
     corpus_dir = _main_corpus_dir()
     if corpus_dir is None:
         return SystemToolResult(
@@ -1169,8 +1188,13 @@ _SYSTEM_TOOLS: tuple[SystemToolSpec, ...] = (
     ),
     SystemToolSpec(
         name="research_topic",
-        description="investiga un tema en la web (async).",
-        args_doc='{"query": "tema a investigar", "max_urls": <int 1-20>, "max_seconds": <int 30-600>}',
+        description=(
+            "investiga un tema en la web (async). URLs incluidas en la query se "
+            "scrapean directo como fuentes explícitas. Si ya investigué algo muy "
+            "parecido hace poco, la tool lo indica y no relanza — pasar force=true "
+            "solo si el usuario pide explícitamente investigar de nuevo."
+        ),
+        args_doc='{"query": "tema o URL a investigar", "max_urls": <int 1-20>, "max_seconds": <int 30-600>, "force": <bool>}',
         fn=tool_research_topic,
     ),
     SystemToolSpec(
@@ -1259,6 +1283,14 @@ _SYSTEM_TOOLS: tuple[SystemToolSpec, ...] = (
 SYSTEM_TOOL_NAMES = frozenset(spec.name for spec in _SYSTEM_TOOLS)
 _SYSTEM_IMPLEMENTATIONS = {spec.name: spec.fn for spec in _SYSTEM_TOOLS}
 
+# Cache corto de tools read-only entre turnos. Se excluye get_system_status:
+# su semántica es "estado AHORA" (procesos corriendo, research en vuelo) y
+# servir una foto vieja sería incorrecto. TTL: IPA_TOOL_CACHE_TTL (default
+# 30s, 0 desactiva).
+_TOOL_CACHEABLE = frozenset({"list_topics", "get_user_profile", "list_promotions"})
+_TOOL_CACHE_TTL = float(os.environ.get("IPA_TOOL_CACHE_TTL", "30") or 30)
+_TOOL_CACHE: dict[str, tuple[float, SystemToolResult]] = {}
+
 
 def execute_system_tool(tool_name: str, arguments: dict[str, Any]) -> SystemToolResult:
     """Execute a system tool deterministically. Raises on unknown tool."""
@@ -1266,7 +1298,23 @@ def execute_system_tool(tool_name: str, arguments: dict[str, Any]) -> SystemTool
         raise ValueError(f"unknown system tool: {tool_name}; valid: {sorted(SYSTEM_TOOL_NAMES)}")
     if tool_name not in _SYSTEM_IMPLEMENTATIONS:
         raise ValueError(f"system tool not implemented: {tool_name}")
-    return _SYSTEM_IMPLEMENTATIONS[tool_name](dict(arguments))
+    impl = _SYSTEM_IMPLEMENTATIONS[tool_name]
+    # Cache corto para tools read-only baratas pero repetidas entre turnos
+    # (get_system_status se pedía cada pocos turnos). IPA_TOOL_CACHE_TTL=0 off.
+    if tool_name in _TOOL_CACHEABLE and _TOOL_CACHE_TTL > 0:
+        key = tool_name + "|" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        now = time.time()
+        hit = _TOOL_CACHE.get(key)
+        if hit is not None and now - hit[0] <= _TOOL_CACHE_TTL:
+            return hit[1]
+        result = impl(dict(arguments))
+        if result.ok:
+            _TOOL_CACHE[key] = (now, result)
+            if len(_TOOL_CACHE) > 64:
+                oldest = min(_TOOL_CACHE, key=lambda k: _TOOL_CACHE[k][0])
+                _TOOL_CACHE.pop(oldest, None)
+        return result
+    return impl(dict(arguments))
 
 
 def tool_specs() -> list[dict[str, str]]:

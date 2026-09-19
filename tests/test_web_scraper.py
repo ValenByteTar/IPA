@@ -704,24 +704,42 @@ class TestArxivLinkFollowing:
             assert len(docs) == 1
 
 
+def _feed_date(days_ago: int, *, iso: bool = False) -> str:
+    """Fecha de feed relativa a ahora (RFC-822 o ISO según el dialecto).
+
+    Las fechas fijas + days_back relativo se pudren: un item "de hace 25 días"
+    deja de estarlo cuando pasa el tiempo. Con fechas relativas el test no
+    depende de cuándo corre.
+    """
+    from datetime import datetime, timedelta, timezone
+    dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    if iso:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def _rss_pubdate(days_ago: int) -> str:
+    return _feed_date(days_ago)
+
+
 class TestRssFeed:
     """Tests for RSS feed parsing."""
 
     def test_parse_rss_feed_extracts_links(self, tmp_path):
         """Should extract article links from RSS 2.0 feed."""
-        rss_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        rss_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0">
           <channel>
             <title>Test Feed</title>
             <item>
               <title>Article 1</title>
               <link>https://example.com/article-1</link>
-              <pubDate>Mon, 25 Aug 2026 10:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(5)}</pubDate>
             </item>
             <item>
               <title>Article 2</title>
               <link>https://example.com/article-2</link>
-              <pubDate>Wed, 20 Aug 2026 12:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(20)}</pubDate>
             </item>
           </channel>
         </rss>"""
@@ -739,19 +757,19 @@ class TestRssFeed:
 
     def test_parse_rss_feed_filters_by_date(self, tmp_path):
         """Should exclude items older than days_back."""
-        rss_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        rss_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0">
           <channel>
             <title>Test Feed</title>
             <item>
               <title>Recent</title>
               <link>https://example.com/recent</link>
-              <pubDate>Mon, 25 Aug 2026 10:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(5)}</pubDate>
             </item>
             <item>
               <title>Old</title>
               <link>https://example.com/old</link>
-              <pubDate>Mon, 01 Jan 2024 10:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(900)}</pubDate>
             </item>
           </channel>
         </rss>"""
@@ -768,19 +786,19 @@ class TestRssFeed:
 
     def test_parse_rss_feed_applies_url_pattern(self, tmp_path):
         """Should filter links by url_pattern."""
-        rss_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        rss_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0">
           <channel>
             <title>Test Feed</title>
             <item>
               <title>Blog post</title>
               <link>https://example.com/blog/my-post</link>
-              <pubDate>Mon, 25 Aug 2026 10:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(5)}</pubDate>
             </item>
             <item>
               <title>News article</title>
               <link>https://example.com/news/my-news</link>
-              <pubDate>Mon, 25 Aug 2026 11:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(4)}</pubDate>
             </item>
           </channel>
         </rss>"""
@@ -800,19 +818,19 @@ class TestRssFeed:
 
     def test_parse_rss_feed_applies_exclude_paths(self, tmp_path):
         """Should exclude links matching exclude_paths."""
-        rss_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        rss_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0">
           <channel>
             <title>Test Feed</title>
             <item>
               <title>Article</title>
               <link>https://example.com/blog/keep-this</link>
-              <pubDate>Mon, 25 Aug 2026 10:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(5)}</pubDate>
             </item>
             <item>
               <title>Category page</title>
               <link>https://example.com/blog/category/ai</link>
-              <pubDate>Mon, 25 Aug 2026 11:00:00 +0000</pubDate>
+              <pubDate>{_rss_pubdate(4)}</pubDate>
             </item>
           </channel>
         </rss>"""
@@ -832,18 +850,18 @@ class TestRssFeed:
 
     def test_parse_rss_feed_handles_atom(self, tmp_path):
         """Should parse Atom feeds (entry/link/@href)."""
-        atom_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        atom_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <feed xmlns="http://www.w3.org/2005/Atom">
           <title>Test Atom Feed</title>
           <entry>
             <title>Article 1</title>
             <link href="https://example.com/article-1" />
-            <published>2026-08-25T10:00:00Z</published>
+            <published>{_feed_date(5, iso=True)}</published>
           </entry>
           <entry>
             <title>Article 2</title>
             <link href="https://example.com/article-2" />
-            <published>2026-08-20T12:00:00Z</published>
+            <published>{_feed_date(20, iso=True)}</published>
           </entry>
         </feed>"""
         with WebScraper(output_dir=tmp_path) as s:

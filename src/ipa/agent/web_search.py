@@ -68,6 +68,50 @@ def _extract_ddg_redirect(href: str) -> str:
     return href
 
 
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"']+")
+
+
+def extract_urls(text: str) -> list[str]:
+    """URLs http(s) embebidas en texto libre, deduplicadas en orden.
+
+    Recorta puntuación de cierre que suele pegarse al link en prosa
+    (puntos, comas, paréntesis, comillas). Usada por research_topic para
+    detectar fuentes explícitas que el usuario pegó en su mensaje.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in _URL_RE.findall(text or ""):
+        url = raw.rstrip(".,;:!?)]}")
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def strip_urls(text: str) -> str:
+    """Texto sin las URLs embebidas (espacios colapsados)."""
+    return " ".join(_URL_RE.sub(" ", text or "").split())
+
+
+def query_from_url(url: str) -> str:
+    """Deriva una query de búsqueda desde el slug de una URL.
+
+    `…/las-big-tech-de-la-ia-dicen-estar-de-acuerdo/` →
+    `las big tech de la ia dicen estar de acuerdo`. Devuelve "" si el
+    slug no produce palabras útiles (raíz del dominio, slug numérico).
+    """
+    try:
+        slug = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
+    except Exception:
+        return ""
+    slug = re.sub(r"\.(html?|php|aspx?|jsp)$", "", slug, flags=re.I)
+    words = re.sub(r"[-_+]+", " ", slug).strip()
+    # Slug útil = al menos una palabra de letras (descarta ids numéricos).
+    if len(words) < 3 or not re.search(r"[^\W\d_]{3,}", words):
+        return ""
+    return words
+
+
 def _cache_path() -> Path:
     return Path(os.environ.get("IPA_WEB_SEARCH_CACHE", "outputs/agent/web_search_cache.db"))
 

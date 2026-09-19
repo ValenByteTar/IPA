@@ -9,6 +9,7 @@ import pytest
 
 from ipa.agent.research_review import (
     ResearchReviewStore,
+    find_recent_research,
     ingest_reviewed_doc,
     mark_researched,
     recently_researched,
@@ -143,3 +144,68 @@ def test_dedup_expires(tmp_path, monkeypatch):
         data[k] = "2020-01-01T00:00:00.000000Z"
     path.write_text(json.dumps(data), encoding="utf-8")
     assert not recently_researched("tema viejo", path=path)
+
+
+# ---------------------------------------------------------------------------
+# find_recent_research — matching tolerante a la reformulación del modelo
+# ---------------------------------------------------------------------------
+
+def test_find_recent_research_exact(tmp_path):
+    path = tmp_path / "recent.json"
+    mark_researched("Ecuación de Navier", path=path)
+    hit = find_recent_research("ecuacion de navier", path=path)
+    assert hit is not None
+    assert hit["exact"] is True
+    assert hit["age_minutes"] == 0
+
+
+def test_find_recent_research_matches_reformulation(tmp_path):
+    """El modelo reformula la query entre turnos: el match por tokens la agarra."""
+    path = tmp_path / "recent.json"
+    mark_researched("acuerdo ralentizacion avance IA big techs", path=path)
+    hit = find_recent_research(
+        "acuerdo ralentizacion avance IA tres grandes tecnologicas", path=path
+    )
+    assert hit is not None
+    assert hit["exact"] is False
+    assert hit["query"] == "acuerdo ralentizacion avance ia big techs"
+
+
+def test_find_recent_research_shorter_subset_matches(tmp_path):
+    path = tmp_path / "recent.json"
+    mark_researched("acuerdo ralentizacion avance IA big techs", path=path)
+    assert find_recent_research("acuerdo IA", path=path) is not None
+
+
+def test_find_recent_research_rejects_unrelated(tmp_path):
+    path = tmp_path / "recent.json"
+    mark_researched("ecuacion de navier stokes fluidos", path=path)
+    assert find_recent_research("historia de roma republica", path=path) is None
+
+
+def test_find_recent_research_stopword_query_needs_exact(tmp_path):
+    """Sin tokens de contenido no hay match difuso (evita falsos positivos)."""
+    path = tmp_path / "recent.json"
+    mark_researched("acuerdo ralentizacion avance ia", path=path)
+    assert find_recent_research("dame toda la informacion", path=path) is None
+
+
+def test_find_recent_research_respects_window(tmp_path):
+    path = tmp_path / "recent.json"
+    mark_researched("acuerdo ralentizacion avance IA big techs", path=path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for k in data:
+        data[k] = "2020-01-01T00:00:00.000000Z"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert find_recent_research("acuerdo ralentizacion avance IA big techs", path=path) is None
+
+
+def test_find_recent_research_picks_most_recent(tmp_path):
+    """Con varias coincidencias gana la corrida más reciente (la que el
+    usuario tiene arriba en el chat)."""
+    path = tmp_path / "recent.json"
+    mark_researched("tema comun", path=path)
+    mark_researched("tema comun variante", path=path)
+    hit = find_recent_research("tema comun", path=path)
+    assert hit is not None
+    assert hit["query"] == "tema comun variante"

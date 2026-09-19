@@ -52,17 +52,21 @@ capacidad las necesita:
 ```powershell
 # Dashboard web (un solo comando, abre el navegador)
 .\start_ipa_dashboard.bat
-# Con orquestador de consola al lado
-.\start_ipa_dashboard.bat -StartOrchestrator
 
 # Manual
 .venv\Scripts\python.exe scripts\operations\web_dashboard.py --host 127.0.0.1 --port 8765
-.venv\Scripts\python.exe scripts\operations\orchestrator.py --no-scraper --no-hammer
 
 # CLI del agente (misma identidad y memoria que el dashboard)
 .venv\Scripts\python.exe scripts\cli\agent.py chat
 .venv\Scripts\python.exe scripts\cli\agent.py chat --role tutor --llm -m "mensaje"
 ```
+
+**DEPRECADO**: el Orchestrator de consola (cadena scraper → fast_path →
+lancedb → hammer → enrichment) no recibe nuevas funciones — los jobs se
+lanzan desde el dashboard y el trabajo LLM en background corre por el idle
+scheduler (Tiers 1/2). Sigue disponible por compatibilidad
+(`scripts\operations\orchestrator.py`); su job `enrichment` (ExL3 4B) queda
+sin trigger activo hasta que se redefina su reemplazo.
 
 URL local: `http://127.0.0.1:8765` · Health: `/api/health`
 
@@ -108,8 +112,11 @@ prioridades y locks por recurso:
   memoria → topificación (clustering + curación) → promoción → inferencias
   cognitivas (user model, skills, principios, agenda).
 - **Tier 2 (LLM)**: re-etiquetado de tópicos, clasificación de grises,
-  principios abstractos. Solo con idle profundo (≥30 min puede cargar el
-  modelo) o aprovechando un modelo ya cargado (≥5 min quieto). Preemptible
+  veredictos de la cola de review (batched), principios abstractos y
+  `enrich_chunks` (summary + queries sintéticas por chunk + re-embed —
+  recupera el ex-job `enrichment` del Orchestrator sobre el 9B del pase).
+  Solo con idle profundo (≥30 min puede cargar el modelo — ExL3 batch por
+  defecto) o aprovechando un modelo ya cargado (≥5 min quieto). Preemptible
   al primer mensaje.
 
 Log auditable: `outputs/web_dashboard/logs/idle_enrichment.log`.
@@ -154,7 +161,6 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 | `IPA_FORCE_CPU` | (no) | `1` fuerza modo 100% CPU |
 | `IPA_AUTO_RESEARCH` | `1` | auto-research ante gap de corpus (`0` desactiva) |
 | `IPA_AUTO_RESEARCH_DEDUP_MINUTES` | `10` | ventana de dedup de research |
-| `IPA_IDLE_DEEP_ENRICHMENT` | `0` | Tier 2 puede cargar el modelo (idle ≥30 min) |
 | `IPA_IDLE_LLM_LOADED_ENRICHMENT` | `1` | Tier 2 con modelo ya cargado (≥5 min idle) |
 | `IPA_IDLE_DEEP_THRESHOLD_MINUTES` | `30` | umbral de idle profundo |
 | `IPA_RESEARCH_REVIEW_IDLE_SECONDS` | `60` | inactividad para el review worker |
@@ -164,6 +170,24 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 | `IPA_SEARXNG_CHECK_INTERVAL` | `60` | segundos entre chequeos de SearXNG del watchdog |
 | `IPA_PROXY_URL` | `http://127.0.0.1:8765` | dashboard al que el MCP server proxea |
 | `IPA_MCP_TIMEOUT` | `300` | timeout (s) de los HTTP calls del MCP server |
+| `IPA_OLLAMA_NUM_GPU` | (auto) | capas del modelo a GPU por request (`num_gpu`); el auto-fit de Ollama es conservador — forzarlo sube el decode ~2x |
+| `IPA_OLLAMA_KEEP_ALIVE` | `30m` | cuánto retiene Ollama el modelo cargado tras cada request (`-1` nunca descarga) |
+| `IPA_OLLAMA_NUM_KEEP` | `2048` | tokens del INICIO que se preservan al llenarse el contexto; default de llama.cpp = 4 → el system prompt se evapora primero |
+| `IPA_OLLAMA_NUM_CTX` | `6144` | contexto por request; los prompts reales miden 2.3-4.1k |
+| `IPA_OLLAMA_REPEAT_LAST_N` | (servidor) | ventana del repetition penalty |
+| `IPA_OLLAMA_NUM_BATCH` | (servidor) | batch de prefill por request |
+| `IPA_EMBED_CACHE_SIZE` | `256` | LRU de embeddings de query (`0` desactiva) |
+| `IPA_RERANK_CACHE_SIZE` | `128` | LRU de rankings del cross-encoder (`0` desactiva) |
+| `IPA_RETRIEVAL_CACHE_SIZE` / `_TTL` | `64` / `300` | cache TTL de resultados de retrieval (query→hits) |
+| `IPA_TOOL_CACHE_TTL` | `30` | TTL del cache de tools read-only (`0` desactiva; `get_system_status` nunca se cachea) |
+| `IPA_RESPONSE_CACHE` | `0` (off) | cache de respuestas del chat: dedup exacto por (mensaje, rol, sesión) |
+| `IPA_VRAM_LOCK_TTL` | `1800` | TTL del lock de VRAM ExL3↔Ollama |
+| `IPA_IDLE_DEEP_ENRICHMENT` | `1` | pase Tier 2 profundo (≥30 min idle); con `IPA_T2_ENGINE=exl3` es el hogar del trabajo batch |
+| `IPA_T2_ENGINE` | `exl3` | motor del pase Tier 2 profundo (`ollama` para volver al comportamiento anterior) |
+| `IPA_T2_CTX` / `IPA_T2_BATCH` | `2048` / `4` | contexto y lote del pase ExL3 (batch 4 = sweet spot medido; MTP se apaga solo) |
+| `IPA_T2_REVIEW_LIMIT` | `12` | docs de la cola de review por pase batched |
+| `IPA_T2_ENRICH_LIMIT` / `_MIN_CHARS` | `60` / `400` | chunks por pase de `enrich_chunks` y umbral de tamaño del filtro de densidad (el corpus es uniforme ~512 chars; con 800 no selecciona nada) |
+| `IPA_EXL3_FORCE_MTP` | `0` | `1` fuerza MTP aunque el batch sea > 2 (medido: thrashing) |
 
 ## Hardware: GPU o 100% CPU
 
@@ -171,6 +195,47 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 - **Sin GPU**: fallback automático — chat/Tutor por Ollama (CPU), OCR y
   Docling en `cpu`, embeddings en CPU. Nada falla al boot; `IPA_FORCE_CPU=1`
   lo fuerza explícitamente.
+
+### Ajuste de VRAM para velocidad (tok/s)
+
+El auto-fit de Ollama es conservador: deja ~1.4 GB de VRAM libre y manda la
+mitad del modelo a CPU. Medido en RTX 4050 (6 GB) con qwen3.5:9b:
+
+| Config | Capas GPU | decode | prefill |
+|---|---|---|---|
+| auto | 18/34 | 10.4 tok/s | 453 tok/s |
+| `IPA_OLLAMA_NUM_GPU=28` | 28/34 | 17.3 tok/s | 653 tok/s |
+| `IPA_OLLAMA_NUM_GPU=30` | 30/34 | 20.6 tok/s | 680 tok/s |
+| `IPA_OLLAMA_NUM_GPU=32` | 32/34 | 9.3 tok/s | 22 tok/s (sin VRAM para compute) |
+
+El punto de quiebre depende de la GPU — subir de a 2 y medir. Complementos:
+`OLLAMA_KV_CACHE_TYPE=q8_0` (mitad de VRAM de KV), `OLLAMA_FLASH_ATTENTION=1`.
+Si al matar/reiniciar Ollama quedan `llama-server.exe` huérfanos, retienen GB
+de VRAM y el siguiente auto-fit manda el modelo a CPU: el watchdog los barre
+solo cuando la API está caída.
+
+### Caches y convivencia de motores
+
+- **PT cache (Ollama)**: el prompt se arma con lo inmutable en el system y todo
+  lo volátil (evidencia RAG, memoria, catálogo de tools) al final del turno
+  user → el runner reusa el prefijo. Medido: 72-90% de reuse por turno
+  (`prompt_eval_cached_count` en `outputs/web_dashboard/logs/llm_perf.jsonl`).
+- **PT cache (ExL3)**: automático — el generator de ExLlamaV3 hashea las
+  páginas de KV y reusa prefijos compartidos entre jobs. Medido: TTFT
+  3.7s → 0.34s (10.9x) en la segunda generación con el mismo prompt.
+- **Caches de la aplicación**: embeddings de query, rankings del reranker,
+  resultados de retrieval, tools read-only y (opt-in) respuestas del chat.
+  Todos con env de tamaño/TTL — ver la tabla de variables.
+- **ExL3 ↔ Ollama (lock de VRAM)**: en GPUs chicas no conviven. `ExL3.load()`
+  descarga los modelos de Ollama, toma `outputs/agent/vram.lock` y lo libera
+  en `unload()`. Mientras ExL3 lo tiene, el chat devuelve
+  "GPU ocupada por exl3" en vez de matar el batch con OOM. Un lock de un
+  proceso muerto se roba solo (TTL `IPA_VRAM_LOCK_TTL`).
+- **Batch ExL3 en 6 GB**: `batch_size=6` con contexto 6144 **no entra** (OOM
+  al cargar). Con contexto 2048 entra pero el generator reencola jobs por
+  presión de páginas (medido: 17.5 tok/s agregado con secuencias de 3 a 31
+  tok/s, vs 37 tok/s single-stream). Para jobs batch usar contexto ≤2048 y
+  lotes ≤3.
 
 ## Seguridad y política de datos
 

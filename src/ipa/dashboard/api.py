@@ -21,9 +21,75 @@ globals().update({name: value for name, value in vars(_server).items() if not na
 import concurrent.futures as _cf
 import os
 import re as _re_module
+import time as _time_module
 
 _RETRIEVAL_POOL = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrieval")
 _RETRIEVAL_STORES: dict[str, object] = {}
+
+
+class _TTLCache:
+    """Cache TTL+LSU mínimo para resultados de retrieval (query → hits).
+
+    Repetir la misma pregunta (o re-consultar en turnos seguidos) pagaba
+    LanceDB + rerank completos. TTL corto (IPA_RETRIEVAL_CACHE_TTL, default
+    300s) acota la staleness frente a documentos nuevos; el embedding ya
+    tiene su propio cache. IPA_RETRIEVAL_CACHE_SIZE=0 lo desactiva.
+    """
+
+    def __init__(self, maxsize: int, ttl_s: float) -> None:
+        self.maxsize = maxsize
+        self.ttl_s = ttl_s
+        self._data: dict[str, tuple[float, object]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str):
+        if self.maxsize <= 0:
+            return None
+        item = self._data.get(key)
+        if item is None:
+            self.misses += 1
+            return None
+        ts, value = item
+        if _time_module.time() - ts > self.ttl_s:
+            self._data.pop(key, None)
+            self.misses += 1
+            return None
+        self.hits += 1
+        return value
+
+    def put(self, key: str, value) -> None:
+        if self.maxsize <= 0:
+            return
+        self._data[key] = (_time_module.time(), value)
+        while len(self._data) > self.maxsize:
+            oldest = min(self._data, key=lambda k: self._data[k][0])
+            self._data.pop(oldest, None)
+
+    def stats(self) -> dict[str, float]:
+        return {"size": len(self._data), "maxsize": self.maxsize,
+                "ttl_s": self.ttl_s, "hits": self.hits, "misses": self.misses}
+
+
+_RETRIEVAL_CACHE = _TTLCache(
+    maxsize=int(os.environ.get("IPA_RETRIEVAL_CACHE_SIZE", "64") or 64),
+    ttl_s=float(os.environ.get("IPA_RETRIEVAL_CACHE_TTL", "300") or 300),
+)
+
+# Cache de respuestas del chat: opt-in (IPA_RESPONSE_CACHE=1, default OFF).
+# Match exacto normalizado por (mensaje, rol, sesión) — dedup de repetidos,
+# no similitud semántica (servir una respuesta "parecida" es incorrecto).
+_RESPONSE_CACHE_ON = os.environ.get("IPA_RESPONSE_CACHE", "0").strip().lower() not in (
+    "0", "false", "no", "off", "")
+_RESPONSE_CACHE = _TTLCache(
+    maxsize=int(os.environ.get("IPA_RESPONSE_CACHE_SIZE", "32") or 32),
+    ttl_s=float(os.environ.get("IPA_RESPONSE_CACHE_TTL", "120") or 120),
+)
+
+
+def _response_cache_key(message: str, role: str, session_id: str) -> str:
+    norm = " ".join(message.lower().split())
+    return f"{role}\x00{session_id}\x00{norm}"
 
 
 def _retrieval_lance(corpus):
@@ -1470,6 +1536,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 messages = core.build_messages(message, history_limit=6)
+                # Prefix-cache friendly: el contexto volátil de este turno
+                # (evidencia RAG/memoria, notas de research) se acumula acá y
+                # va al TAIL del prompt — no al system — para que el prefijo
+                # [system estable + historia append-only] se reutilice entre
+                # turnos en el KV del runner de Ollama (longest-prefix reuse).
+                _volatile_ctx: list[str] = []
                 # Progressive tool unlocking: el agente empieza con 7 tools
                 # base y desbloquea más a medida que las usa. Esto reduce la
                 # carga cognitiva del 9B (7 tools vs 17 en el catálogo).
@@ -1487,8 +1559,11 @@ class Handler(BaseHTTPRequestHandler):
                     unlocked = unlock_after_tool(used, unlocked)
                 _server_mod._SESSION_TOOLS[session_key] = unlocked | used_tools
                 catalog = build_tool_catalog(unlocked)
-                # Enable the tool protocol in the system prompt
-                messages[0] = {"role": "system", "content": messages[0]["content"] + "\n\n" + catalog}
+                # Tool protocol en el TAIL, no en el system: el catálogo cambia
+                # cuando una tool se desbloquea, y cualquier mutación temprana
+                # del prompt mata el longest-prefix-reuse del runner (todo lo
+                # que sigue al diff —incluida la historia estable— se re-evalúa).
+                _volatile_ctx.append(catalog)
                 # Investigación en vuelo: si el pedido depende de los datos que
                 # están llegando, el agente aguarda en vez de improvisar pasos
                 # que requieren material que todavía no existe.
@@ -1496,7 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                     from ipa.agent.system_tools import _research_progress
                     _rp = _research_progress()
                     if _rp.get("status") == "running":
-                        messages[0]["content"] += (
+                        _volatile_ctx.append(
                             "\n\nHay una investigación web en curso sobre "
                             f"'{_rp.get('query', '?')}'. Si el pedido del usuario "
                             "depende de esos datos, respondé en una oración que "
@@ -1541,6 +1616,28 @@ class Handler(BaseHTTPRequestHandler):
                 # restaura el comportamiento anterior (solo ofrece).
                 _auto_research = os.environ.get("IPA_AUTO_RESEARCH", "1") != "0"
                 _auto_hits: list[dict[str, Any]] = []
+                # Cache de respuestas (opt-in IPA_RESPONSE_CACHE=1, default OFF):
+                # repetir la MISMA pregunta en la MISMA sesión (doble envío,
+                # retry tras timeout) re-emite la respuesta sin retrieval ni
+                # generación. Match exacto normalizado — no similitud difusa:
+                # servir una respuesta parecida-pero-no-igual es incorrecto.
+                if _RESPONSE_CACHE_ON and _dd is None:
+                    _rck = _response_cache_key(message, _role, core.session_id)
+                    _rchit = _RESPONSE_CACHE.get(_rck)
+                    if _rchit is not None:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "keep-alive")
+                        self.end_headers()
+                        self._sse_write({"type": "session", "session_id": core.session_id})
+                        self._sse_write({"type": "cached", "hit": True})
+                        for _i in range(0, len(_rchit), 400):
+                            self._sse_write({"type": "token", "text": _rchit[_i:_i + 400]})
+                        self._sse_write({"type": "done", "reply": _rchit})
+                        _server_mod.CHAT_BUSY["flag"] = False
+                        core.memory.close()
+                        return
                 if _dd is not None:
                     # Deep dive: retrieval agéntico sobre el corpus del
                     # reporte (planner + Tantivy + LanceDB híbrido 3-vías),
@@ -1581,7 +1678,7 @@ class Handler(BaseHTTPRequestHandler):
                                 f"[{i}] {chunk.text[:1200]}"
                                 for i, chunk in enumerate(_dd_chunks, 1)
                             )
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEvidencia del corpus del reporte — respondé SOLO "
                                 "con estos datos, sin escribir marcadores [n] en la "
                                 "respuesta:\n" + _dd_lines
@@ -1599,7 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
                             })
                         else:
                             self._sse_write({"type": "retrieval", "stage": "empty", "query": message})
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEl corpus del reporte no devolvió evidencia para "
                                 "esta consulta. Decilo y ofrecé ampliar la búsqueda."
                             )
@@ -1617,7 +1714,7 @@ class Handler(BaseHTTPRequestHandler):
                                 f"- [{i['scope']}/{i['kind']}] {i['text']}"
                                 for i in _items
                             )
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nMEMORIA RECUPERADA — esto ES tu memoria real "
                                 "(episodios y perfil de tu usuario, que es Valen; "
                                 "vos sos RA):\n" + _mem_lines +
@@ -1635,7 +1732,7 @@ class Handler(BaseHTTPRequestHandler):
                             })
                         else:
                             self._sse_write({"type": "retrieval", "stage": "empty", "query": message})
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nTu memoria no tiene nada registrado sobre esto "
                                 "todavía. Decilo honestamente y ofrecé recordarlo "
                                 "si el usuario lo comparte ahora."
@@ -1710,7 +1807,15 @@ class Handler(BaseHTTPRequestHandler):
                         _retrieval_timeout = float(
                             os.environ.get("IPA_RETRIEVAL_TIMEOUT_SECONDS", "60")
                         )
-                        _auto_hits = _RETRIEVAL_POOL.submit(_do_retrieval).result(timeout=_retrieval_timeout)
+                        from ipa.agent.system_tools import _main_corpus_dir as _mcd
+                        from ipa.indexes.reranker_adapter import rerank_enabled as _re_on
+                        _rkey = f"{message}\x00{_mcd()}\x00{_re_on()}"
+                        _cached_hits = _RETRIEVAL_CACHE.get(_rkey)
+                        if _cached_hits is not None:
+                            _auto_hits = _cached_hits
+                        else:
+                            _auto_hits = _RETRIEVAL_POOL.submit(_do_retrieval).result(timeout=_retrieval_timeout)
+                            _RETRIEVAL_CACHE.put(_rkey, _auto_hits)
                     except _cf.TimeoutError:
                         self._sse_write({"type": "retrieval", "stage": "timeout"})
                     except Exception as exc:
@@ -1729,26 +1834,22 @@ class Handler(BaseHTTPRequestHandler):
                             "type": "retrieval", "stage": "found",
                             "count": len(_auto_hits), "sources": _sources,
                         })
-                        # El retrieval ya corrió este turno: search_corpus no se
-                        # ofrece en el catálogo (evita una segunda búsqueda) y si
-                        # el modelo lo emite igual, se responde con el cache.
-                        if "search_corpus" in unlocked:
-                            unlocked.discard("search_corpus")
-                            _cat = build_tool_catalog(unlocked)
-                            _sys = messages[0]["content"]
-                            if "\n\nHerramientas." in _sys:
-                                messages[0]["content"] = _sys.split("\n\nHerramientas.")[0] + "\n\n" + _cat
+                        # El retrieval ya corrió este turno: NO se muta el
+                        # catálogo a mitad de turno (rompería el prefijo KV
+                        # compartido). Si el modelo emite search_corpus igual,
+                        # el dedup por call_key lo rechaza.
                         context_lines = "\n".join(
                             f"[{i}] ({h['source_domain'] or h['document_id']}) {h['text']}"
                             for i, h in enumerate(_auto_hits, 1)
                         )
-                        messages[0]["content"] += (
-                            "\n\nContexto relevante del corpus — respondé SOLO con "
+                        _volatile_ctx.append(
+                            "\n\nContexto relevante del corpus — la búsqueda ya "
+                            "se ejecutó este turno: respondé SOLO con "
                             "estos datos, sin escribir marcadores [n] en la "
                             "respuesta (el usuario no puede abrir esas fuentes):\n" + context_lines
                         )
                         if _is_order:
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEl usuario te dio una ORDEN directa de profundizar. "
                                 "Ejecutá ya con el contexto de arriba: respondé con el "
                                 "análisis profundo que pidieron. Si el contexto no "
@@ -1757,7 +1858,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "NO preguntes si querés que empiece."
                             )
                         elif _auto_research and _msg_kind == "knowledge":
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nSi este contexto NO responde la pregunta del "
                                 "usuario, decí qué falta y emití "
                                 "[TOOL:research_topic]{\"query\": \"<tema faltante>\"} "
@@ -1767,13 +1868,13 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         self._sse_write({"type": "retrieval", "stage": "empty", "query": message})
                         if _is_order:
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEl corpus NO devolvió resultados y el usuario dio una "
                                 "ORDEN directa. Ejecutá: emití [TOOL:research_topic]{...} "
                                 "con la query en esta misma respuesta — no pidas permiso."
                             )
                         elif _auto_research and _msg_kind == "knowledge":
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEl corpus NO devolvió resultados para esta consulta. "
                                 "Decí que no hay datos en el corpus y emití "
                                 "[TOOL:research_topic]{\"query\": \"<tema>\"} en esta "
@@ -1782,13 +1883,21 @@ class Handler(BaseHTTPRequestHandler):
                                 "conocimiento interno."
                             )
                         else:
-                            messages[0]["content"] += (
+                            _volatile_ctx.append(
                                 "\n\nEl corpus NO devolvió resultados para esta consulta. "
                                 "Decí que no hay datos y ofrecé lanzar una investigación "
                                 "web con la tool research_topic. No respondas desde tu "
                                 "conocimiento interno."
                             )
 
+                # Merge: contexto volátil al tail — dentro del turno user,
+                # antes de la pregunta (evidencia primero, pregunta última =
+                # más cerca de la generación). El episodio grabado guarda el
+                # mensaje crudo, así la historia sigue append-only/estable.
+                if _volatile_ctx:
+                    messages[-1]["content"] = (
+                        "\n\n".join(_volatile_ctx) + "\n\n" + messages[-1]["content"]
+                    )
 
                 try:
                     def _clean(text: str) -> str:
@@ -2061,6 +2170,10 @@ class Handler(BaseHTTPRequestHandler):
                         tool_name, tool_args = parsed_tool
                         if tool_name == "research_topic":
                             tool_args["_session_id"] = core.session_id
+                            # Mensaje crudo del usuario: la tool rescata de ahí
+                            # las URLs que el modelo descartó al parafrasear la
+                            # query (se scrapean directo como fuentes).
+                            tool_args["_user_message"] = message
                         call_key = tool_name + "|" + json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
                         tool_round += 1
                         refused = None
@@ -2104,11 +2217,16 @@ class Handler(BaseHTTPRequestHandler):
                             tool_name, _server_mod._SESSION_TOOLS[session_key]
                         )
                         _server_mod._SESSION_TOOLS[session_key] = new_unlocked
-                        # Actualizar el catálogo en el system prompt para la
-                        # próxima ronda de generación.
-                        updated_catalog = build_tool_catalog(new_unlocked)
-                        messages[0] = {"role": "system", "content": messages[0]["content"].split("\n\nHerramientas.")[0] + "\n\n" + updated_catalog}
-                        messages.append({"role": "user", "content": tool_block + "\n\nRespondé al usuario en 1-3 oraciones. Si necesitás otra herramienta, emití el marcador."})
+                        # NO reescribir el catálogo en messages[0]: mutar el
+                        # system a mitad de turno rompe el prefijo KV y toda la
+                        # historia se re-evalúa. Las tools recién desbloqueadas
+                        # se anuncian en el tail (junto al resultado).
+                        newly = sorted(new_unlocked - unlocked)
+                        unlock_note = (
+                            f"\n\nHerramientas desbloqueadas: {', '.join(newly)} — podés emitirlas si hacen falta."
+                            if newly else ""
+                        )
+                        messages.append({"role": "user", "content": tool_block + unlock_note + "\n\nRespondé al usuario en 1-3 oraciones. Si necesitás otra herramienta, emití el marcador."})
                         self._sse_write({"type": "new_message"})
                         # loop → la próxima generación puede ser otro marcador
                         # o la respuesta final al usuario.
@@ -2131,6 +2249,11 @@ class Handler(BaseHTTPRequestHandler):
                         tool_calls=_turn_tools,
                     )
                     self._sse_write({"type": "done", "reply": full_reply})
+                    if _RESPONSE_CACHE_ON and _dd is None and full_reply:
+                        _RESPONSE_CACHE.put(
+                            _response_cache_key(message, _role, core.session_id),
+                            full_reply,
+                        )
                     # Cerrar la conexión: HTTP/1.1 keep-alive dejaría el socket
                     # abierto y el reader del browser nunca terminaría.
                     self.close_connection = True

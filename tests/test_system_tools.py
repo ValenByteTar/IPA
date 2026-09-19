@@ -137,6 +137,67 @@ def test_research_topic_already_running(tmp_path, monkeypatch):
     assert result.data["already_running"] is True
 
 
+def _no_launch(monkeypatch, tmp_path):
+    """Neutraliza el lanzamiento real: corpus fake + Popen capturado."""
+    import ipa.agent.research_review as rr
+    captured: dict = {}
+    monkeypatch.setattr(system_tools, "_research_progress", lambda: {})
+    monkeypatch.setattr(system_tools, "_main_corpus_dir", lambda: tmp_path)
+    monkeypatch.setattr(system_tools, "_write_research_progress", lambda p: captured.update(p))
+    monkeypatch.setattr(rr, "mark_researched", lambda q, **kw: None)
+    import subprocess as sp
+    monkeypatch.setattr(sp, "Popen", lambda argv, **kw: captured.setdefault("argv", argv))
+    return rr, captured
+
+
+def test_research_topic_dedup_blocks_explicit_call(tmp_path, monkeypatch):
+    """El dedup aplica también a llamados explícitos del modelo (no solo al
+    safety-net): reformular la query no debe relanzar la investigación."""
+    rr, captured = _no_launch(monkeypatch, tmp_path)
+    monkeypatch.setattr(rr, "find_recent_research", lambda q, **kw: {
+        "query": "acuerdo ralentizacion avance ia big techs",
+        "age_minutes": 4, "exact": False,
+    })
+    result = execute_system_tool(
+        "research_topic",
+        {"query": "acuerdo ralentizacion avance IA tres grandes tecnologicas"},
+    )
+    assert result.ok
+    assert result.data["dedup"] is True
+    assert result.data["matched_query"] == "acuerdo ralentizacion avance ia big techs"
+    assert "force=true" in result.summary
+    assert "argv" not in captured  # no se lanzó ningún subproceso
+
+
+def test_research_topic_force_bypasses_dedup(tmp_path, monkeypatch):
+    rr, captured = _no_launch(monkeypatch, tmp_path)
+    monkeypatch.setattr(rr, "find_recent_research", lambda q, **kw: {
+        "query": "lo mismo", "age_minutes": 1, "exact": True,
+    })
+    result = execute_system_tool(
+        "research_topic", {"query": "lo mismo de nuevo", "force": True}
+    )
+    assert result.ok
+    assert "dedup" not in result.data
+    assert captured["status"] == "running"
+    assert captured["argv"][1].endswith("run_research.py")
+
+
+def test_research_topic_reinjects_urls_from_user_message(tmp_path, monkeypatch):
+    """Las URLs del mensaje crudo del usuario se reinyectan en la query —
+    el modelo las descarta al parafrasear."""
+    rr, captured = _no_launch(monkeypatch, tmp_path)
+    monkeypatch.setattr(rr, "find_recent_research", lambda q, **kw: None)
+    url = "https://www.pagina12.com.ar/2026/09/12/las-big-tech-de-la-ia-dicen-estar-de-acuerdo-en-frenar-su-desarrollo/"
+    result = execute_system_tool("research_topic", {
+        "query": "acuerdo de las big tech para frenar la IA",
+        "_user_message": f"Como que no, mira {url}",
+    })
+    assert result.ok
+    assert url in result.data["query"]
+    assert url in captured["argv"][2]  # la query lanzada lleva la URL
+
+
 def test_list_promotions_empty_when_no_db(tmp_path, monkeypatch):
     monkeypatch.setattr(system_tools, "TOPIC_CLUSTER_DB", tmp_path / "nope.db")
     result = execute_system_tool("list_promotions", {})

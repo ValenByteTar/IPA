@@ -156,7 +156,7 @@ RESEARCH_WATCH = {"session_id": None, "saw_running": False}
 # Level 1 runs every 5 min of idle; Level 2 (LLM) after 30 min continuous idle.
 LAST_ACTIVITY = {"ts": time.time()}
 IDLE_DEEP_THRESHOLD = int(os.environ.get("IPA_IDLE_DEEP_THRESHOLD_MINUTES", "30"))
-IDLE_DEEP_ENABLED = os.environ.get("IPA_IDLE_DEEP_ENRICHMENT", "0") == "1"
+IDLE_DEEP_ENABLED = os.environ.get("IPA_IDLE_DEEP_ENRICHMENT", "1") == "1"
 # Tier 2 "liviano": si el modelo YA está cargado por el chat y el sistema
 # está quieto, se aprovecha para enriquecer sin cargar nada (interrumpible
 # al primer mensaje). No levanta el modelo por sí solo.
@@ -715,7 +715,26 @@ def get_deep_dive_provider():
 
         if DEEP_DIVE_PROVIDER is not None and DEEP_DIVE_PROVIDER.is_loaded():
 
-            return DEEP_DIVE_PROVIDER
+            if not getattr(DEEP_DIVE_PROVIDER, "_t2_owned", False):
+
+                return DEEP_DIVE_PROVIDER
+
+            # El pase Tier 2 cargó un motor batch (ExL3 ctx 2048): no sirve
+            # para el chat (prompts de 2.3-4.1k) y el usuario tiene prioridad.
+            # Se descarga y se cae al camino normal (factory → Ollama).
+            # unload() libera el lock de VRAM en el mismo proceso, así la
+            # carga siguiente lo encuentra libre. El worker del Tier 2 aborta
+            # vía should_abort (CHAT_BUSY) y su finally solo descarga si la
+            # instancia sigue siendo la suya (guard por identidad).
+            try:
+
+                DEEP_DIVE_PROVIDER.unload()
+
+            except Exception:
+
+                pass
+
+            DEEP_DIVE_PROVIDER = None
 
         with JOBS_LOCK:
 
@@ -2300,6 +2319,57 @@ def main() -> None:
         path = state_dir / f"{name}.json"
         return read_json(path, {"status": "not_started"})
 
+    def _load_deep_engine(ilog) -> Any:
+        """Motor del pase Tier 2 profundo.
+
+        ExL3 (IPA_T2_ENGINE=exl3, default): batch 3-4, ctx 2048, MTP off (el
+        guard del provider lo fuerza para batch > 2). Es el único punto del
+        sistema que YA pagaba el costo de cargar un modelo desde frío — el
+        switch se amortiza sobre toda la cola Tier 2, y el throughput agregado
+        es ~2.4x (EXP-008 §8). Fallback a Ollama (factory) si ExL3 no carga.
+        """
+        engine = os.environ.get("IPA_T2_ENGINE", "exl3").strip().lower()
+        if engine == "exl3":
+            try:
+                from ipa.providers.exl3_provider import ExL3Provider
+                _ctx = int(os.environ.get("IPA_T2_CTX", "2048") or 2048)
+                _bs = int(os.environ.get("IPA_T2_BATCH", "4") or 4)
+                _root = ROOT / "models" / "Qwen3.5-9B-exl3-3.0bpw"
+                provider = ExL3Provider(
+                    model_path=str(_root),
+                    model_id="Qwen3.5-9B-EXL3-3.0bpw",
+                    quantization="EXL3-3.0bpw",
+                    context_length=_ctx,
+                    max_output_tokens=512,
+                    temperature=0.1,
+                    no_think=True,
+                    batch_size=_bs,
+                    use_mtp=True,  # el guard lo apaga para batch > 2
+                    mtp_draft_tokens=2,
+                    mtp_cache_tokens=_ctx,
+                    cache_k_bits=8,
+                    cache_v_bits=8,
+                    suppress_cjk=True,
+                    rep_p=1.15,
+                )
+                provider.load()
+                # Marca de propiedad: si el chat llega con este motor cargado,
+                # get_deep_dive_provider() lo descarga y monta el interactivo
+                # (el usuario tiene prioridad sobre el trabajo de fondo).
+                provider._t2_owned = True
+                ilog(f"  [idle-sched T2] ExL3 listo (ctx {_ctx}, batch {_bs}, "
+                     f"MTP {'on' if provider.use_mtp else 'off'})", flush=True)
+                return provider
+            except Exception as exc:
+                ilog(f"  [idle-sched T2] ExL3 no disponible ({exc}) — fallback Ollama",
+                     flush=True)
+        from ipa.providers.factory import create_star_provider
+        provider = create_star_provider(interactive=True)
+        provider.load()
+        # El fallback también es del pase: mismo marcador de prioridad al chat.
+        provider._t2_owned = True
+        return provider
+
     def _idle_enrichment_worker():
         import time as _time
         # El provider global se lee y se (des)carga desde este worker.
@@ -2452,6 +2522,13 @@ def main() -> None:
             def _run(ctx):
                 if ctx.should_abort():
                     return {"skipped": "aborted"}
+                # Trabajo batch por diseño: en Ollama serial cada doc cuesta
+                # ~25 s y acapara el motor del chat durante horas sobre el
+                # corpus completo. Solo corre con un provider que implemente
+                # generate_chat_batch (ExL3) — el split de motores de EXP-008.
+                from ipa.agentic.batch_llm import supports_batch
+                if not supports_batch(ctx.provider):
+                    return {"skipped": "requiere provider con batch (ExL3)"}
                 cluster_store = TopicClusterStore()
                 try:
                     result = enrich_corpus_level2(
@@ -2469,7 +2546,104 @@ def main() -> None:
             return _run
 
         def _t_cog_principles_llm(ctx):
+            # Split por longitud de salida: los principios usan ~500 tok
+            # (max_new_tokens=500 en strategic_memory) — fuera del rango
+            # cómodo del motor batch ExL3 (~300-400 tok con contexto largo,
+            # EXP-008 §6). Se saltea en el pase ExL3 y queda para Ollama.
+            engine = str(getattr(ctx.provider, "engine", "") or "")
+            if engine == "exllamav3":
+                return {"skipped": "salida larga (~500 tok): no apta para motor batch"}
             return reflect_principles(ctx.episodes, provider=ctx.provider)
+
+        def _t_review_batch(ctx):
+            """Veredictos de la cola de review en un pase batched (128 tok/ítem).
+
+            Con ExL3 batch 3-4 el throughput agregado es ~2.4x el serial
+            (EXP-008 §8). Reemplaza al worker de 60s de idle: el switch de
+            motor no se amortiza por pocos docs, sí dentro del pase Tier 2.
+            """
+            from ipa.agent.research_review import (
+                ResearchReviewStore, ingest_reviewed_doc, review_docs_with_llm,
+            )
+            from ipa.agent.system_tools import _main_corpus_dir
+
+            limit = int(os.environ.get("IPA_T2_REVIEW_LIMIT", "12") or 12)
+            store = ResearchReviewStore()
+            try:
+                items = store.pending(limit=limit)
+                if not items:
+                    return {"pending": 0}
+                if ctx.should_abort():
+                    return {"skipped": "aborted"}
+                corpus = _main_corpus_dir() or MAIN_CORPUS
+                landing = ROOT / "Landing" / "web"
+                CHAT_BUSY["flag"] = True  # el generator no es thread-safe
+                try:
+                    verdicts = review_docs_with_llm(ctx.provider, items)
+                finally:
+                    CHAT_BUSY["flag"] = False
+                promoted = discarded = errors = 0
+                for item, verdict in zip(items, verdicts):
+                    if verdict.get("error"):
+                        store.mark(item["review_id"], "error", verdict["error"])
+                        errors += 1
+                        continue
+                    if verdict.get("promote"):
+                        try:
+                            doc_id = ingest_reviewed_doc(
+                                corpus, landing, item,
+                                embedding_adapter=get_embedding_adapter(),
+                            )
+                            store.mark(item["review_id"], "promoted",
+                                       verdict.get("reason", ""), document_id=doc_id)
+                            promoted += 1
+                        except Exception as exc:
+                            store.mark(item["review_id"], "error", str(exc)[:200])
+                            errors += 1
+                    else:
+                        store.mark(item["review_id"], "discarded",
+                                   verdict.get("reason", ""))
+                        discarded += 1
+                return {"promoted": promoted, "discarded": discarded, "errors": errors}
+            finally:
+                store.close()
+
+        def _t_enrich_chunks(ctx):
+            """Summary + queries sintéticas por chunk + re-embed en LanceDB.
+
+            Recupera el trabajo del worker deprecado del Orchestrator
+            (run_enrichment_exl3.py, era 4B): ahora corre sobre el 9B ya
+            cargado del pase — el switch de motor ya está pagado. Incremental:
+            los chunks ya enriquecidos ([Summary]) se saltean y el checkpoint
+            embedding_status recupera corridas cortadas.
+            """
+            from ipa.agentic.chunk_enrichment import count_pending, enrich_chunks
+            from ipa.indexes.lancedb_index import LanceDBIndex
+
+            store_db = MAIN_CORPUS / "document_store.db"
+            if not store_db.exists():
+                return {"skipped": "sin document_store"}
+            limit = int(os.environ.get("IPA_T2_ENRICH_LIMIT", "60") or 60)
+            # El worker original usaba min_chars=800 (corpus de chunks
+            # grandes). El corpus actual es uniforme ~512 chars — con 800 el
+            # filtro no selecciona nada. Con ~400 la densidad discrimina
+            # (~3% del corpus, medido 2026-09).
+            min_chars = int(os.environ.get("IPA_T2_ENRICH_MIN_CHARS", "400") or 400)
+            if count_pending(store_db, min_chars=min_chars) <= 0:
+                return {"pending": 0}
+            if ctx.should_abort():
+                return {"skipped": "aborted"}
+            embedding = get_embedding_adapter()  # CPU — no compite con ExL3
+            lancedb = LanceDBIndex(MAIN_CORPUS / "vector" / "lancedb",
+                                   vector_dim=embedding.dimension)
+            try:
+                return enrich_chunks(
+                    ctx.provider, store_db,
+                    lancedb=lancedb, embedding=embedding,
+                    limit=limit, min_chars=min_chars,
+                    should_abort=ctx.should_abort, log=_ilog)
+            finally:
+                lancedb.close()
 
         _scheduler = IdleScheduler([
             # Tier 1 — CPU/IO, sin VRAM. Prioridad: higiene → memoria →
@@ -2504,8 +2678,22 @@ def main() -> None:
             IdleTask("deep_topify_reporter", 2, 11, _t_deep_topify(_reporter_corpus, "reporter"),
                      resources=frozenset({RES_LLM, RES_CLUSTER_STORE, RES_CORPUS_REPORTER}),
                      cooldown_seconds=300, needs_llm=True),
+            # Review batched: veredictos de 128 tok — el caso de uso ideal del
+            # motor batch. Prioridad 15: después de los labels, antes de los
+            # principios (que se saltean en el pase ExL3).
+            IdleTask("review_batch", 2, 15, _t_review_batch,
+                     resources=frozenset({RES_LLM, RES_AGENT_DB}),
+                     cooldown_seconds=300, needs_llm=True),
             IdleTask("cog_principles_llm", 2, 20, _t_cog_principles_llm,
                      resources=frozenset({RES_LLM, RES_STRATEGIC}),
+                     cooldown_seconds=300, needs_llm=True),
+            # Enrichment por chunk (ex-job "enrichment" del Orchestrator):
+            # summary + queries sintéticas + re-embed. Última del pase: es la
+            # de mayor volumen — las rápidas (labels, veredictos) se completan
+            # aunque el usuario vuelva a mitad del pase. RES_EMBEDDINGS porque
+            # re-embede con BGE-M3 (CPU, no compite con ExL3 en VRAM).
+            IdleTask("enrich_chunks", 2, 25, _t_enrich_chunks,
+                     resources=frozenset({RES_LLM, RES_EMBEDDINGS, RES_CORPUS_MAIN}),
                      cooldown_seconds=300, needs_llm=True),
         ], max_tier1_workers=3)
 
@@ -2521,6 +2709,7 @@ def main() -> None:
                     _ilog(f"  [idle-sched {tier}] {o.name}: {interesting} ({o.duration_s:.1f}s)", flush=True)
 
         level2_done = False  # prevent Tier 2 from re-running every cycle
+        deep_done = False    # el pase profundo (motor ExL3) corre una vez por ventana
 
         while True:
             _time.sleep(60)
@@ -2528,6 +2717,7 @@ def main() -> None:
                 if not _idle():
                     LAST_ACTIVITY["ts"] = time.time()
                     level2_done = False  # reset so Tier 2 can run next idle
+                    deep_done = False    # idem para el pase profundo
                     continue
 
                 idle_mins = (time.time() - LAST_ACTIVITY["ts"]) / 60.0
@@ -2549,57 +2739,89 @@ def main() -> None:
                     _log_outcomes(_scheduler.run_tier1(ctx), "T1")
 
                     # --- Tier 2 (LLM) ---
-                    # Corre si: (a) idle profundo (>= umbral) — puede cargar el
-                    # modelo; o (b) el modelo YA está cargado por el chat y el
-                    # sistema está quieto — se aprovecha sin cargar nada.
-                    if not level2_done:
-                        _loaded = (DEEP_DIVE_PROVIDER is not None
-                                   and DEEP_DIVE_PROVIDER.is_loaded())
-                        _t2_deep = IDLE_DEEP_ENABLED and idle_mins >= IDLE_DEEP_THRESHOLD
-                        _t2_loaded = (IDLE_LLM_LOADED_ENABLED and _loaded
+                    # Dos disparadores con motores distintos:
+                    #  (a) pase profundo (idle >= IPA_IDLE_DEEP_THRESHOLD): usa
+                    #      SU PROPIO motor — ExL3 batch (IPA_T2_ENGINE=exl3).
+                    #      Si el chat dejó Ollama warm, se descarga: en 6 GB
+                    #      no conviven y el pase batch rinde ~2.4x (EXP-008).
+                    #      Marcado _t2_owned: si el usuario vuelve, el chat lo
+                    #      descarga y monta el interactivo (prioridad al chat).
+                    #  (b) modelo ya cargado (>= IPA_IDLE_LLM_LOADED_THRESHOLD):
+                    #      aprovecha el provider del chat sin cargar nada.
+                    _loaded = (DEEP_DIVE_PROVIDER is not None
+                               and DEEP_DIVE_PROVIDER.is_loaded())
+                    _ours_loaded = (_loaded and bool(
+                        getattr(DEEP_DIVE_PROVIDER, "_t2_owned", False)))
+                    _t2_deep_due = (IDLE_DEEP_ENABLED and not deep_done
+                                    and idle_mins >= IDLE_DEEP_THRESHOLD
+                                    and not _ours_loaded)
+                    _t2_loaded_due = (IDLE_LLM_LOADED_ENABLED and not level2_done
+                                      and _loaded and not _ours_loaded
                                       and idle_mins >= IDLE_LLM_LOADED_THRESHOLD)
-                        if _t2_deep or _t2_loaded:
-                            _ilog(
-                                f"  [idle-sched] idle {idle_mins:.1f} min — Tier 2 "
-                                f"(LLM, {'profundo' if _t2_deep else 'modelo ya cargado'})",
-                                flush=True,
-                            )
-                            we_loaded = False
-                            if not _loaded:
-                                if not _t2_deep:
-                                    # No cargamos el modelo solo por Tier 2 liviano.
-                                    level2_done = True
-                                    continue
-                                _ilog(f"  [idle-sched T2] loading LLM provider...", flush=True)
+                    if _t2_deep_due or _t2_loaded_due:
+                        _ilog(
+                            f"  [idle-sched] idle {idle_mins:.1f} min — Tier 2 "
+                            f"(LLM, {'profundo' if _t2_deep_due else 'modelo ya cargado'})",
+                            flush=True,
+                        )
+                        we_loaded = False
+                        _our_provider = None
+                        if _t2_deep_due:
+                            # El pase profundo corre con su motor: si hay otro
+                            # provider cargado (Ollama warm del chat), se baja —
+                            # ExL3 necesita la VRAM y el lock es de un solo dueño.
+                            if _loaded:
                                 try:
-                                    from ipa.providers.factory import create_star_provider
-                                    DEEP_DIVE_PROVIDER = create_star_provider(interactive=True)
-                                    DEEP_DIVE_PROVIDER.load()
-                                    we_loaded = True
-                                except Exception as exc:
-                                    _ilog(f"  [idle-sched T2] LLM load failed: {exc}", flush=True)
-                                    level2_done = True
-                                    continue
+                                    DEEP_DIVE_PROVIDER.unload()
+                                except Exception:
+                                    pass
+                                DEEP_DIVE_PROVIDER = None
+                            _ilog(f"  [idle-sched T2] loading LLM provider...", flush=True)
                             try:
-                                ctx2 = CycleContext(
-                                    idle_minutes=idle_mins,
-                                    provider=DEEP_DIVE_PROVIDER,
-                                    episodes=ctx.episodes,
-                                    tasks=ctx.tasks,
-                                    should_abort=lambda: not _idle(),
-                                    log=_ilog,
-                                )
-                                _log_outcomes(_scheduler.run_tier2(ctx2), "T2")
-                            finally:
-                                # Descargar solo si lo cargamos nosotros (VRAM
-                                # libre para el chat).
-                                if we_loaded:
-                                    try:
-                                        DEEP_DIVE_PROVIDER.unload()
-                                        DEEP_DIVE_PROVIDER = None
-                                    except Exception:
-                                        pass
+                                _our_provider = _load_deep_engine(_ilog)
+                                DEEP_DIVE_PROVIDER = _our_provider
+                                we_loaded = True
+                            except Exception as exc:
+                                _ilog(f"  [idle-sched T2] LLM load failed: {exc}", flush=True)
+                                deep_done = True
                                 level2_done = True
+                                continue
+                        try:
+                            ctx2 = CycleContext(
+                                idle_minutes=idle_mins,
+                                provider=DEEP_DIVE_PROVIDER,
+                                episodes=ctx.episodes,
+                                tasks=ctx.tasks,
+                                should_abort=lambda: not _idle(),
+                                log=_ilog,
+                            )
+                            _log_outcomes(_scheduler.run_tier2(ctx2), "T2")
+                        finally:
+                            # Descargar solo si lo cargamos nosotros Y la
+                            # instancia sigue siendo la nuestra: si el chat
+                            # llegó a mitad del pase ya descargó el motor
+                            # batch (_t2_owned) y montó el suyo — no hay
+                            # que tocar el provider del chat.
+                            if we_loaded and DEEP_DIVE_PROVIDER is _our_provider:
+                                try:
+                                    with DEEP_DIVE_LOCK:
+                                        if DEEP_DIVE_PROVIDER is _our_provider:
+                                            DEEP_DIVE_PROVIDER.unload()
+                                            DEEP_DIVE_PROVIDER = None
+                                except Exception:
+                                    pass
+                            level2_done = True
+                            if _t2_deep_due:
+                                deep_done = True
+                            # Re-warm del motor interactivo: si el sistema sigue
+                            # idle, recargar Ollama para que el próximo chat no
+                            # pague el reload del GGUF (~10 s de TTFT extra).
+                            if we_loaded and _idle():
+                                try:
+                                    get_deep_dive_provider()
+                                    _ilog("  [idle-sched T2] motor interactivo re-cargado (chat listo)", flush=True)
+                                except Exception as _rw_exc:
+                                    _ilog(f"  [idle-sched T2] re-warm falló: {_rw_exc}", flush=True)
                 finally:
                     ENRICHMENT_LOCK.release()
             except Exception as exc:

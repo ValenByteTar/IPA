@@ -48,6 +48,34 @@ the maximum (7). Residual failures reach the learner as a friendly message
 (the exception goes to the log). When no retrieved hit mentions the requested
 topic, the reply carries a transparency note.
 
+### Topic detection (`awaiting_topic`)
+
+The state machine no longer depends on the imperative regex alone
+("quiero aprender X", "roadmap de X"). Three fallbacks, in order:
+
+1. **`awaiting_topic`**: after the driver emits "¿Qué querés aprender?",
+   the next message that is not approve/reject, a filler/command
+   (`_NOT_A_TOPIC_RE`), a question, or a new topic-less roadmap request
+   is taken *literally* as the topic (`_topic_from_answer`). This broke
+   the observed loop where a bare answer like "De IA Engineer Senior a
+   CTO en etapas tempranas" was re-asked forever.
+2. **Context recovery**: "hagamos un roadmap" without a topic scans the
+   last ~6 user episodes (`_topic_from_context`) — the topic is usually
+   inside a citation to the previous proposal (`_topic_from_citation`
+   cuts the scaffolding at the last boundary marker, e.g. "la transición
+   de X" → "X").
+3. **Citation-only acceptance**: a message that is *only* a citation
+   marker (`[respondiendo a: «…»]` / `[cita: «…»]`) counts as approval
+   at both gates (roadmap and research) — per the identity rule, citing
+   the agent's own proposal without extra text means "yes".
+
+Session-persistent constraints: "límite de N URLs" (`_URL_LIMIT_RE`,
+1-100) becomes `ResearchBudget.max_urls` (seconds scale ×40, capped
+3600), and "roadmap de M fases" becomes `requested_units` — both survive
+the topic arriving in a later message. Unit/URL counts are stripped from
+the extracted topic so "roadmap de 6 fases" or "límite de 20 URLs" never
+become the topic itself.
+
 ### Roadmap focus (cross-session)
 
 Clicking a stepper card, or activating a roadmap, calls
@@ -85,7 +113,10 @@ explanations: definition + example + connection); `TUTOR_POLICY` adds
 Insufficient corpus (<3 concepts) → `ResearchRequest` (human gate) → background
 executor; on completion an episode is written into the user's session and a
 topic-less message ("dale") resumes the stored topic. Tutor research budget:
-15 sources / 300 s (general chat `research_topic`: default 5, cap 20). While an
+15 sources / 300 s by default, or the user-requested "N URLs" limit
+(≤100, seconds scaled); allowed domains default to a broad quality list
+(`_TUTOR_RESEARCH_DOMAINS`: docs, universities, press — the runtime's
+tech-only default can't serve general topics). While an
 approved research is in flight the driver answers deterministically ("aguardamos
 a que llegue la información de la fuente web") — no LLM, no proposed steps.
 Frontend gates (Aprobar/Rechazar/Debatir) are re-mounted from
