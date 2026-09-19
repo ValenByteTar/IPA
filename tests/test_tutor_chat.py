@@ -20,7 +20,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from ipa.agent import AgentCore, AgentMemory  # noqa: E402
-from ipa.tutor.tutor_chat import TutorChatDriver  # noqa: E402
+from ipa.agent.query_gate import (  # noqa: E402
+    RESEARCH_ACCEPT_RE, RESEARCH_CITE_RE, RESEARCH_CLAIM_RE,
+)
+from ipa.tutor.tutor_chat import TutorChatDriver, tutor_intent  # noqa: E402
 from ipa.tutor.tutor_runtime import TutorStore  # noqa: E402
 
 
@@ -547,6 +550,53 @@ def test_citation_only_approves_research_gate(env):
     rid = out["research_proposal"]["request_id"]
     assert "aprobada" in out2["reply"].lower()
     assert store.get_research_request(rid).status.value == "approved"
+
+
+def test_tutor_intent_derivation():
+    """Pedidos pedagógicos explícitos derivan general→tutor; preguntas
+    definicionales y charla general no."""
+    assert tutor_intent("Armame un roadmap de transicion de IA Engineer a CTO")
+    assert tutor_intent("hagamos un roadmap muy completo")
+    assert tutor_intent("quiero aprender rust")
+    assert tutor_intent("enseñame MMA")
+    assert tutor_intent("[cita: «El roadmap propuesto…»] Perfecto, crea ese roadmap")
+    assert tutor_intent("¿me armás un roadmap de MMA?")
+    assert not tutor_intent("¿qué es un roadmap de producto?")
+    assert not tutor_intent("hola, cómo andás")
+    assert not tutor_intent("explicame qué hace un CTO")
+    assert not tutor_intent("")
+
+
+def test_research_claim_patterns_cover_real_narrations():
+    """Los claims observados en producción (bug 2026-09-19: el modelo
+    narró la investigación 5 veces sin emitir [TOOL:]) deben matchear.
+    Menciones condicionales no."""
+    for claim in (
+        "Investigando ahora mismo el tema para extraer las mejores prácticas",
+        "Voy a ejecutar una investigación web sobre cómo se estructura",
+        "He procesado la solicitud para investigar cómo se estructura",
+        "Entendido, acepto la investigación sobre cómo se estructura",
+        "Mientras el sistema procesa las fuentes recientes",
+        "la investigación está activa",
+        "inicié la búsqueda",
+    ):
+        assert RESEARCH_CLAIM_RE.search(claim.lower()), claim
+    assert not RESEARCH_CLAIM_RE.search(
+        "una investigación web mostraría resultados distintos")
+    assert not RESEARCH_CLAIM_RE.search("la investigación muestra que X")
+
+
+def test_research_acceptance_patterns_cover_truncated_citations():
+    """La cita llega truncada por la UI («…busqu…», «nvestiguemos…»):
+    los stems parciales tienen que alcanzar."""
+    assert RESEARCH_CITE_RE.search("¿prefieres que busqu…")
+    assert RESEARCH_CITE_RE.search("nvestiguemos directa…")
+    assert RESEARCH_CITE_RE.search("El roadmap propuesto…")
+    assert not RESEARCH_CITE_RE.search("¿has tenido que…")
+    for accept in ("Dale, interesante", "avancemos en esta direccion",
+                   "Perfecto, crea ese roadmap", "Ambas, vamos a hacerlo"):
+        assert RESEARCH_ACCEPT_RE.search(accept), accept
+    assert not RESEARCH_ACCEPT_RE.search("No, nunca llegue a eso")
 
 
 def test_parallel_sessions_have_independent_state(env):

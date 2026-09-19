@@ -115,4 +115,60 @@ def is_imperative(message: str) -> bool:
     return bool(_IMPERATIVE.search(_normalize(message.strip())))
 
 
-__all__ = ["classify_message", "is_imperative"]
+# ── Research narration net (chat general) ──────────────────────────────
+# El 9B narra la investigación sin emitir el marcador [TOOL:] (bug del
+# 2026-09-19: 5 narraciones, 0 tool_calls grabados). Estos patrones
+# detectan (a) pedido/aceptación del usuario y (b) claim falso del modelo,
+# para que la red de seguridad dispare research_topic de verdad.
+# Stems parciales a propósito: las citas llegan truncadas por la UI
+# («…busqu…», «nvestiguemos…» — pierden letras al cortar).
+
+# El usuario pidió investigar explícitamente.
+RESEARCH_ASK_RE = re.compile(
+    r"investig|busc[aá].*web|buscar.*web|research|busc[aá].*internet",
+    re.IGNORECASE,
+)
+
+# La cita contiene lenguaje de investigación/roadmap (truncada o no).
+# "nvestig" sin la i: la truncación corta palabras por delante
+# («nvestiguemos…») y "investig" queda cubierto como substring.
+RESEARCH_CITE_RE = re.compile(
+    r"nvestig|busqu|research|roadmap|fuentes",
+    re.IGNORECASE,
+)
+
+# Aceptación genérica ("dale", "avancemos", "perfecto") — solo cuenta si
+# el assistant ofreció investigar en el turno previo (ver OFFER_RE).
+RESEARCH_ACCEPT_RE = re.compile(
+    r"\b(?:dale|avancemos|adelante|perfecto|ambas|interesante|acepto|"
+    r"vamos|ok|s[ií])\b",
+    re.IGNORECASE,
+)
+
+# El turno assistant previo ofreció investigar / armar roadmap.
+RESEARCH_OFFER_RE = re.compile(
+    r"investig|roadmap|búsqueda|research|fuentes",
+    re.IGNORECASE,
+)
+
+# El modelo AFIRMA que una investigación corre/arrancó sin emitir la tool.
+# Frases observadas en producción + variantes; deliberadamente no cubre
+# menciones condicionales ("una investigación web mostraría…").
+RESEARCH_CLAIM_RE = re.compile(
+    r"investigaci[oó]n.*activa|está ejecutándose|en curso|"
+    r"voy a investigar|inici[eé] la búsqueda|búsqueda.*activa|"
+    r"investigando ahora|estoy investigando|"
+    r"ejecutar una investigaci[oó]n|ejecuto una investigaci[oó]n|"
+    r"acepto la investigaci[oó]n|lanc[eé] la investigaci[oó]n|"
+    r"lanzo la (?:investigaci[oó]n|búsqueda)|"
+    r"proces\w*\s+la solicitud|procesa (?:las )?fuentes|"
+    r"mientras (?:el sistema )?procesa",
+    re.IGNORECASE,
+)
+
+
+__all__ = [
+    "classify_message", "is_imperative",
+    "RESEARCH_ASK_RE", "RESEARCH_CITE_RE", "RESEARCH_ACCEPT_RE",
+    "RESEARCH_OFFER_RE", "RESEARCH_CLAIM_RE",
+]

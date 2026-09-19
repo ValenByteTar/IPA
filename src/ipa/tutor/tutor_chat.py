@@ -87,6 +87,41 @@ _NOT_A_TOPIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pedido pedagógico explícito → derivación general→tutor (server-side).
+# Artefactos (roadmap/plan/temario) o requests de aprendizaje ("quiero
+# aprender X", "enseñame Y", "pasar de X a Y").
+_TUTOR_DERIVE_RE = re.compile(
+    r"\b(?:roadmap|mapa\s+de\s+estudio|plan\s+de\s+estudio|temario|"
+    r"ruta\s+de\s+aprendizaje|programa\s+de\s+estudio|"
+    r"quiero\s+aprender|quisiera\s+aprender|me\s+gustar[ií]a\s+aprender|"
+    r"quiero\s+estudiar|ense[ñn]ame|quiero\s+pasar\s+de|"
+    r"transici[óo]n\s+de)\b",
+    re.IGNORECASE,
+)
+# Verbo de pedido: una pregunta que lo contiene SÍ deriva
+# ("¿me armás un roadmap?" deriva; "¿qué es un roadmap?" no).
+_TUTOR_REQUEST_VERB_RE = re.compile(
+    r"\b(?:quiero|quisiera|hagamos|armemos|armame|arm[aá]me|haceme|"
+    r"hac[eé]me|arm[aá]s|hac[eé]s|crea|crear|creame|dame|dise[ñn]ame|"
+    r"necesito|prefiero|mejor)\b",
+    re.IGNORECASE,
+)
+
+
+def tutor_intent(message: str) -> bool:
+    """True si el mensaje es un pedido pedagógico explícito → el turno
+    corre por el state machine del Tutor aunque llegue con role=general.
+    Preguntas definicionales ("¿qué es un roadmap?") no derivan salvo que
+    pidan el artefacto explícitamente ("¿me armás un roadmap?")."""
+    text = (message or "").strip()
+    if not text or not _TUTOR_DERIVE_RE.search(text):
+        return False
+    if (text.startswith("¿") and text.rstrip().endswith("?")
+            and not _TUTOR_REQUEST_VERB_RE.search(text)):
+        return False
+    return True
+
+
 # Andamiaje interrogativo dentro de una cita: el tema suele estar en la
 # cola tras el último marcador ("¿te gustaría que investiguemos cómo se
 # estructura típicamente la transición de X" → "X").
@@ -1173,4 +1208,4 @@ def get_tutor_driver() -> TutorChatDriver:
     return _DRIVER
 
 
-__all__ = ["TutorChatDriver", "get_tutor_driver"]
+__all__ = ["TutorChatDriver", "get_tutor_driver", "tutor_intent"]

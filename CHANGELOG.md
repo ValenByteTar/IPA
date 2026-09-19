@@ -2,6 +2,22 @@
 
 Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 
+## Unreleased — 2026-09-19 (post-v0.1.2)
+
+- **fix(ci)**: `FlagEmbedding`, `langchain-text-splitters` y `tiktoken`
+  declarados en extras (`retrieval` + nuevo `chunkers`); `HF_HUB_OFFLINE`
+  acotado al load de BGE-M3 (fugaba process-wide y rompía docling en CI).
+- **Anti-narración de research (chat general)**: el 9B narraba la
+  investigación sin emitir `[TOOL:research_topic]` (bug real: 5 claims,
+  0 ejecuciones). El safety net ahora también detecta aceptación por cita
+  truncada («…busqu…») u oferta del assistant en el turno previo, y los
+  claims sin tool ejecutada se reemplazan por una admisión honesta en vez
+  de grabar la mentira en el historial.
+- **Derivación general→tutor**: pedidos pedagógicos explícitos ("haceme
+  un roadmap de X", "quiero aprender Y") corren por el state machine del
+  Tutor aunque lleguen con `role=general` — la investigación ahí es un
+  contrato real con gate humano. `tutor_intent()` en `tutor_chat.py`.
+
 ## v0.1.2 — 2026-09-19
 
 ### Rendimiento y caches (ver `EXP-008`)

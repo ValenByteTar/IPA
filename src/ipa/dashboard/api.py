@@ -1424,6 +1424,18 @@ class Handler(BaseHTTPRequestHandler):
                         _dd = parse_deep_dive_context(body)
                     except Exception as exc:
                         _dd, _dd_error = None, str(exc)
+                # Derivación pedagógica (general→tutor): pedidos explícitos
+                # de roadmap/aprendizaje corren por el state machine del
+                # Tutor — ahí la investigación es un contrato real con gate
+                # humano; en el chat general el 9B la narraba sin ejecutarla
+                # (bug del 2026-09-19: 5 narraciones, 0 tool_calls).
+                if _role == "general" and _dd is None:
+                    try:
+                        from ipa.tutor.tutor_chat import tutor_intent
+                        if tutor_intent(message):
+                            _role = "tutor"
+                    except Exception:
+                        pass
                 # Build messages and record user turn BEFORE streaming.
                 core = AgentCore(interface="dashboard", role=_role)
                 if session_id:
@@ -1607,7 +1619,11 @@ class Handler(BaseHTTPRequestHandler):
                 _server_mod.CHAT_BUSY["flag"] = True
                 _server_mod.LAST_ACTIVITY["ts"] = time.time()
 
-                from ipa.agent.query_gate import classify_message, is_imperative
+                from ipa.agent.query_gate import (
+                    classify_message, is_imperative,
+                    RESEARCH_ASK_RE, RESEARCH_CITE_RE, RESEARCH_ACCEPT_RE,
+                    RESEARCH_OFFER_RE, RESEARCH_CLAIM_RE,
+                )
                 _msg_kind = classify_message(message)
                 _is_order = is_imperative(message)
                 # Auto-research: ante un gap del corpus (retrieval vacío o
@@ -2110,21 +2126,46 @@ class Handler(BaseHTTPRequestHandler):
                             # investigar sin emitir el marcador. NO dispara en
                             # follow-ups (después de que ya se ejecutó una tool).
                             import re as _re
-                            user_asked_research = _re.search(
-                                r"investig|buscá.*web|buscar.*web|research|buscá.*internet",
-                                message.lower()
-                            )
-                            model_claimed_research = _re.search(
-                                r"investigaci[oó]n.*activa|está ejecutándose|en curso|"
-                                r"voy a investigar|inicié la búsqueda|busqueda.*activa",
-                                reply.lower()
-                            )
+                            research_query = message
+                            user_asked_research = bool(RESEARCH_ASK_RE.search(message))
+                            if not user_asked_research:
+                                # Cita+aceptación tras oferta de research: la
+                                # cita llega truncada («…busqu…», «nvestig…»)
+                                # y los stems parciales bastan; o el assistant
+                                # ofreció investigar en el turno previo y el
+                                # usuario acepta sin nombrarlo ("dale").
+                                _cit = _re.search(r"«([^»]+)»", message)
+                                if _cit and RESEARCH_CITE_RE.search(_cit.group(1)):
+                                    user_asked_research = True
+                                    research_query = _cit.group(1)
+                                elif RESEARCH_ACCEPT_RE.search(message):
+                                    try:
+                                        _offer_ep = next(
+                                            (e for e in reversed(
+                                                core.memory.get_episodes(
+                                                    core.session_id, limit=8))
+                                             if getattr(e, "turn_role", "") == "assistant"),
+                                            None)
+                                        _offer = (
+                                            getattr(_offer_ep, "content", "")
+                                            if _offer_ep else "")
+                                        if _offer and RESEARCH_OFFER_RE.search(_offer):
+                                            user_asked_research = True
+                                            # La propuesta tiene el tema mejor
+                                            # que la aceptación truncada.
+                                            research_query = _offer
+                                    except Exception:
+                                        pass
+                            model_claimed_research = RESEARCH_CLAIM_RE.search(reply.lower())
                             if (
                                 user_asked_research
                                 and model_claimed_research
                                 and tool_round == 0  # solo en la primera ronda
                             ):
-                                parsed_tool = ("research_topic", {"query": message, "_session_id": core.session_id})
+                                parsed_tool = ("research_topic", {
+                                    "query": research_query[:500],
+                                    "_session_id": core.session_id,
+                                })
 
                             # Safety net: corpus search. Si el usuario pide
                             # información sobre un tema específico y el modelo
@@ -2165,6 +2206,21 @@ class Handler(BaseHTTPRequestHandler):
                                     parsed_tool = ("search_corpus", {"query": query, "limit": 5})
                             if parsed_tool is None:
                                 full_reply = reply.strip()
+                                # Anti-narración: el modelo afirmó que corre
+                                # una investigación sin emitir la tool (y sin
+                                # que el usuario la hubiera pedido — si la
+                                # pidió, el net de arriba ya disparó
+                                # research_topic). Grabar el claim falso
+                                # envenena el historial: el modelo se
+                                # autoimita y repite la mentira. Se reemplaza
+                                # por una admisión honesta.
+                                if tool_round == 0 and model_claimed_research:
+                                    full_reply = (
+                                        "No pude lanzar la investigación en este "
+                                        "turno — la tool no llegó a ejecutarse. "
+                                        "Si la querés, decime 'investigá <tema>' "
+                                        "y la arranco ahora."
+                                    )
                                 break
 
                         tool_name, tool_args = parsed_tool
