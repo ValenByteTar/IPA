@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +31,13 @@ if not Path(PYTHON).exists():
 DASHBOARD_SCRIPT = str(ROOT / "scripts" / "operations" / "web_dashboard.py")
 PID_FILE = ROOT / "outputs" / "web_dashboard" / "dashboard.pid"
 WATCHDOG_PID_FILE = ROOT / "outputs" / "web_dashboard" / "watchdog.pid"
+
+SEARXNG_URL_DEFAULT = "http://127.0.0.1:8888"
+SEARXNG_COMPOSE = ROOT / ".devin" / "searxng" / "docker-compose.yml"
+_DOCKER_DESKTOP_CANDIDATES = [
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Docker" / "Docker" / "Docker Desktop.exe",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Docker" / "Docker Desktop.exe",
+]
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -76,6 +84,108 @@ def find_dashboard_pids() -> list[int]:
     return [pid for pid, _ in _ps_processes("web_dashboard.py")]
 
 
+# --- SearXNG management ----------------------------------------------------
+# The watchdog also keeps the local SearXNG container alive so research_topic
+# always has its preferred web-search backend after restarts/resets.
+# Disable with IPA_SEARXNG_MANAGED=0. Only manages local URLs — if
+# IPA_SEARXNG_URL points elsewhere, that instance is the user's to run.
+
+
+def _searxng_url() -> str:
+    return os.environ.get("IPA_SEARXNG_URL", SEARXNG_URL_DEFAULT).rstrip("/")
+
+
+def _is_local_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _searxng_responding(url: str, timeout: float = 3.0) -> bool:
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status < 500
+    except Exception:
+        return False
+
+
+def _docker_daemon_up() -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, timeout=15, creationflags=_NO_WINDOW,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _start_docker_desktop() -> bool:
+    for candidate in _DOCKER_DESKTOP_CANDIDATES:
+        if candidate.exists():
+            subprocess.Popen([str(candidate)], creationflags=_NO_WINDOW)
+            return True
+    return False
+
+
+def _compose_up() -> tuple[bool, str]:
+    if not SEARXNG_COMPOSE.exists():
+        return False, f"compose file missing: {SEARXNG_COMPOSE}"
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "-f", str(SEARXNG_COMPOSE), "up", "-d"],
+            capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            return True, ""
+        return False, (result.stderr or result.stdout or "").strip()[:300]
+    except Exception as exc:
+        return False, str(exc)[:300]
+
+
+def ensure_searxng(state: dict) -> None:
+    """Keep local SearXNG alive: start Docker Desktop if needed, compose up.
+
+    `state` carries rate-limiting/logging fields across loop iterations.
+    Called at most once per check interval — cheap when SearXNG is up
+    (one refused-or-200 HTTP GET).
+    """
+    if os.environ.get("IPA_SEARXNG_MANAGED", "1") == "0":
+        return
+    url = _searxng_url()
+    if not _is_local_url(url):
+        if not state.get("remote_logged"):
+            print(f"[watchdog] IPA_SEARXNG_URL={url} is not local — not managing it", flush=True)
+            state["remote_logged"] = True
+        return
+    if _searxng_responding(url):
+        if not state.get("was_up"):
+            print(f"[watchdog] SearXNG responding at {url}", flush=True)
+        state["was_up"] = True
+        return
+    state["was_up"] = False
+    now = time.time()
+    if now - state.get("last_attempt", 0.0) < 300:
+        return  # attempts at most every 5 min — Docker Desktop boot is slow
+    state["last_attempt"] = now
+
+    if not _docker_daemon_up():
+        if _start_docker_desktop():
+            print("[watchdog] SearXNG down; launched Docker Desktop (waiting for daemon)", flush=True)
+        elif not state.get("no_docker_logged"):
+            print("[watchdog] SearXNG down and no Docker Desktop found — install Docker or set IPA_SEARXNG_MANAGED=0", flush=True)
+            state["no_docker_logged"] = True
+        return
+    ok, err = _compose_up()
+    if ok:
+        print(f"[watchdog] SearXNG down; ran compose up (waiting for {url})", flush=True)
+    else:
+        print(f"[watchdog] SearXNG compose up failed: {err}", flush=True)
+
+
 def watchdog_already_running() -> bool:
     """True if the recorded watchdog PID is alive and still a watchdog."""
     try:
@@ -101,7 +211,14 @@ def launch_dashboard(host: str, port: int) -> subprocess.Popen | None:
     log_dir = ROOT / "outputs" / "web_dashboard" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log = open(log_dir / "dashboard.log", "a", encoding="utf-8")
-    env = {**os.environ, "PYTHONPATH": "src", "PYTHONIOENCODING": "utf-8"}
+    env = {
+        **os.environ,
+        "PYTHONPATH": "src",
+        "PYTHONIOENCODING": "utf-8",
+        # Default the research web-search backend to the managed local SearXNG
+        # (ensure_searxng keeps it alive). Explicit IPA_SEARXNG_URL wins.
+        "IPA_SEARXNG_URL": os.environ.get("IPA_SEARXNG_URL", SEARXNG_URL_DEFAULT),
+    }
     try:
         proc = subprocess.Popen(
             [PYTHONW, "-u", DASHBOARD_SCRIPT, "--host", host, "--port", str(port)],
@@ -145,12 +262,21 @@ def run_watchdog(host: str, port: int, interval: int) -> None:
     print(f"[watchdog] Monitoring {host}:{port} every {interval}s (Ctrl+C to stop)", flush=True)
     last_launch_time = 0.0
     consecutive_failures = 0
+    searxng_state: dict = {}
+    searxng_interval = float(os.environ.get("IPA_SEARXNG_CHECK_INTERVAL", "60"))
+    last_searxng_check = 0.0
     while True:
+        now = time.time()
+        if now - last_searxng_check >= searxng_interval:
+            try:
+                ensure_searxng(searxng_state)
+            except Exception as exc:
+                print(f"[watchdog] ensure_searxng error: {exc}", flush=True)
+            last_searxng_check = now
         if is_port_responding(host, port):
             consecutive_failures = 0
         else:
             consecutive_failures += 1
-            now = time.time()
             # 3 failed checks in a row before restarting — a single slow
             # response under load is not a crash. Min 15s between launches.
             if consecutive_failures >= 3 and now - last_launch_time > 15:

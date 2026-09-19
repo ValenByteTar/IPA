@@ -71,8 +71,11 @@ py -3.12 -m venv .venv
 .venv/Scripts/python.exe scripts/operations/sync_index_metadata.py --corpus outputs/experiments/E12-corpus [--all]
 
 # Local SearXNG (preferred web-search backend for research_topic)
-docker compose -f .devin/searxng/docker-compose.yml up -d   # 127.0.0.1:8888
-# then export IPA_SEARXNG_URL=http://127.0.0.1:8888
+# Managed automatically: start_ipa_dashboard.ps1 ensures it at boot and the
+# watchdog keeps it alive (starts Docker Desktop + compose up if down).
+# Manual: docker compose -f .devin/searxng/docker-compose.yml up -d  # 127.0.0.1:8888
+# Env: IPA_SEARXNG_URL defaults to http://127.0.0.1:8888 in watchdog/launcher;
+#      IPA_SEARXNG_MANAGED=0 disables watchdog management (e.g. remote instance).
 
 # Agent CLI (sessions, episodic memory, research)
 .venv/Scripts/python.exe scripts/cli/agent.py chat -m "mensaje"
@@ -132,7 +135,7 @@ src/ipa/
   reporter/          Reporter metadata, curation, topics, reports, promotion
   tutor/             Learning contracts and pedagogy runtime
   providers/         ExLlama/Ollama provider adapters
-  mcp/               Runtime MCP boundary (external clients only)
+  mcp/               Thin MCP proxy to the dashboard tool registry (external clients only)
   dashboard/         Dashboard server and orchestration
 ```
 

@@ -1,16 +1,15 @@
-"""MCP server tests — search_knowledge rerank path + import safety.
+"""MCP server (proxy mode) tests.
 
-The MCP server had two latent bugs with no safety net (no MCP suite):
-  1. sys.path shadowing: inserting src/ipa (the package dir itself) made
-     `ipa/mcp/` shadow the `mcp` SDK on sys.path → the module could not
-     even be imported ("No module named 'mcp.server'").
-  2. RerankCandidate(id=...) — the dataclass field is chunk_id; the
-     TypeError was swallowed by the fallback except, so search_knowledge
-     silently ran WITHOUT reranking.
+The MCP server is a thin frontier over the dashboard's unified tool
+registry — it owns no models. These tests guard:
+  1. sys.path import safety (inserting src/ipa shadowed the `mcp` SDK).
+  2. Tool generation from registry specs (name/docstring/args).
+  3. The HTTP roundtrip: URL, payload and response parsing.
+  4. Dashboard-down → clear JSON error, never a raw exception.
 """
 import json
-import sqlite3
 import sys
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,123 +17,113 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from ipa.indexes.reranker_adapter import RerankCandidate  # noqa: E402
 from ipa.mcp import mcp_server  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Fakes — the real components load BGE-M3 / reranker / LanceDB (heavy).
-# ---------------------------------------------------------------------------
+class _FakeResponse:
+    def __init__(self, payload: dict):
+        self._payload = json.dumps(payload).encode()
 
-class _FakeEmbed:
-    def embed_query_hybrid(self, query: str):
-        return [0.1, 0.2, 0.3], {"1": 0.5}
+    def read(self) -> bytes:
+        return self._payload
 
+    def __enter__(self):
+        return self
 
-class _FakeHit:
-    def __init__(self, chunk_id: str, score: float):
-        self.chunk_id = chunk_id
-        self.score = score
-
-
-class _FakeLance:
-    def __init__(self, hits):
-        self._hits = hits
-
-    def search_hybrid(self, query, dense, *, query_sparse=None, limit=10):
-        return self._hits[:limit]
-
-
-class _FakeStore:
-    """DocumentStore stand-in: get_chunk + the _conn surface _availability uses."""
-
-    def __init__(self, chunks: dict):
-        self._chunks = chunks
-        self._conn = sqlite3.connect(":memory:")
-        self._conn.execute("CREATE TABLE chunks (tombstoned INTEGER DEFAULT 0, text TEXT)")
-        self._conn.execute("CREATE TABLE embedding_jobs (status TEXT)")
-
-    def get_chunk(self, chunk_id):
-        return self._chunks.get(chunk_id)
-
-
-class _FakeReranker:
-    """Records candidates; returns them REVERSED — an observable ordering."""
-
-    def __init__(self, error: Exception | None = None):
-        self.calls: list[list[str]] = []
-        self._error = error
-
-    def rerank(self, query, candidates, top_k=5, normalize=True):
-        if self._error:
-            raise self._error
-        self.calls.append([c.chunk_id for c in candidates])
-        return [RerankCandidate(
-            chunk_id=c.chunk_id, text=c.text, score=float(len(candidates) - i),
-            metadata=c.metadata,
-        ) for i, c in enumerate(reversed(candidates))][:top_k]
-
-
-def _wire(monkeypatch, *, hits, chunks, reranker):
-    store = _FakeStore(chunks)
-    monkeypatch.setattr(mcp_server._ComponentCache, "_embedding_adapter", _FakeEmbed())
-    monkeypatch.setattr(mcp_server._ComponentCache, "_lancedb_index", _FakeLance(hits))
-    monkeypatch.setattr(mcp_server._ComponentCache, "_document_store", store)
-    monkeypatch.setattr(mcp_server._ComponentCache, "_reranker", reranker)
-
-
-def _default_hits():
-    return [_FakeHit(f"chunk:{i}", 1.0 - i * 0.1) for i in range(6)]
-
-
-def _default_chunks():
-    return {
-        f"chunk:{i}": SimpleNamespace(
-            text=f"texto {i}", document_id=f"doc:{i}", source_span=None,
-        )
-        for i in range(6)
-    }
+    def __exit__(self, *exc):
+        return False
 
 
 # ---------------------------------------------------------------------------
 
-def test_mcp_server_imports_and_exposes_tools():
+def test_mcp_server_imports_and_exposes_generic_tools():
     """Guards the sys.path fix: inserting src/ipa (not src/) made `ipa/mcp/`
     shadow the `mcp` SDK and the module failed to import entirely."""
-    assert callable(mcp_server.search_knowledge)
-    assert callable(mcp_server.ingest_url)
-    assert callable(mcp_server.list_sources)
+    assert callable(mcp_server.ipa_tool)
+    assert callable(mcp_server.list_ipa_tools)
+    assert callable(mcp_server.tutor_focus)
 
 
-def test_search_knowledge_applies_reranker(monkeypatch):
-    """El reranker se invoca y su orden gana — con el bug latente
-    (RerankCandidate(id=...)) el TypeError se tragaba y el output era el
-    orden híbrido sin rerankear."""
-    chunks = {f"chunk:{i}": SimpleNamespace(
-        text=f"texto {i}", document_id=f"doc:{i}", source_span=None)
-        for i in range(6)}
-    reranker = _FakeReranker()
-    _wire(monkeypatch, hits=_default_hits(), chunks=chunks, reranker=reranker)
-
-    out = json.loads(mcp_server.search_knowledge("consulta", top_k=3))
-
-    assert len(reranker.calls) == 1  # el reranker SÍ se invocó
-    # Los candidatos llegan con el campo correcto (chunk_id, no id).
-    assert reranker.calls[0] == [f"chunk:{i}" for i in range(6)]
-    # El orden de salida es el del reranker (reverso), no el híbrido.
-    assert [r["chunk_id"] for r in out["results"]] == ["chunk:5", "chunk:4", "chunk:3"]
-    assert out["total"] == 3
-    assert all("document_id" in r for r in out["results"])
+def test_make_tool_uses_spec_name_and_docstring():
+    spec = {"name": "search_corpus",
+            "description": "busca en el corpus. Cita hits como [n].",
+            "args_doc": '{"query": "texto a buscar", "limit": 5}'}
+    tool = mcp_server._make_tool(spec)
+    assert tool.__name__ == "search_corpus"
+    assert "busca en el corpus" in (tool.__doc__ or "")
+    assert '"query"' in (tool.__doc__ or "")
 
 
-def test_search_knowledge_falls_back_when_reranker_fails(monkeypatch):
-    """Si el reranker falla, el fallback devuelve los hits híbridos sin
-    rerankear — la búsqueda nunca se rompe por el stage-2."""
-    chunks = {f"chunk:{i}": SimpleNamespace(text=f"texto {i}", document_id=f"doc:{i}", source_span=None)
-              for i in range(6)}
-    reranker = _FakeReranker(error="boom")
-    _wire(monkeypatch, hits=_default_hits(), chunks=chunks, reranker=reranker)
+def test_tool_roundtrip_posts_to_dashboard(monkeypatch):
+    """La tool generada POSTea {name, args} al endpoint unificado y parsea
+    la respuesta JSON del dashboard."""
+    captured = {}
 
-    out = json.loads(mcp_server.search_knowledge("consulta", top_k=3))
-    assert out["total"] == 3
-    assert [r["chunk_id"] for r in out["results"]] == [f"chunk:{i}" for i in range(3)]
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.method
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResponse({"ok": True, "tool": "search_corpus",
+                              "summary": "3 hits", "data": {"hits": []}})
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+    tool = mcp_server._make_tool({"name": "search_corpus",
+                                  "description": "busca", "args_doc": "{}"})
+    out = json.loads(tool({"query": "fotonica"}))
+
+    assert captured["url"] == mcp_server.PROXY_URL + "/api/tools/execute"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {"name": "search_corpus", "args": {"query": "fotonica"}}
+    assert out["ok"] is True and out["summary"] == "3 hits"
+
+
+def test_tool_dashboard_down_returns_clear_error(monkeypatch):
+    """Dashboard caído → JSON con instrucción, no excepción cruda."""
+
+    def boom(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", boom)
+    tool = mcp_server._make_tool({"name": "search_corpus",
+                                  "description": "busca", "args_doc": "{}"})
+    out = json.loads(tool({}))
+    assert out["ok"] is False
+    assert "dashboard" in out["error"].lower()
+    assert "start" in out["error"].lower() or "start_ipa_dashboard" in out["error"]
+
+
+def test_register_registry_tools_generates_one_per_spec():
+    catalog = {"tools": [
+        {"name": "search_corpus", "description": "busca", "args_doc": "{}"},
+        {"name": "recall_memory", "description": "memoria", "args_doc": "{}"},
+    ]}
+    registered = mcp_server.register_registry_tools(catalog)
+    assert registered == ["search_corpus", "recall_memory"]
+
+
+def test_startup_registration_is_best_effort(monkeypatch):
+    """Dashboard caído al arrancar → el server igual levanta (sin tools
+    del registry; ipa_tool sigue disponible)."""
+
+    def boom(req, timeout=None):
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", boom)
+    assert mcp_server._register_registry_tools() == []
+
+
+def test_tutor_tools_use_read_endpoints(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["path"] = urllib.parse.urlsplit(req.full_url).path
+        return _FakeResponse({"ok": True, "focus": None})
+
+    import urllib.parse
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+    mcp_server.tutor_focus()
+    assert captured["path"] == "/api/tutor/focus"
+    mcp_server.tutor_projects()
+    assert captured["path"] == "/api/tutor/projects"
+    mcp_server.tutor_roadmap_context("roadmap:abc")
+    assert captured["path"] == "/api/tutor/roadmap/context"

@@ -1269,6 +1269,16 @@ def execute_system_tool(tool_name: str, arguments: dict[str, Any]) -> SystemTool
     return _SYSTEM_IMPLEMENTATIONS[tool_name](dict(arguments))
 
 
+def tool_specs() -> list[dict[str, str]]:
+    """Registry specs for external frontiers (MCP proxy). Same source of
+    truth as the LLM catalog — the surfaces cannot drift apart."""
+    return [
+        {"name": spec.name, "description": spec.description, "args_doc": spec.args_doc}
+        for spec in _SYSTEM_TOOLS
+        if spec.chat_visible
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tool catalog — progressive unlocking (reduce cognitive load for the 9B)
 # ---------------------------------------------------------------------------

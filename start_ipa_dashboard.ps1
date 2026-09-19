@@ -59,6 +59,53 @@ if (-not $ollamaUp) {
     }
 }
 
+# Ensure local SearXNG (preferred web-search backend for research_topic).
+# The watchdog also keeps it alive; this makes it available from boot.
+if (-not $env:IPA_SEARXNG_URL) { $env:IPA_SEARXNG_URL = "http://127.0.0.1:8888" }
+$searxngUp = $false
+try {
+    $null = Invoke-WebRequest -Uri $env:IPA_SEARXNG_URL -UseBasicParsing -TimeoutSec 2
+    $searxngUp = $true
+} catch { }
+
+$searxngLocal = $env:IPA_SEARXNG_URL -match "127\.0\.0\.1|localhost|\[::1\]"
+if (-not $searxngUp -and $searxngLocal) {
+    $compose = Join-Path $Root ".devin\searxng\docker-compose.yml"
+    $dockerUp = $false
+    try {
+        $null = docker version --format "{{.Server.Version}}" 2>$null
+        $dockerUp = ($LASTEXITCODE -eq 0)
+    } catch { }
+    if (-not $dockerUp) {
+        $dockerDesktop = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+        if (Test-Path $dockerDesktop) {
+            Write-Host "Iniciando Docker Desktop para SearXNG..." -ForegroundColor Cyan
+            Start-Process -FilePath $dockerDesktop
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
+                Start-Sleep -Seconds 1
+                $null = docker version --format "{{.Server.Version}}" 2>$null
+                if ($LASTEXITCODE -eq 0) { $dockerUp = $true; break }
+            }
+        }
+    }
+    if ($dockerUp -and (Test-Path $compose)) {
+        Write-Host "Levantando SearXNG (backend de búsqueda web)..." -ForegroundColor Cyan
+        docker compose -f $compose up -d 2>$null | Out-Null
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            try {
+                $null = Invoke-WebRequest -Uri $env:IPA_SEARXNG_URL -UseBasicParsing -TimeoutSec 2
+                $searxngUp = $true; break
+            } catch { }
+        }
+    }
+    if ($searxngUp) {
+        Write-Host "SearXNG listo en $env:IPA_SEARXNG_URL." -ForegroundColor Green
+    } else {
+        Write-Host "SearXNG no disponible; la investigación web caerá al fallback DDG." -ForegroundColor Yellow
+    }
+}
+
 $existing = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "El dashboard ya está ejecutándose en $Url" -ForegroundColor Green

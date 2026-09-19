@@ -252,6 +252,35 @@ def tutor_projects_payload() -> dict[str, Any]:
         store.close()
 
 
+def tool_catalog_payload() -> dict[str, Any]:
+    """Registry specs for the MCP proxy — one source of truth, no drift."""
+    from ipa.agent.system_tools import tool_specs
+    return {"tools": tool_specs()}
+
+
+def execute_tool_payload(name: str, args: dict[str, Any] | None) -> dict[str, Any]:
+    """Unified tool frontier for external agents (MCP proxy): dispatches to
+    the same registry the dashboard chat uses. Never loads models here —
+    the tools open their own stores; LLM-backed tools (research) run in
+    the dashboard's background executors."""
+    from ipa.agent.system_tools import execute_system_tool, SYSTEM_TOOL_NAMES
+
+    if not name:
+        return {"ok": False, "error": "tool name required"}
+    if name not in SYSTEM_TOOL_NAMES:
+        return {"ok": False,
+                "error": f"unknown tool: {name}; valid: {sorted(SYSTEM_TOOL_NAMES)}"}
+    if args is not None and not isinstance(args, dict):
+        return {"ok": False, "error": "args must be a JSON object"}
+    try:
+        result = execute_system_tool(name, args or {})
+    except Exception as exc:
+        return {"ok": False, "tool": name, "error": str(exc)}
+    return {"ok": bool(result.ok), "tool": result.tool_name,
+            "summary": result.summary, "data": result.data,
+            **({"error": result.error} if result.error else {})}
+
+
 def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
     """Full context for the Roadmaps tab: goal (objective), rationale,
     progress, re-derived concepts, focus state.
@@ -680,6 +709,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_tutor_driver().get_focus(_fsid))
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
+        elif parsed.path == "/api/tools/catalog":
+            # Frontera MCP: specs del registry para que el proxy genere tools.
+            self.send_json(tool_catalog_payload())
         elif parsed.path == "/api/agent/session":
             query = urllib.parse.parse_qs(parsed.query)
             session_id = query.get("session_id", [""])[0]
@@ -1048,6 +1080,11 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json(get_tutor_driver().unfocus_roadmap(sid, rid), 200)
                 except Exception as exc:
                     self.send_json({"ok": False, "error": str(exc)}, 500)
+            elif parsed.path == "/api/tools/execute":
+                # Frontera unificada de tools para agentes externos (MCP
+                # proxy): mismo registry que el chat del dashboard.
+                self.send_json(
+                    execute_tool_payload(body.get("name", ""), body.get("args")), 200)
             elif parsed.path == "/api/tutor/roadmap/decision":
                 # Human gate on a proposed roadmap (button click).
                 try:

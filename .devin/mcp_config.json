@@ -7,6 +7,13 @@
         "IPA_EKS_ROOT": "knowledge",
         "IPA_EKS_REFERENCE_ROOTS": "docs/adr"
       }
+    },
+    "ipa": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["-m", "ipa.mcp.mcp_server"],
+      "env": {
+        "PYTHONPATH": "src"
+      }
     }
   }
 }

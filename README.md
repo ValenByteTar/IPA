@@ -91,6 +91,12 @@ py -3.12 -m venv .venv
 The core smoke path uses synthetic fixtures and does not require a GPU, a cloud
 service, a real corpus, or a local LLM.
 
+Capabilities beyond the core need external dependencies: **Docker Desktop**
+(local SearXNG, the real web-search backend — auto-started by the launcher and
+watchdog), **Ollama** (chat/Tutor LLM backend), **Playwright browsers** (JS
+scraping), and optionally **ExLlamaV3** (GPU star model). See
+`docs/USAGE.md` → "Dependencias externas" for install steps.
+
 ## Optional profiles
 
 Install only what a workload needs:
