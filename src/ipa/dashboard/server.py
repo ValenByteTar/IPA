@@ -117,10 +117,6 @@ def get_embedding_adapter():
     """Lazy singleton for BGE-M3 on CPU — avoids reloading per request."""
     global _EMBED_ADAPTER
     if _EMBED_ADAPTER is None:
-        import os
-        # Skip the per-call HuggingFace hub check ("Fetching 30 files"):
-        # the model is already in the local cache after the first download.
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from ipa.indexes.embedding_adapter import EmbeddingAdapter
         _EMBED_ADAPTER = EmbeddingAdapter(device="cpu", show_progress=False)
     return _EMBED_ADAPTER

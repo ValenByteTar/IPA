@@ -153,14 +153,33 @@ class EmbeddingAdapter:
         self._device_resolved = self._resolve_device()
         # FP16 only helps on GPU; on CPU it's slower.
         fp16 = self.use_fp16 and self._device_resolved == "cuda"
-        # BUG FIX: BGEM3FlagModel (M3Embedder) accepts `devices` (plural),
-        # not `device`. The singular `device` was swallowed by **kwargs and
-        # silently ignored, so device="cpu" still ran on cuda:0.
-        self._model = BGEM3FlagModel(
-            self.model_name,
-            use_fp16=fp16,
-            devices=[self._device_resolved] if self._device_resolved else None,
-        )
+        # Skip the hub round-trip ("Fetching N files") when the snapshot is
+        # already in the local HF cache — pero HF_HUB_OFFLINE se acota a este
+        # load: dejarlo seteado fuga al resto del proceso y rompe otros
+        # consumidores de HF que sí necesitan red (bug real en CI: docling
+        # no podía bajar sus modelos tras un test que cargaba BGE-M3).
+        cached = False
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            cached = isinstance(
+                try_to_load_from_cache(self.model_name, "config.json"), str)
+        except Exception:
+            pass
+        prev_offline = os.environ.get("HF_HUB_OFFLINE")
+        if cached and prev_offline is None:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            # BUG FIX: BGEM3FlagModel (M3Embedder) accepts `devices` (plural),
+            # not `device`. The singular `device` was swallowed by **kwargs and
+            # silently ignored, so device="cpu" still ran on cuda:0.
+            self._model = BGEM3FlagModel(
+                self.model_name,
+                use_fp16=fp16,
+                devices=[self._device_resolved] if self._device_resolved else None,
+            )
+        finally:
+            if cached and prev_offline is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
         self._dim = DEFAULT_DIM
 
     @property

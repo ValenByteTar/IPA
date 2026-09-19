@@ -17,13 +17,14 @@ tantivy>=0.22,<1
 lancedb>=0.15,<1
 sqlite-vec>=0.1.1,<1
 sentence-transformers>=2.5,<7
+FlagEmbedding>=1.3,<2
 
 # E3: parser competition
 docling>=2.0,<3
 unstructured[pdf]>=0.16,<1
 
 # E5: chunker competition
-langchain-text-splitters>=0.3,<1
+langchain-text-splitters>=0.3,<2
 tiktoken>=0.7,<1
 
 # Future experiments (not yet installed)
