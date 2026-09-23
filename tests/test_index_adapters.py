@@ -3,6 +3,7 @@ LanceDBIndex, SQLiteVecIndex."""
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import pytest
@@ -338,8 +339,13 @@ def test_physical_vram_probe_hides_nvidia_smi_console(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert physical_free_vram_mb() == 5144
-    assert seen["kwargs"]["creationflags"] == (
-        subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+    # Los flags CREATE_NO_WINDOW/DETACHED_PROCESS solo existen en Windows;
+    # en POSIX creationflags debe ser 0.
+    if sys.platform == "win32":
+        assert seen["kwargs"]["creationflags"] == (
+            subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+    else:
+        assert seen["kwargs"]["creationflags"] == 0
 
 
 # ---------- SQLiteVecIndex ----------

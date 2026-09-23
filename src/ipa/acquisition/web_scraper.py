@@ -27,7 +27,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from threading import Lock
@@ -1801,7 +1801,10 @@ class WebScraper:
             lines.append("")
             lines.append("--- Linked documents downloaded to Landing zone ---")
             for i, doc_path in enumerate(result.document_paths):
-                lines.append(f"[Document {i+1}] {Path(doc_path).name}")
+                # PureWindowsPath reduce a basename rutas Windows Y POSIX en
+                # cualquier plataforma (Path.name en Linux deja un path
+                # "C:\...\file.pdf" intacto porque \ no es separador ahi).
+                lines.append(f"[Document {i+1}] {PureWindowsPath(doc_path).name}")
             lines.append("")
 
         filepath.write_text("\n".join(lines), encoding="utf-8")
