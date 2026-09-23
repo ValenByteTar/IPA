@@ -1,5 +1,11 @@
 # Decision log
 
+> **FROZEN 2026-09-06** — this pre-EKS log is superseded by the Engineering
+> Knowledge System. New decisions are `DEC-*` records in
+> `knowledge/decisions/` (DEC-* is the project's ADR format, DEC-008). This
+> file stays as the historical record of the 2026-08/09 lab sessions; do not
+> append to it.
+
 | Date | Decision | Status | Evidence |
 |---|---|---|---|
 | 2026-08-24 | Contracts remain authoritative; tools are adapters | accepted for lab | RES-023/024 context |

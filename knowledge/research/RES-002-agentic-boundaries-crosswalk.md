@@ -1,15 +1,16 @@
 ---
 id: RES-002
 category: research
-status: proposed
+status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-23
 author: human
 components: [agentic_runtime, reporter, tutor, retrieval, context, mcp]
 tags: [agentic-rag, crosswalk, ownership, boundaries, adapters]
-related: [EXP-003, PAT-004]
+related: [EXP-003, PAT-004, DEC-002, DEC-008]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/agentic/**", "src/ipa/agent/**"]
 ---
 
 # RES-002 — Crosswalk de boundaries agentivos
@@ -36,3 +37,15 @@ Los patrones externos deben incorporarse sólo mediante contracts, adapters, tes
 - falta definir ownership definitivo de memoria conversacional;
 - falta demostrar valor incremental de navegación horizontal y multi-hop;
 - falta decidir si alguna frontera futura merece ADR local.
+
+## Cierre (2026-09-23)
+
+Research concluido — los cuatro gaps quedaron resueltos por artefactos
+posteriores:
+
+- ownership de memoria conversacional: **DEC-002** (user model unificado);
+- valor de multi-hop: medido en E13 (`docs/plans/agent-core-roadmap.md`,
+  Fase 3: recall +1.6pp en corpus E12, mecanismo disponible y medido);
+- benchmark del runtime agentivo: EXP-003 (agentic_v1 = legacy + citas
+  verificadas) y el gate Fase 2 del Tutor (720/720 generaciones, EXP-004);
+- criterio ADR: **DEC-008** (DEC-* es el formato ADR; no hay docs/adr).

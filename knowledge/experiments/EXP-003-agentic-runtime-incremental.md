@@ -3,13 +3,14 @@ id: EXP-003
 category: experiment
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [agentic_runtime, planner, retrieval, context, reporter]
 tags: [query-ir, evidence, context-package, deep-dive, agentic-v1]
 related: [RES-002, PAT-004]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/agentic/**", "src/ipa/dashboard/server.py"]
 ---
 
 # EXP-003 — Runtime agentivo incremental para Reporter

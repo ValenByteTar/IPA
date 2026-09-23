@@ -215,6 +215,31 @@ function renderState(){
   const tipLLM=`Modelo: ${llmModel}\nEstado: ${llm.ready?'Listo':'No listo'}\nProvider: ${llmProvider}`;
   const tipMain=`Corpus principal (aprobado)\nDocumentos: ${mainDocs}\nChunks BM25: ${mainChunks}\nChunks LanceDB: ${mainLanceChunks}\nSolo se llena al aprobar un reporte`;
   const tipArchive=`Documentos archivados en Archive/\nTotal: ${archivedFiles} archivos`;
+  // Index audit (idle T1, read-only): logical layer consume señales Tier 0,
+  // physical layer compara store↔BM25↔FTS↔LanceDB cada IPA_AUDIT_PHYSICAL_HOURS.
+  const ih=state.index_health||{};
+  const ihLog=ih.logical||{},ihPhys=ih.physical||{};
+  const ihIssues=[];
+  if(ihLog.empty_docs_count)ihIssues.push(`${ihLog.empty_docs_count} docs vacíos`);
+  if(ihLog.dup_hashes_count)ihIssues.push(`${ihLog.dup_hashes_count} hashes duplicados`);
+  if(ihLog.dup_flag_leaks_count)ihIssues.push(`${ihLog.dup_flag_leaks_count} dup-flag fugados`);
+  if(ihLog.missing_meta_count)ihIssues.push(`${ihLog.missing_meta_count} sin metadata`);
+  if(ihLog.scrape_no_url_count)ihIssues.push(`${ihLog.scrape_no_url_count} scrape sin URL`);
+  if(ihPhys.bm25){
+    if(ihPhys.bm25.meta_missing_count)ihIssues.push(`${ihPhys.bm25.meta_missing_count} chunks fuera de BM25 meta`);
+    if(ihPhys.bm25.fts_missing_count)ihIssues.push(`${ihPhys.bm25.fts_missing_count} chunks fuera de FTS`);
+  }
+  if(ihPhys.lance){
+    if(ihPhys.lance.missing_count)ihIssues.push(`${ihPhys.lance.missing_count} chunks sin vector`);
+    if(ihPhys.lance.orphans_count)ihIssues.push(`${ihPhys.lance.orphans_count} vectores huérfanos`);
+  }
+  if(ihPhys.spam_chunks){
+    if(ihPhys.spam_chunks.same_site_hashes)ihIssues.push(`${ihPhys.spam_chunks.same_site_hashes} hashes spam same-site`);
+    if(ihPhys.spam_chunks.cross_domain_hashes)ihIssues.push(`${ihPhys.spam_chunks.cross_domain_hashes} hashes cross-domain (revisar)`);
+  }
+  const ihStatus=ih.status||'—';
+  const ihLabel=ih.checked_at?`última: ${ih.checked_at}`:'sin auditoría aún';
+  const tipHealth=`Auditoría de índices (idle T1, read-only)\nEstado: ${ihStatus}\n${ihIssues.length?ihIssues.join('\n'):'Sin hallazgos'}\nReporte: outputs/agent/index_health.json`;
   // Research indicator — show when agent is doing web research
   const agentResearch=state.agent_research||{};
   const ri=$('#research-indicator');
@@ -223,7 +248,28 @@ function renderState(){
     const q=agentResearch.query||'';
     const maxU=agentResearch.max_urls||'?';
     const started=agentResearch.started_at||'';
-    ri.querySelector('#research-indicator-text').textContent=`Investigación en curso: "${q}" (${maxU} fuentes máx.) — iniciada ${started}`;
+    // La fase pesada (ingesta + embeddings) se serializa con otros jobs: si
+    // está esperando el lock, decir por quién — antes no había señal alguna.
+    const hw=agentResearch.heavy_wait;
+    const waitTxt=hw&&hw.seconds?` · esperando a ${hw.blocked_by||'otro job'} (${Math.round(hw.seconds)}s)`:'';
+    // Fase granular — research_progress.json emite phase + phase_detail en
+    // cada transición (search→judge→scrape→ingest→embed→retrieval); sin ella
+    // el indicador decía solo "running" durante minutos.
+    const phaseLabels={starting:'Arrancando',search:'Buscando en la web',judge:'Filtrando fuentes',scrape:'Descargando fuentes',ingest:'Ingestando al staging',embed:'Vectorizando',retrieval:'Recuperando contexto'};
+    const ph=agentResearch.phase;
+    const pd=agentResearch.phase_detail||{};
+    let phTxt='';
+    if(ph){
+      phTxt=phaseLabels[ph]||ph;
+      if(ph==='search'&&pd.results!=null)phTxt+=` (${pd.results} resultados)`;
+      else if(ph==='judge'&&pd.accepted!=null)phTxt+=` (${pd.accepted}/${pd.candidates||'?'} aceptadas)`;
+      else if(ph==='scrape')phTxt+=` ${pd.done||0}/${pd.total||'?'} · ${pd.accepted||0} aceptadas, ${pd.rejected||0} rechazadas`;
+      else if(ph==='ingest'&&pd.docs!=null)phTxt+=` (${pd.docs} docs)`;
+      else if(ph==='embed'&&pd.chunks!=null)phTxt+=` (${pd.chunks} chunks)`;
+      else if(ph==='retrieval'&&pd.hits!=null)phTxt+=` (${pd.hits} hits)`;
+      phTxt=` — ${phTxt}`;
+    }
+    ri.querySelector('#research-indicator-text').textContent=`Investigación en curso: "${q}"${phTxt} (${maxU} fuentes máx.) — iniciada ${started}${waitTxt}`;
   }else if(pipelineActive){
     // Ingesta en curso — visible también desde el chat, no solo en Resumen.
     ri.style.display='flex';
@@ -233,6 +279,30 @@ function renderState(){
   }else{
     ri.style.display='none';
   }
+  const maintenance=state.embedding_maintenance||{};
+  const chatBlocked=maintenance.chat_blocked===true;
+  const maintenanceBanner=$('#embedding-maintenance-banner');
+  if(maintenanceBanner){
+    maintenanceBanner.style.display=chatBlocked?'block':'none';
+    if(chatBlocked){
+      const phaseLabels={preparing:'Preparando la GPU',waiting_for_vram:'Esperando a que termine el turno activo',unloading_llm:'Liberando Ollama de la VRAM',loading_bge:'Cargando BGE-M3 en GPU',embedding:'Indexando embeddings',restoring_chat:'Restaurando el modelo de chat'};
+      const total=Number(maintenance.total_chunks||0);
+      const done=Number(maintenance.vectorized??maintenance.vectorized_before??0);
+      const pct=total?Math.min(100,Math.floor(done*100/total)):0;
+      const eta=Number(maintenance.eta_seconds||0);
+      const etaText=eta>0?` · aprox. ${Math.ceil(eta/60)} min restantes`:'';
+      maintenanceBanner.textContent=`Chat pausado por ingesta masiva de embeddings. ${phaseLabels[maintenance.phase]||maintenance.phase||'Procesando'} — ${format(done)} / ${format(total)} vectores (${pct}%)${etaText}. Se reactivará al terminar.`;
+    }
+  }
+  const chatInput=$('#agent-chat-input');
+  if(chatInput){
+    chatInput.disabled=chatBlocked;
+    chatInput.placeholder=chatBlocked?'Chat pausado durante la ingesta masiva…':'Escribí tu mensaje…';
+    const form=chatInput.closest('form');
+    const submit=form?.querySelector('button[type="submit"],button.primary');
+    if(submit)submit.disabled=chatBlocked;
+  }
+  document.querySelectorAll('#chat-role .role-btn').forEach(button=>{button.disabled=chatBlocked});
   $('#metrics').innerHTML=[
     {l:'Pendientes en Landing',v:format(scrapedFiles),s:'sin procesar',t:tipScraped,ctx:'landing'},
     {l:'En Transit',v:format(transitFiles),s:'esperan confirmación',t:tipTransit},
@@ -247,6 +317,7 @@ function renderState(){
     {l:'Chunks principales',v:format(mainChunks),s:'en BM25 (aprobado)',t:`Corpus principal BM25\nChunks: ${mainChunks}`},
     {l:'Vectores principales',v:format(mainLanceChunks),s:'en LanceDB (aprobado)',t:`Corpus principal LanceDB\nVectores: ${mainLanceChunks}`},
     {l:'Documentos archivados',v:format(archivedFiles),s:'en Archive/',t:tipArchive},
+    {l:'Salud de índices',v:ihStatus,s:ihLabel,t:tipHealth},
   ].map(x=>`<div class="metric" title="${esc(x.t)}"><div class="label">${x.l}</div><div class="value">${x.v}</div><div class="label">${x.s}</div></div>`).join('');
   // Pipeline progress banner on overview
   if(pipelineActive){
@@ -1509,6 +1580,10 @@ async function tutorDecide(kind,id,decision){
 
 async function sendAgentMessage(event){
   event.preventDefault();
+  if(state?.embedding_maintenance?.chat_blocked){
+    toast('Chat pausado durante la ingesta masiva de embeddings. Se reactivará al terminar.');
+    return;
+  }
   const input=$('#agent-chat-input');
   const message=input.value.trim();
   if(!message)return;

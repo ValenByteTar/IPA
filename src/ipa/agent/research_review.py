@@ -260,9 +260,11 @@ def ingest_reviewed_doc(
     *,
     embedding_adapter: Any | None = None,
 ) -> str | None:
-    """Promote a reviewed doc into the main corpus.
+    """Promote a reviewed doc into the given corpus.
 
-    Writes the text as a Landing file, runs FastPath ingestion, records
+    DEC-003b: the caller passes the research staging corpus by default —
+    the main corpus only when IPA_RESEARCH_STAGING=0. Writes the text as
+    a Landing file, runs FastPath ingestion, records
     agent_research provenance, and embeds the new chunks into LanceDB when
     an embedding adapter is provided. Returns the document_id or None.
     """
@@ -313,8 +315,24 @@ def ingest_reviewed_doc(
         store = DocumentStore(corpus / "document_store.db")
         try:
             record_agent_research(store, document_id, item["url"])
+            # Señales Tier 0: title/hash/dates + flag "corpus changed" para el
+            # gate de topify (este path bypasea la promotion queue).
+            try:
+                from ipa.ingestion.ingest_metadata import record_ingest_metadata
+                record_ingest_metadata(store, [document_id])
+            except Exception:
+                pass
         finally:
             store.close()
+        try:
+            from ipa.agentic.topic_clusters import TopicClusterStore
+            _cs = TopicClusterStore()
+            try:
+                _cs.set_meta(f"dirty:{corpus.resolve()}", "1")
+            finally:
+                _cs.close()
+        except Exception:
+            pass
 
     if document_id and embedding_adapter is not None:
         try:

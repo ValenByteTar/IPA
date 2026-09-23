@@ -33,6 +33,13 @@ from ipa.contracts import DocumentChunk
 # Previous: all-MiniLM-L6-v2 (384 dims, 256 tokens, MTEB 56.3) â€” truncated
 # chunks to 256 tokens and had weaker retrieval quality.
 DEFAULT_MODEL = "BAAI/bge-m3"
+# Batch por device (None en el constructor = auto). El probe inicial de GPU
+# usó textos sintéticos cortos y favoreció batch 64; con chunks reales el
+# throughput máximo observado fue batch 4 en ambos dispositivos. El probe CPU
+# fijó torch a 6 threads (~2.9 chunks/s); el adapter no fija ese valor. GPU
+# fp16 ≈129 chunks/s (PM-004).
+DEFAULT_BATCH_GPU = int(os.environ.get("IPA_EMBED_BATCH_GPU", "4") or 4)
+DEFAULT_BATCH_CPU = int(os.environ.get("IPA_EMBED_BATCH_CPU", "4") or 4)
 DEFAULT_DIM = 1024
 
 
@@ -83,7 +90,7 @@ class EmbeddingAdapter:
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
-        batch_size: int = 64,
+        batch_size: int | None = None,
         show_progress: bool = True,
         device: str = "auto",
         use_fp16: bool = True,
@@ -91,7 +98,12 @@ class EmbeddingAdapter:
         max_length: int = 2048,
     ) -> None:
         self.model_name = model_name
-        self.batch_size = batch_size
+        # None = auto por device; `batch_size` explícito mantiene prioridad.
+        # El batch 64 del probe histórico era un tuning con texto sintético;
+        # con corpus real variable, batch 4 rindió mejor en ambos devices
+        # (PM-004, microbenchmark 2026-09-22).
+        self._batch_override = batch_size
+        self.batch_size = batch_size if batch_size is not None else DEFAULT_BATCH_GPU
         self.show_progress = show_progress
         # IPA_EMBED_DEVICE permite forzar el device cuando el caller no lo
         # especifica (device="auto"): los tests lo setean a "cpu" para ser
@@ -145,12 +157,19 @@ class EmbeddingAdapter:
             pass
         return "cpu"
 
+    def _resolve_batch(self) -> int:
+        """Batch efectivo por device (override explícito gana)."""
+        if self._batch_override is not None:
+            return int(self._batch_override)
+        return DEFAULT_BATCH_GPU if self._device_resolved == "cuda" else DEFAULT_BATCH_CPU
+
     def _ensure_model(self) -> None:
         """Lazy-load the model on first use."""
         if self._model is not None:
             return
         from FlagEmbedding import BGEM3FlagModel
         self._device_resolved = self._resolve_device()
+        self.batch_size = self._resolve_batch()
         # FP16 only helps on GPU; on CPU it's slower.
         fp16 = self.use_fp16 and self._device_resolved == "cuda"
         # Skip the hub round-trip ("Fetching N files") when the snapshot is
@@ -195,6 +214,64 @@ class EmbeddingAdapter:
         if self._device_resolved is None:
             self._ensure_model()
         return self._device_resolved  # type: ignore
+
+    def try_move_to_gpu(self, min_free_mb: float | None = None) -> bool:
+        """Sube el modelo a GPU si hay headroom (venía resuelto en CPU).
+
+        Medido 2026-09-22 (PM-004): con los mismos 64 chunks reales (~512 chars),
+        mejor CPU FP32 batch 4, con 6 threads fijados en la sonda, dio
+        2.86-2.99 chunks/s; GPU FP16 batch 4 dio 124-135 chunks/s (~45x). GPU
+        FP32 batch 8 dio ~37 chunks/s. El adapter no fija el thread count. El
+        probe anterior (~125x) mezclaba texto sintético corto y chunks reales.
+        El locking de VRAM queda en el caller: en 6 GB BGE-M3 y el LLM no conviven
+        (OOM medido). Devuelve True si quedó GPU.
+        """
+        if self._device_resolved == "cuda":
+            return True
+        try:
+            from ipa.indexes.reranker_adapter import physical_free_vram_mb
+            free_mb = physical_free_vram_mb()
+        except Exception:
+            free_mb = None
+        threshold = float(min_free_mb if min_free_mb is not None
+                          else os.environ.get("IPA_EMBED_MIN_FREE_MB", "2048"))
+        if free_mb is None or free_mb < threshold:
+            return False
+        self.close()
+        self.device = "cuda"
+        self._device_resolved = None
+        try:
+            self._ensure_model()
+        except Exception:
+            # Carga en GPU falló (OOM u otro): volver a CPU sin romper el drain.
+            self.device = "cpu"
+            self._device_resolved = None
+            self._ensure_model()
+            return False
+        return self._device_resolved == "cuda"
+
+    def move_to_cpu(self) -> None:
+        """Baja el modelo a CPU y libera la VRAM (cierra una ventana GPU)."""
+        if self._device_resolved != "cuda":
+            return
+        self.close()
+        self.device = "cpu"
+        self._device_resolved = None
+        self._ensure_model()
+
+    def release_gpu(self) -> None:
+        """Libera la ventana GPU sin recargar el modelo (lazy).
+
+        close() solo suelta la VRAM pero deja device/_device_resolved en
+        "cuda": un embed posterior recargaría BGE-M3 en CUDA encima del chat
+        recién restaurado (OOM medido en 6 GB). Acá el próximo embed
+        re-resuelve el device — normalmente CPU por el gate de VRAM.
+        """
+        if self._device_resolved != "cuda" and self.device != "cuda":
+            return
+        self.close()
+        self.device = "cpu"
+        self._device_resolved = None
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts.  Returns a list of float vectors (dense only)."""

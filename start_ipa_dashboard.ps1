@@ -35,6 +35,12 @@ if (-not $env:OLLAMA_KV_CACHE_TYPE) { $env:OLLAMA_KV_CACHE_TYPE = "q8_0" }
 # Ajustar por máquina; vacío = auto.
 if (-not $env:IPA_OLLAMA_NUM_GPU) { $env:IPA_OLLAMA_NUM_GPU = "30" }
 
+# Reranker fijado a CPU: es un singleton lazy — si `auto` lo carga en CUDA
+# mientras el LLM está descargado, queda residente (~2.1 GB) y compite con el
+# 9B cuando el chat vuelve (EXP-008: OOM/congelamiento en 6 GB). El costo CPU
+# medido es ~+0.7 s/query (EXP-007), marginal vs el riesgo de VRAM.
+if (-not $env:IPA_RERANK_DEVICE) { $env:IPA_RERANK_DEVICE = "cpu" }
+
 # Ensure Ollama is running (LLM backend for the agent; also the CPU fallback target)
 $ollamaUp = $false
 try {
@@ -92,14 +98,16 @@ if (-not $searxngUp -and $searxngLocal) {
             Start-Process -FilePath $dockerDesktop
             for ($attempt = 0; $attempt -lt 90; $attempt++) {
                 Start-Sleep -Seconds 1
-                $null = docker version --format "{{.Server.Version}}" 2>$null
-                if ($LASTEXITCODE -eq 0) { $dockerUp = $true; break }
+                try {
+                    $null = docker version --format "{{.Server.Version}}" 2>$null
+                    if ($LASTEXITCODE -eq 0) { $dockerUp = $true; break }
+                } catch { }
             }
         }
     }
     if ($dockerUp -and (Test-Path $compose)) {
         Write-Host "Levantando SearXNG (backend de búsqueda web)..." -ForegroundColor Cyan
-        docker compose -f $compose up -d 2>$null | Out-Null
+        try { docker compose -f $compose up -d 2>$null | Out-Null } catch { }
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
             Start-Sleep -Milliseconds 500
             try {

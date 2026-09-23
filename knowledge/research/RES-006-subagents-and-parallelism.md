@@ -1,15 +1,17 @@
 ---
 id: RES-006
 category: research
-status: proposed
+status: accepted
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-23
 author: human
-components: [agent_core, exl3_provider, research_executor]
+components: [agent_core, providers, research_executor]
 tags: [subagents, parallelism, vram, multi-agent, architecture]
-related: [RES-005, RES-002, DEC-002]
+related: [RES-005, RES-002, DEC-002, DEC-009]
 supersedes: null
 superseded_by: null
+evidence: ["docs/architecture/agent-runtime.md"]
+affects: ["src/ipa/agent/research_executor.py", "src/ipa/providers/**"]
 ---
 
 # RES-006 — Subagents y paralelismo agentivo
@@ -118,3 +120,12 @@ Total:                   ~5.8 GB  ← queda ~0.2 GB libre
 - Falta definir el contrato de `SubagentTask` (goal, context_isolated, report_back) para cuando se implemente.
 - Falta decidir si el orquestador secuencial (opción 2) vale la pena vs el planner + task queue de RES-005.
 - Re-evaluar si un modelo 3B (Qwen-3B, Phi-3-mini) como subagent verificador deja VRAM suficiente para el 9B orquestador.
+
+## Cierre (2026-09-23)
+
+Research concluido con recomendación negativa adoptada: la propuesta de
+deliberación multi-agente quedó formalmente rechazada en **DEC-009** (daño
+neto medido en EXP-004 + imposibilidad de VRAM documentada aquí). La
+arquitectura vigente (single-agent + bounded loop + research async) es la
+recomendada por este research. Los gaps restantes son triggers de
+re-evaluación ante cambio de hardware/modelo, no trabajo pendiente.

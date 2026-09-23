@@ -10,6 +10,10 @@ tags: []
 related: []
 supersedes: null
 superseded_by: null
+affects: []
+evidence: []
+author_model: null
+trigger: null
 ---
 
 # BM-001 — Título

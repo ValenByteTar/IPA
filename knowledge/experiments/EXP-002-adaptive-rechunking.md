@@ -3,13 +3,15 @@ id: EXP-002
 category: experiment
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [chunking, retrieval, ingestion]
 tags: [adaptive, rechunking, lexical-density, fallback]
 related: [BM-004, PAT-002]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/benchmarks/run_adaptive_rechunk.py", "tests/test_adaptive_chunker.py"]
+affects: ["scripts/benchmarks/run_adaptive_rechunk.py", "src/ipa/ingestion/**"]
 ---
 
 # EXP-002 â€” Adaptive rechunking
@@ -23,7 +25,7 @@ Reagrupar sólo documentos con baja densidad lexical puede reducir chunks proble
 - Corpus analizado: 720 documentos.
 - Activación: más del 30% de chunks de un documento con lexical density menor que 0,4.
 - Estrategia: merge adyacente y fallback recursive cuando fuese necesario.
-- Artefacto: `outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json`.
+- Artefacto: `outputs/experiments/E5-adaptive/retrieval/adaptive_retrieval_comparison.json` (histórico, ya no en disco — ver PM-002).
 
 ## Resultados
 

@@ -41,10 +41,12 @@ IPA runs with or without an NVIDIA GPU:
 
 - **GPU present** — the star model runs on CUDA (Ollama or ExL3), OCR and
   Docling use GPU acceleration.
-- **No GPU** — the system falls back automatically and runs 100% on CPU:
-  chat and Tutor use the Ollama provider (CPU), OCR and Docling resolve to
-  `cpu`, and embeddings run on CPU. Nothing fails at boot for lack of a GPU;
-  set `IPA_FORCE_CPU=1` to force CPU mode explicitly.
+- **No CUDA-capable GPU** — chat/Tutor fall back to Ollama on CPU, OCR/Docling
+  resolve to `cpu`, and `EmbeddingAdapter` resolves `auto` to CPU. Nothing fails
+  at boot for lack of a GPU.
+- `IPA_FORCE_CPU=1` disables GPU detection in the provider factory; it is not a
+  process-wide PyTorch device switch. To pin BGE embeddings/reranker explicitly,
+  use `IPA_EMBED_DEVICE=cpu` / `IPA_RERANK_DEVICE=cpu` (see `docs/USAGE.md`).
 
 ## Architecture
 

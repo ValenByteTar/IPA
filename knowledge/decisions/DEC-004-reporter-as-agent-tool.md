@@ -3,13 +3,14 @@ id: DEC-004
 category: decision
 status: accepted
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-23
 author: human
 components: [agent_core, reporter, dashboard]
 tags: [reporter, agent-tool, compile_report, decoupling, pipeline]
 related: [DEC-003, EXP-003, EXP-006, PAT-001, PAT-003]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/reporter/**", "src/ipa/agent/compile_report_executor.py"]
 ---
 
 # DEC-004 — Reporter como tool del agente (compile_report)

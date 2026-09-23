@@ -1396,11 +1396,14 @@ class TutorSession:
         return cancelled
 
     def execute_approved_research(self, request_id: str, ctx: Any, *, judge: Any | None = None,
-                                  landing_dir: Any = "Landing/web") -> dict[str, Any]:
+                                  landing_dir: Any = None) -> dict[str, Any]:
         """Execute an APPROVED ResearchRequest via the Fase 1 agentic executor.
 
         Only approved requests run; the executor receives the request_id for
         provenance tracing (web_source.research_request_id).
+
+        ``landing_dir`` None → dir de trabajo privado por corrida (PM-004): la
+        investigación no comparte ``Landing/web`` con el scraper del pipeline.
         """
         from ipa.tutor.tutor_contracts import ResearchRequest, ResearchStatus
         request = self.store.get_research_request(request_id)

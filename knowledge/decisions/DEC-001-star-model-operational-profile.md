@@ -3,13 +3,15 @@ id: DEC-001
 category: decision
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [tutor, providers, configuration, performance]
 tags: [qwen3.5-9b, exllama, exl3, mtp, no-think, batch, provisional]
 related: [RES-004, EXP-004, BM-006]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/providers/exl3_provider.py", "tests/test_device_fallback.py"]
+affects: ["src/ipa/providers/**", "configs/**"]
 ---
 
 # DEC-001 — Perfil operacional del modelo estrella

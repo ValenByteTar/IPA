@@ -305,6 +305,43 @@ def test_embed_device_gate_uses_physical_vram(monkeypatch):
     assert ea.EmbeddingAdapter(device="cpu")._resolve_device() == "cpu"
 
 
+def test_embedding_batch_defaults_match_measured_devices():
+    import os
+    from ipa.indexes.embedding_adapter import (
+        DEFAULT_BATCH_CPU, DEFAULT_BATCH_GPU, EmbeddingAdapter,
+    )
+
+    cpu = EmbeddingAdapter()
+    cpu._device_resolved = "cpu"
+    gpu = EmbeddingAdapter()
+    gpu._device_resolved = "cuda"
+    explicit = EmbeddingAdapter(batch_size=64)
+    explicit._device_resolved = "cpu"
+    assert DEFAULT_BATCH_CPU == int(os.environ.get("IPA_EMBED_BATCH_CPU", "4") or 4)
+    assert DEFAULT_BATCH_GPU == 4
+    assert cpu._resolve_batch() == DEFAULT_BATCH_CPU
+    assert gpu._resolve_batch() == DEFAULT_BATCH_GPU
+    assert explicit._resolve_batch() == 64
+
+
+def test_physical_vram_probe_hides_nvidia_smi_console(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    from ipa.indexes.reranker_adapter import physical_free_vram_mb
+
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(stdout="1000, 6144\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert physical_free_vram_mb() == 5144
+    assert seen["kwargs"]["creationflags"] == (
+        subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+
+
 # ---------- SQLiteVecIndex ----------
 
 class TestSQLiteVecIndex:

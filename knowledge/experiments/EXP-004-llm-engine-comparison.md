@@ -3,13 +3,15 @@ id: EXP-004
 category: experiment
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [tutor, providers, evaluation, performance]
 tags: [qwen3.5-9b, exllamav3, exl3, ollama, mtp, vram, deliberation]
 related: [RES-004, BM-006, DEC-001]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/operations/test_exl3_provider.py", "src/ipa/providers/exl3_provider.py"]
+affects: ["src/ipa/providers/**", "scripts/operations/test_exl3_provider.py"]
 ---
 
 # EXP-004 — Comparación de engine y modelo LLM para Tutor

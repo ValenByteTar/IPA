@@ -15,7 +15,7 @@ def main() -> int:
     parser.add_argument("root", nargs="?", default="knowledge")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
-    repository = EKSRepository(Path(args.root), [Path("docs/adr")])
+    repository = EKSRepository(Path(args.root))
     report = repository.validate()
     payload = {
         "valid": report.valid,

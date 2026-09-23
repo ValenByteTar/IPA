@@ -41,6 +41,7 @@ _STATUS_RANK = {
     "quarantine": 3,
     "chunked": 4,
     "indexed": 5,
+    "no_text": 5,
 }
 
 # Operational scraper state living inside Landing — never artifacts to sweep.
@@ -305,7 +306,10 @@ def sweep_landing(
             return "delete"
         if aid in pending_artifacts or status == "indexed":
             return "transit"
-        if status == "failed":
+        # no_text: parsed OK but zero usable text (e.g. image-only PDF whose
+        # OCR produced nothing) — nothing queryable was ever stored, so the
+        # file is waste like a failed parse.
+        if status in ("failed", "no_text"):
             return "delete"
         return "skip"
 
@@ -379,7 +383,7 @@ def sweep_landing(
                 _move_to_dir(path, transit_root, archive_root)
                 stats["archived"] += 1
                 transit_hashes.pop(aid, None)
-            elif aid in rejected_artifacts:
+            elif aid in rejected_artifacts or statuses_by_id.get(aid) == "no_text":
                 _robust_delete(path)
                 stats["deleted"] += 1
                 transit_hashes.pop(aid, None)

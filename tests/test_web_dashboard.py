@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -119,6 +120,180 @@ def test_idle_switch_persists_across_boot(tmp_path, monkeypatch):
 
 
 # ── Deep dive consolidado en el chat (context=deep_dive) ────────────────────
+
+def _make_reporter_corpus(output: Path, docs: int) -> None:
+    import sqlite3
+
+    corpus = output / "corpus"
+    corpus.mkdir(parents=True)
+    with sqlite3.connect(corpus / "document_store.db") as conn:
+        conn.execute("CREATE TABLE documents (tombstoned INTEGER NOT NULL)")
+        conn.executemany("INSERT INTO documents VALUES (?)", [(0,)] * docs)
+
+
+def test_active_reporter_output_persists_across_dashboard_restart(tmp_path, monkeypatch):
+    reporter_root = tmp_path / "reporter"
+    output = reporter_root / "quality-check" / "optimized-llm-unspecified"
+    _make_reporter_corpus(output, 12)
+    pointer_path = tmp_path / "active_reporter_output.json"
+    monkeypatch.setattr(dashboard, "REPORTER_ROOT", reporter_root)
+    monkeypatch.setattr(dashboard, "ACTIVE_REPORTER_OUTPUT_PATH", pointer_path)
+    monkeypatch.setattr(dashboard, "_ACTIVE_REPORTER_OUTPUT", None)
+
+    dashboard.set_active_reporter_output(output)
+    assert json.loads(pointer_path.read_text(encoding="utf-8")) == {
+        "path": str(output.resolve()),
+    }
+    assert not pointer_path.with_suffix(".tmp").exists()
+
+    # Simula reinicio: se pierde la variable de módulo, no el puntero durable.
+    dashboard._ACTIVE_REPORTER_OUTPUT = None
+    assert dashboard.active_reporter_output() == output.resolve()
+
+
+def test_active_reporter_fallback_prefers_populated_corpus_without_report(
+        tmp_path, monkeypatch):
+    reporter_root = tmp_path / "reporter"
+    qc = reporter_root / "quality-check"
+    populated = qc / "optimized-llm-unspecified"
+    empty = qc / "optimized-llm-2026-09"
+    _make_reporter_corpus(populated, 17)
+    _make_reporter_corpus(empty, 0)
+    # El reporte más reciente es de un output vacío; el corpus vivo ni siquiera
+    # generó su report.json. El fallback debe resolver por datos, no por mtime.
+    (populated / "report.json").unlink(missing_ok=True)
+    (empty / "report.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(dashboard, "REPORTER_ROOT", reporter_root)
+    monkeypatch.setattr(dashboard, "ACTIVE_REPORTER_OUTPUT_PATH",
+                        tmp_path / "missing-pointer.json")
+    monkeypatch.setattr(dashboard, "_ACTIVE_REPORTER_OUTPUT", None)
+    dashboard._corpus_doc_count_cache.clear()
+
+    assert dashboard.active_reporter_output() == populated
+
+
+def test_active_reporter_discards_stale_persisted_pointer(tmp_path, monkeypatch):
+    reporter_root = tmp_path / "reporter"
+    qc = reporter_root / "quality-check"
+    good = qc / "populated"
+    stale = qc / "deleted-output"
+    _make_reporter_corpus(good, 3)
+    pointer_path = tmp_path / "active_reporter_output.json"
+    pointer_path.write_text(json.dumps({"path": str(stale)}), encoding="utf-8")
+    monkeypatch.setattr(dashboard, "REPORTER_ROOT", reporter_root)
+    monkeypatch.setattr(dashboard, "ACTIVE_REPORTER_OUTPUT_PATH", pointer_path)
+    monkeypatch.setattr(dashboard, "_ACTIVE_REPORTER_OUTPUT", None)
+    dashboard._corpus_doc_count_cache.clear()
+
+    assert dashboard.active_reporter_output() == good
+    assert not pointer_path.exists()
+
+
+def test_chat_api_returns_423_while_gpu_maintenance_is_active(tmp_path, monkeypatch):
+    from ipa.agentic import embedding_maintenance
+    from ipa.dashboard.api import Handler
+
+    monkeypatch.setattr(embedding_maintenance, "STATE_PATH",
+                        tmp_path / "embedding_maintenance.json")
+    embedding_maintenance.start_state(
+        corpus="corpus", total_chunks=1000, vectorized=0, pending=1000,
+        mode="bulk_gpu",
+    )
+    handler = object.__new__(Handler)
+    handler.path = "/api/agent/chat/stream"
+    handler.read_body = lambda: {"message": "hola"}
+    result = {}
+    handler.send_json = lambda value, status=200: result.update(value=value, status=status)
+
+    Handler.do_POST(handler)
+
+    assert result["status"] == 423
+    assert "ingesta masiva" in result["value"]["error"].lower()
+
+
+@pytest.mark.parametrize("path", [
+    "/api/promotions/process", "/api/reports/review", "/api/decisions/review",
+    "/api/pipeline/run", "/api/lancedb/run",
+])
+def test_corpus_mutation_is_rejected_during_gpu_maintenance(
+        tmp_path, monkeypatch, path):
+    from ipa.agentic import embedding_maintenance
+    from ipa.dashboard.api import Handler
+
+    monkeypatch.setattr(embedding_maintenance, "STATE_PATH",
+                        tmp_path / "embedding_maintenance.json")
+    embedding_maintenance.start_state(
+        corpus="corpus", total_chunks=1000, vectorized=0, pending=1000,
+        mode="bulk_gpu",
+    )
+    handler = object.__new__(Handler)
+    handler.path = path
+    handler.read_body = lambda: {}
+    result = {}
+    handler.send_json = lambda value, status=200: result.update(value=value, status=status)
+
+    Handler.do_POST(handler)
+
+    assert result["status"] == 423
+    assert "ingesta masiva" in result["value"]["error"].lower()
+
+
+def test_corpus_mutation_waits_for_cpu_embedding_drain(tmp_path, monkeypatch):
+    from ipa.agentic import embedding_maintenance
+    from ipa.dashboard.api import Handler
+
+    monkeypatch.setattr(embedding_maintenance, "STATE_PATH",
+                        tmp_path / "embedding_maintenance.json")
+    monkeypatch.setattr(embedding_maintenance, "JOB_LOCK_PATH",
+                        tmp_path / "embedding.lock")
+    assert embedding_maintenance.claim_job("embedding_drain") is True
+    handler = object.__new__(Handler)
+    handler.path = "/api/promotions/process"
+    handler.read_body = lambda: {}
+    result = {}
+    handler.send_json = lambda value, status=200: result.update(value=value, status=status)
+    try:
+        Handler.do_POST(handler)
+        assert result["status"] == 423
+        assert "embedding_drain" in result["value"]["error"]
+    finally:
+        embedding_maintenance.release_job("embedding_drain")
+
+
+def test_chat_backend_gate_survives_dashboard_state_reload(tmp_path, monkeypatch):
+    from ipa.agentic import embedding_maintenance
+
+    monkeypatch.setattr(embedding_maintenance, "STATE_PATH",
+                        tmp_path / "embedding_maintenance.json")
+    embedding_maintenance.start_state(
+        corpus="corpus", total_chunks=1000, vectorized=400, pending=600,
+        mode="bulk_gpu",
+    )
+    # Estado durable leído desde otra llamada/módulo; la UI no es el único gate.
+    assert embedding_maintenance.read_state()["chat_blocked"] is True
+    assert embedding_maintenance.chat_block_reason() is not None
+
+
+def test_deep_dive_stream_is_rejected_during_gpu_maintenance(tmp_path, monkeypatch):
+    from ipa.agentic import embedding_maintenance
+    from ipa.dashboard.api import Handler
+
+    monkeypatch.setattr(embedding_maintenance, "STATE_PATH",
+                        tmp_path / "embedding_maintenance.json")
+    embedding_maintenance.start_state(
+        corpus="corpus", total_chunks=1000, vectorized=0, pending=1000,
+        mode="bulk_gpu",
+    )
+    handler = object.__new__(Handler)
+    handler.path = "/api/deep-dive/stream?query=test"
+    result = {}
+    handler.send_json = lambda value, status=200: result.update(value=value, status=status)
+
+    Handler.do_GET(handler)
+
+    assert result["status"] == 423
+    assert "ingesta masiva" in result["value"]["error"].lower()
+
 
 def test_deep_dive_context_absent_returns_none():
     from ipa.dashboard.api import parse_deep_dive_context

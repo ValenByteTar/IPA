@@ -3,13 +3,14 @@ id: EXP-008
 category: experiment
 status: accepted
 created: 2026-09-19
-updated: 2026-09-19
+updated: 2026-09-23
 author: agent
 components: [providers, dashboard, indexes, operations]
 tags: [kv-cache, prefix-cache, ollama, exl3, vram, num-gpu, num-keep, batch, throughput]
-related: [EXP-004, EXP-007]
+related: [EXP-004, EXP-007, EXP-009, PAT-007]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/providers/ollama_provider.py", "src/ipa/indexes/embedding_adapter.py"]
 ---
 
 # EXP-008 — Caches y VRAM: PT cache, KV, num_gpu, num_keep y convivencia de motores
@@ -267,6 +268,36 @@ emitió JSON válido (se marca `error` y se reintenta en el próximo pase).
    para batch > 2; a batch 1 el MTP da +14%).
 8. Orchestrator de consola deprecado (la cadena scraper→fast_path→lancedb→
    hammer→enrichment); los jobs van por el dashboard y el idle scheduler.
+
+## Seguimiento: precisión BGE-M3 en Ada
+
+EXP-009 documenta un diseño propuesto para FP8 E4M3/NVIDIA scaling en la RTX
+4050 (SM89). Ada tiene Tensor Cores con FP8, pero el adapter FlagEmbedding de
+IPA no expone FP8; NVFP4/MXFP8 no deben confundirse con este formato. EXP-009
+no se ha implementado ni ejecutado: FP16 sigue siendo la ruta GPU vigente.
+
+## Addendum (2026-09-23) — caches de aplicación, pin del reranker y conmutación chat↔T2
+
+Hallazgos operacionales medidos que complementan los resultados originales:
+
+- **Caches de aplicación** (encima de los caches de motor): embeddings de
+  query (`IPA_EMBED_CACHE_SIZE`), rankings del reranker
+  (`IPA_RERANK_CACHE_SIZE`), resultados de retrieval con TTL
+  (`IPA_RETRIEVAL_CACHE_*`), tools read-only (`IPA_TOOL_CACHE_TTL`;
+  `get_system_status` nunca se cachea) y respuestas de chat opt-in
+  (`IPA_RESPONSE_CACHE=1`, match exacto por mensaje/rol/sesión).
+- **Reranker pinneado a CPU** (`IPA_RERANK_DEVICE=cpu` en launcher + env de
+  usuario): con `auto`, el singleton podía cargarse en CUDA mientras el LLM
+  estaba ausente y quedar residente compitiendo por VRAM. Costo medido del
+  pin: ~+0.7 s/query (EXP-007).
+- **Conmutación chat↔T2 verificada**: el provider del pase profundo va
+  marcado `_t2_owned`; un chat a mitad del pase lo descarga y monta el
+  interactivo (~29 s en frío: unload + reload GGUF). El worker solo
+  descarga si la instancia sigue siendo la suya (identidad +
+  `DEEP_DIVE_LOCK`). El warmup del boot carga Ollama y el pase profundo lo
+  baja antes de cargar ExL3 (`deep_done` separado de `level2_done`).
+- **Métrica directa del PT cache de Ollama**: `prompt_eval_cached_count`
+  por generación en `outputs/web_dashboard/logs/llm_perf.jsonl`.
 
 ## Reproducción
 

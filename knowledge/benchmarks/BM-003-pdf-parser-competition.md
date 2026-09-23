@@ -3,13 +3,15 @@ id: BM-003
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [parsing, ingestion, performance, provenance]
 tags: [pdf, pymupdf, docling, unstructured, parser]
 related: [PAT-001]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/benchmarks/run_parser_benchmark.py", "tests/test_parsers_alt.py"]
+affects: ["scripts/benchmarks/run_parser_benchmark.py"]
 ---
 
 # BM-003 â€” Competencia de parsers PDF
@@ -21,7 +23,7 @@ Comparar PyMuPDF, Docling y Unstructured para el fast path de PDFs born-digital.
 ## Entorno
 
 - Dataset: 20 PDFs balanceados.
-- Artefacto: `outputs/experiments/E3/benchmark_report.json`.
+- Artefacto: `outputs/experiments/E3/benchmark_report.json` (histórico, ya no en disco — ver PM-002).
 - Métricas: tiempo, texto extraído y errores.
 
 ## Resultados

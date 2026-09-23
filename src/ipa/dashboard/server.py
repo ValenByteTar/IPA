@@ -125,9 +125,70 @@ _CLEANING_LOCK = threading.Lock()
 
 _CLEANING_IN_PROGRESS = False
 
-# Active reporter output directory â€” set by run_full_pipeline, read by dashboard_state
-
+# Active reporter output directory — set by run_full_pipeline, read by dashboard_state.
+# Persistido a disco: un restart del dashboard (watchdog) perdía el puntero en
+# memoria y las métricas caían al fallback "report.json más reciente", que puede
+# ser un corpus vacío — el corpus en uso no tiene report.json hasta que se
+# genera (bug real medido 2026-09-22: mostraba 0 documentos con 127k chunks vivos).
 _ACTIVE_REPORTER_OUTPUT: Path | None = None
+ACTIVE_REPORTER_OUTPUT_PATH = ROOT / "outputs" / "web_dashboard" / "active_reporter_output.json"
+_CORPUS_DOC_COUNT_TTL_S = 30.0
+_corpus_doc_count_cache: dict[str, tuple[float, int]] = {}
+
+
+def set_active_reporter_output(path: Path | None) -> None:
+    """Fija y persiste el output activo del reporter (sobrevive al restart)."""
+    global _ACTIVE_REPORTER_OUTPUT
+    _ACTIVE_REPORTER_OUTPUT = Path(path).resolve() if path is not None else None
+    try:
+        ACTIVE_REPORTER_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _ACTIVE_REPORTER_OUTPUT is None:
+            ACTIVE_REPORTER_OUTPUT_PATH.unlink(missing_ok=True)
+        else:
+            temp = ACTIVE_REPORTER_OUTPUT_PATH.with_suffix(".tmp")
+            temp.write_text(json.dumps({"path": str(_ACTIVE_REPORTER_OUTPUT)}),
+                            encoding="utf-8")
+            temp.replace(ACTIVE_REPORTER_OUTPUT_PATH)
+    except Exception:
+        pass  # el puntero persistido es una conveniencia, no estado canónico
+
+
+def _load_persisted_active_reporter_output() -> Path | None:
+    """Recupera el puntero persistido si el directorio sigue existiendo."""
+    try:
+        data = json.loads(ACTIVE_REPORTER_OUTPUT_PATH.read_text(encoding="utf-8"))
+        raw_path = str(data.get("path") or "")
+        if raw_path:
+            path = Path(raw_path).resolve()
+            if (REPORTER_ROOT.resolve() in path.parents
+                    and path.is_dir() and (path / "corpus").is_dir()):
+                return path
+    except Exception:
+        pass
+    try:
+        ACTIVE_REPORTER_OUTPUT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
+
+
+def _corpus_doc_count(output_dir: Path) -> int:
+    """Docs vivos del corpus de un output (cache 30s: /api/state lo consulta seguido)."""
+    key = str(output_dir)
+    cached = _corpus_doc_count_cache.get(key)
+    if cached is not None and time.time() - cached[0] < _CORPUS_DOC_COUNT_TTL_S:
+        return cached[1]
+    count = 0
+    store = output_dir / "corpus" / "document_store.db"
+    if store.exists():
+        try:
+            with sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=5) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE tombstoned=0").fetchone()[0]
+        except Exception:
+            count = 0
+    _corpus_doc_count_cache[key] = (time.time(), count)
+    return count
 
 DEEP_DIVE_LOCK = threading.Lock()
 
@@ -283,35 +344,47 @@ def active_reporter_output() -> Path:
 
     1. _ACTIVE_REPORTER_OUTPUT (set by run_full_pipeline during execution)
 
-    2. Most recent directory under REPORTER_ROOT/quality-check/ that has a report.json
+    2. El mismo puntero persistido en disco (sobrevive al restart del dashboard)
 
-    3. Fall back to legacy hardcoded path
+    3. Most populated corpus under REPORTER_ROOT/quality-check/ (works before
+       report.json exists and avoids choosing a newer empty run)
+
+    4. Fall back to legacy hardcoded path
 
     """
 
     global _ACTIVE_REPORTER_OUTPUT
 
-    if _ACTIVE_REPORTER_OUTPUT is not None:
+    if _ACTIVE_REPORTER_OUTPUT is None:
+
+        _ACTIVE_REPORTER_OUTPUT = _load_persisted_active_reporter_output()
+
+    if (_ACTIVE_REPORTER_OUTPUT is not None
+            and _ACTIVE_REPORTER_OUTPUT.is_dir()
+            and (_ACTIVE_REPORTER_OUTPUT / "corpus").is_dir()):
 
         return _ACTIVE_REPORTER_OUTPUT
+
+    if _ACTIVE_REPORTER_OUTPUT is not None:
+
+        set_active_reporter_output(None)
 
     qc_dir = REPORTER_ROOT / "quality-check"
 
     if qc_dir.exists():
 
-        candidates = []
-
-        for d in qc_dir.iterdir():
-
-            if d.is_dir() and (d / "report.json").exists():
-
-                candidates.append(d)
+        candidates = [d for d in qc_dir.iterdir()
+                      if d.is_dir() and (d / "corpus").is_dir()]
 
         if candidates:
 
-            # Most recently modified report.json
-
-            candidates.sort(key=lambda d: (d / "report.json").stat().st_mtime, reverse=True)
+            # Priorizar corpus poblado (aunque aún no tenga report.json); entre
+            # corpus equivalentes, el de actividad más reciente. Un reporte
+            # reciente vacío nunca debe ocultar el corpus realmente indexado.
+            candidates.sort(
+                key=lambda d: (_corpus_doc_count(d), d.stat().st_mtime),
+                reverse=True,
+            )
 
             return candidates[0]
 
@@ -775,7 +848,7 @@ def process_status() -> dict[str, Any]:
 
     # Pipeline thread status (from /api/pipeline/run)
 
-    pipeline_progress = read_json(PIPELINE_PROGRESS, {})
+    pipeline_progress = _pipeline_progress_view() if PIPELINE_PROGRESS.exists() else {}
 
     if pipeline_progress:
 
@@ -1381,6 +1454,8 @@ def dashboard_state() -> dict[str, Any]:
 
         reporter_ingestion = db_counts(reporter and Path(reporter["path"]).parent / "corpus" / "document_store.db" if reporter else REPORTER_ROOT / "missing.db")
 
+    from ipa.agentic.embedding_maintenance import read_state as embedding_maintenance_state
+
     return {
 
         "timestamp": now(),
@@ -1401,11 +1476,16 @@ def dashboard_state() -> dict[str, Any]:
 
         "processes": process_status(),
 
-        "pipeline": read_json(PIPELINE_PROGRESS, {"stage": "idle", "status": "idle", "percent": 0}),
+        "pipeline": _pipeline_progress_view(),
 
         "reporter_progress": read_json(REPORTER_PROGRESS, {}),
 
         "agent_research": read_json(AGENT_RESEARCH_PROGRESS, {}),
+
+        "embedding_maintenance": embedding_maintenance_state(),
+
+        "index_health": read_json(
+            ROOT / "outputs" / "agent" / "index_health.json", {}),
 
         "scrape_counts": scrape_counts(),
 
@@ -1514,6 +1594,47 @@ def _write_pipeline_progress(stage: str, status: str, percent: int, detail: str 
 
 
 
+def _pipeline_progress_view() -> dict[str, Any]:
+
+    """pipeline_progress.json with stale-run detection.
+
+    The pipeline thread lives inside the dashboard process; if the process
+    dies (restart, crash) the file keeps saying "running" forever and the UI
+    shows a frozen live card — the run can no longer advance because the
+    orchestrator is gone even if child processes survived. Once no spawned
+    job is alive and the last write is old, mark it interrupted (same
+    self-healing discipline as embedding_maintenance's pid liveness check).
+    """
+
+    progress = read_json(PIPELINE_PROGRESS, {"stage": "idle", "status": "idle", "percent": 0})
+
+    if progress.get("status") != "running":
+        return progress
+
+    try:
+        age_s = time.time() - PIPELINE_PROGRESS.stat().st_mtime
+    except OSError:
+        return progress
+
+    with JOBS_LOCK:
+        jobs_alive = any(proc.poll() is None for proc in JOBS.values())
+
+    if jobs_alive or age_s < 300:
+        return progress
+
+    detail = str(progress.get("detail") or "")
+
+    _write_pipeline_progress(
+        str(progress.get("stage") or "pipeline"), "interrupted",
+        int(progress.get("percent") or 0),
+        f"{detail} — interrumpido: el proceso orquestador ya no está vivo",
+    )
+
+    return read_json(PIPELINE_PROGRESS, progress)
+
+
+
+
 
 def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode: str = "days", days_back: int = 0) -> None:
 
@@ -1595,9 +1716,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
 
         reporter_corpus = reporter_output / "corpus"
 
-        global _ACTIVE_REPORTER_OUTPUT
-
-        _ACTIVE_REPORTER_OUTPUT = reporter_output
+        set_active_reporter_output(reporter_output)
 
         print(f"  [pipeline] reporter output: {reporter_output}", flush=True)
 
@@ -1646,11 +1765,33 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
 
 
 
+        # The scraper-done sentinel tells the fast path watch it can stop
+
+        # counting idle iterations. The scraper itself writes it via
+
+        # --done-file on exit (success or failure), so the gate fires even if
+
+        # this pipeline thread dies; the write below stays as a fallback for
+
+        # hard-killed scrapers. Remove any stale sentinel first.
+
+        scraper_done_flag = ROOT / "Landing" / "web" / ".scraper_done"
+
+        try:
+
+            scraper_done_flag.unlink(missing_ok=True)
+
+        except Exception:
+
+            pass
+
+
+
         # Scraper
 
         config = effective_scrape_config()
 
-        scraper_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto", "--no-images", "--no-ocr"]
+        scraper_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_web_scrape.py", "--config", str(config), "--output", "Landing/web", "--engine", "auto", "--no-images", "--no-ocr", "--done-file", str(scraper_done_flag)]
 
         # Si el agente pidió days_back específico, sobreescribir el config
         # por sitio (bug del 2026-09-08: el days_back del agente no llegaba
@@ -1681,14 +1822,7 @@ def run_full_pipeline(period_start: str = "", period_end: str = "", period_mode:
         # Only promoted to main corpus when user approves the report
 
         # reporter_output and reporter_corpus already set above (dynamic)
-
-        # The scraper-done sentinel tells the fast path watch it can stop
-        # counting idle iterations. Remove any stale sentinel first.
-        scraper_done_flag = ROOT / "Landing" / "web" / ".scraper_done"
-        try:
-            scraper_done_flag.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # (scraper_done_flag already defined and cleared above)
 
         fast_path_cmd = [VENV_PYTHONW, "-u", "scripts/cli/run_fast_path.py", "--input", "Landing/web", "--output", str(reporter_corpus), "--watch", "10", "--idle-exit", "3", "--idle-gate", str(scraper_done_flag)]
 
@@ -2233,9 +2367,11 @@ def main() -> None:
             ingest_reviewed_doc,
             review_doc_with_llm,
         )
-        from ipa.agent.system_tools import _main_corpus_dir
+        from ipa.agent.system_tools import _research_ingest_corpus
 
-        landing = ROOT / "Landing" / "web"
+        # Dir propio del review (PM-004): ingerir Landing/web compartido hacía
+        # que el worker recorriera el material de un pipeline concurrente.
+        landing = ROOT / "outputs" / "agent" / "research" / "review"
         while True:
             _time.sleep(15)
             try:
@@ -2253,7 +2389,9 @@ def main() -> None:
                     provider = DEEP_DIVE_PROVIDER
                     if provider is None or not provider.is_loaded():
                         continue
-                    corpus = _main_corpus_dir() or MAIN_CORPUS
+                    # DEC-003b: material de research → staging, la curación T1
+                    # decide la entrada a main (no bypass vía review queue).
+                    corpus = _research_ingest_corpus() or MAIN_CORPUS
                     for item in items:
                         if (_time.time() - LAST_ACTIVITY["ts"] < RESEARCH_REVIEW_IDLE
                                 or CHAT_BUSY["flag"]):
@@ -2276,6 +2414,10 @@ def main() -> None:
                                 store.mark(item["review_id"], "promoted",
                                            verdict.get("reason", ""),
                                            document_id=doc_id)
+                                # Backlog residual → drain (PM-004: la
+                                # promoción defiere sin vectores).
+                                from ipa.agent.system_tools import _spawn_embed_drain
+                                _spawn_embed_drain(corpus)
                                 print(f"[research-review] promoted "
                                       f"{item['url']}: {verdict.get('reason','')}",
                                       flush=True)
@@ -2394,6 +2536,35 @@ def main() -> None:
             # items vía should_abort → _idle()).
             if not IDLE_ENABLED["enabled"]:
                 return False
+            # Tier 0 (fast_path) muta los corpora que T1/T2 leen y promueven.
+            # El lease es cross-process: cubre también watchers huérfanos de
+            # un dashboard anterior, que no figuran en JOBS. Mientras esté
+            # activo el reset de LAST_ACTIVITY hace que la cuenta de idle
+            # arranque recién cuando Tier 0 se libera.
+            try:
+                from ipa.agentic import tier0
+                if tier0.active():
+                    return False
+            except Exception:
+                pass
+            # La ingesta interactiva (research_ingest) corre bajo heavy.lock:
+            # mismo criterio — escribe el corpus canónico y T1/T2 no deben
+            # evaluar estados parciales mientras dura.
+            try:
+                from ipa.agentic import heavy_lock
+                if heavy_lock.holder() is not None:
+                    return False
+            except Exception:
+                pass
+            # La promoción idle escribe/purga los mismos corpora que el drain.
+            # El lease cross-process evita que comiencen ciclos mientras un
+            # embedding drain está activo (y viceversa).
+            try:
+                from ipa.agentic.embedding_maintenance import job_active
+                if job_active(exclude_owner="idle_scheduler"):
+                    return False
+            except Exception:
+                pass
             if CHAT_BUSY["flag"]:
                 return False
             with JOBS_LOCK:
@@ -2412,8 +2583,9 @@ def main() -> None:
         from ipa.agentic.idle_scheduler import (
             CycleContext, IdleScheduler, IdleTask,
             RES_AGENT_DB, RES_CLUSTER_STORE, RES_CORPUS_MAIN,
-            RES_CORPUS_REPORTER, RES_EMBEDDINGS, RES_LLM, RES_SKILLS,
-            RES_STRATEGIC, RES_UNCERTAINTY, RES_USER_MODEL,
+            RES_CORPUS_REPORTER, RES_CORPUS_RESEARCH, RES_EMBEDDINGS,
+            RES_LLM, RES_SKILLS, RES_STRATEGIC, RES_UNCERTAINTY,
+            RES_USER_MODEL,
         )
         from ipa.agentic.idle_cognition import (
             detect_skills, infer_user_model, load_episode_dicts, load_task_dicts,
@@ -2422,6 +2594,13 @@ def main() -> None:
 
         def _reporter_corpus() -> Path:
             return REPORTER_ROOT / "quality-check" / active_reporter_output().name / "corpus"
+
+        def _research_staging_corpus() -> Path:
+            # Staging propio de la research (DEC-003): path fijo del dominio
+            # agente — no el puntero del reporter, que se mueve entre corridas
+            # y el cleanup puede borrar.
+            from ipa.agent.system_tools import _research_staging_dir
+            return _research_staging_dir()
 
         # --- Higiene / memoria ---
         def _t_hygiene(ctx):
@@ -2449,14 +2628,46 @@ def main() -> None:
                 if ctx.should_abort():
                     return {"skipped": "aborted"}
                 corpus = corpus_getter()
-                _ilog(f"  [idle-sched T1] topify {label}: starting {corpus.name}...", flush=True)
-                # Provenance self-heal before policy evaluation: scraper docs
-                # without document_sources would be "unknown provenance" forever.
+                if not corpus or not (corpus / "document_store.db").exists():
+                    return {"skipped": "no corpus"}
+                cluster_store = TopicClusterStore()
                 try:
-                    from ipa.ingestion.provenance import backfill_from_landing_registry
-                    from ipa.storage.document_store import DocumentStore as _DS
-                    if (corpus / "document_store.db").exists():
-                        _ps = _DS(corpus / "document_store.db")
+                    # Gate "corpus changed": sin dirty flag, con conteo
+                    # estable, cobertura completa y sin gaps de provenance
+                    # → no hay trabajo nuevo; se salta el scan O(corpus)
+                    # (docs fetichados + sha256 + embeddings de main).
+                    dirty_key = f"dirty:{corpus.resolve()}"
+                    count_key = f"last_count:{corpus.resolve()}"
+                    if cluster_store.get_meta(dirty_key) != "1":
+                        from ipa.storage.document_store import DocumentStore as _DS
+                        _ds = _DS(corpus / "document_store.db")
+                        try:
+                            live_count = _ds.count_documents()
+                            live_ids = set(_ds.all_centroids())
+                            source_ids = set(_ds.all_sources())
+                        finally:
+                            _ds.close()
+                        covered = (
+                            live_ids
+                            <= cluster_store.processed_doc_ids(stage="clustered")
+                            and live_ids
+                            <= cluster_store.processed_doc_ids(stage="curated"))
+                        stable = str(live_count) == (
+                            cluster_store.get_meta(count_key) or "")
+                        provenance_gap = bool(live_ids - source_ids)
+                        if covered and stable and not provenance_gap:
+                            return {"skipped": "corpus unchanged",
+                                    "corpus": corpus.name}
+                    _ilog(f"  [idle-sched T1] topify {label}: starting {corpus.name}...",
+                          flush=True)
+                    # Provenance self-heal before policy evaluation: scraper docs
+                    # without document_sources would be "unknown provenance"
+                    # forever. Tier 0 ya registra provenance al ingerir — esto
+                    # queda como repair path para corpus legacy/incompletos.
+                    try:
+                        from ipa.ingestion.provenance import backfill_from_landing_registry
+                        from ipa.storage.document_store import DocumentStore as _DS2
+                        _ps = _DS2(corpus / "document_store.db")
                         try:
                             _pn = backfill_from_landing_registry(
                                 _ps, corpus / "landing.db", ROOT / "Landing")
@@ -2464,21 +2675,31 @@ def main() -> None:
                                 _ilog(f"  [idle-sched T1] provenance backfill: {_pn} docs", flush=True)
                         finally:
                             _ps.close()
-                except Exception:
-                    pass
-                cluster_store = TopicClusterStore()
-                try:
+                    except Exception:
+                        pass
                     result = enrich_corpus_level1(corpus, cluster_store, main_corpus_path=MAIN_CORPUS)
+                    # Corrida completada → limpiar el gate. Si crashea a mitad,
+                    # el dirty flag queda y el próximo ciclo reintenta.
+                    try:
+                        from ipa.storage.document_store import DocumentStore as _DS3
+                        _ds3 = _DS3(corpus / "document_store.db")
+                        try:
+                            cluster_store.set_meta(count_key, str(_ds3.count_documents()))
+                        finally:
+                            _ds3.close()
+                        cluster_store.set_meta(dirty_key, "0")
+                    except Exception:
+                        pass
+                    return {
+                        "corpus": corpus.name,
+                        "topics_new": result.get("topics_new", 0),
+                        "parents_new": result.get("parents_new", 0),
+                        "curated": result.get("curated", 0),
+                        "promoted": result.get("promoted", 0),
+                        "continuity": result.get("continuity_links", 0),
+                    }
                 finally:
                     cluster_store.close()
-                return {
-                    "corpus": corpus.name,
-                    "topics_new": result.get("topics_new", 0),
-                    "parents_new": result.get("parents_new", 0),
-                    "curated": result.get("curated", 0),
-                    "promoted": result.get("promoted", 0),
-                    "continuity": result.get("continuity_links", 0),
-                }
             return _run
 
         def _t_promotion(ctx):
@@ -2490,12 +2711,16 @@ def main() -> None:
             finally:
                 cluster_store.close()
             if promo.get("processed", 0) <= 0:
-                return {}
+                # Nothing promoted — surface deferrals (PM-004 vector
+                # preflight) so the idle log explains the pending queue.
+                deferred = promo.get("deferred_docs", 0)
+                return {"deferred_docs": deferred} if deferred else {}
             _sw = run_landing_sweep()
             return {
                 "processed": promo["processed"],
                 "promoted_docs": promo.get("promoted_docs", 0),
                 "promoted_chunks": promo.get("promoted_chunks", 0),
+                "deferred_docs": promo.get("deferred_docs", 0),
                 "archived": _sw.get("archived", 0),
                 "deleted": _sw.get("deleted", 0),
             }
@@ -2537,6 +2762,8 @@ def main() -> None:
                     "corpus": label,
                     "labeled": result.get("labeled", 0),
                     "classified": result.get("classified", 0),
+                    "gray_reviewed": result.get("gray_reviewed", 0),
+                    "gray_rescued": result.get("gray_rescued", 0),
                     "aborted": result.get("aborted"),
                 }
             return _run
@@ -2561,7 +2788,7 @@ def main() -> None:
             from ipa.agent.research_review import (
                 ResearchReviewStore, ingest_reviewed_doc, review_docs_with_llm,
             )
-            from ipa.agent.system_tools import _main_corpus_dir
+            from ipa.agent.system_tools import _research_ingest_corpus
 
             limit = int(os.environ.get("IPA_T2_REVIEW_LIMIT", "12") or 12)
             store = ResearchReviewStore()
@@ -2571,8 +2798,11 @@ def main() -> None:
                     return {"pending": 0}
                 if ctx.should_abort():
                     return {"skipped": "aborted"}
-                corpus = _main_corpus_dir() or MAIN_CORPUS
-                landing = ROOT / "Landing" / "web"
+                # DEC-003b: material de research → staging, la curación T1
+                # decide la entrada a main (no bypass vía review queue).
+                corpus = _research_ingest_corpus() or MAIN_CORPUS
+                # Dir propio del review (PM-004), no Landing/web compartido.
+                landing = ROOT / "outputs" / "agent" / "research" / "review"
                 CHAT_BUSY["flag"] = True  # el generator no es thread-safe
                 try:
                     verdicts = review_docs_with_llm(ctx.provider, items)
@@ -2592,6 +2822,10 @@ def main() -> None:
                             )
                             store.mark(item["review_id"], "promoted",
                                        verdict.get("reason", ""), document_id=doc_id)
+                            # Backlog residual → drain (PM-004: la promoción
+                            # defiere sin vectores).
+                            from ipa.agent.system_tools import _spawn_embed_drain
+                            _spawn_embed_drain(corpus)
                             promoted += 1
                         except Exception as exc:
                             store.mark(item["review_id"], "error", str(exc)[:200])
@@ -2632,18 +2866,69 @@ def main() -> None:
             embedding = get_embedding_adapter()  # CPU — no compite con ExL3
             lancedb = LanceDBIndex(MAIN_CORPUS / "vector" / "lancedb",
                                    vector_dim=embedding.dimension)
+            bm25 = None
+            _bm25_db = MAIN_CORPUS / "bm25_index.db"
+            if _bm25_db.exists():
+                from ipa.indexes.bm25_index import BM25Index
+                bm25 = BM25Index(_bm25_db)  # win léxico de EXP-001 (+14.3%)
             try:
                 return enrich_chunks(
                     ctx.provider, store_db,
-                    lancedb=lancedb, embedding=embedding,
+                    lancedb=lancedb, embedding=embedding, bm25=bm25,
                     limit=limit, min_chars=min_chars,
                     should_abort=ctx.should_abort, log=_ilog)
             finally:
                 lancedb.close()
+                if bm25 is not None:
+                    bm25.close()
+
+        def _t_index_audit(ctx):
+            """Auditoría de salud del corpus (read-only) → index_health.json.
+
+            Capa lógica cada corrida (consume señales Tier 0, barata); capa
+            física solo si su checked_at supera el cooldown largo — el drift
+            por kills/locks no setea dirty flags, así que es forzada, no
+            gated por cambios.
+            """
+            from ipa.agentic import tier0
+            if tier0.active():
+                return {"skipped": "tier0 lease activo — índices parciales"}
+            from ipa.agentic.index_audit import (
+                DEFAULT_OUTPUT, run_index_audit)
+            import json as _json
+            phys_hours = float(os.environ.get(
+                "IPA_AUDIT_PHYSICAL_HOURS", "6") or 6)
+            run_physical = True
+            try:
+                prev = _json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
+                last = (prev.get("physical") or {}).get("checked_at")
+                if last:
+                    from datetime import datetime, timezone
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(
+                        last.replace("Z", "+00:00"))).total_seconds()
+                    run_physical = age >= phys_hours * 3600
+            except Exception:
+                run_physical = True  # sin previo o JSON roto → forzar física
+            result = run_index_audit(
+                MAIN_CORPUS, layer="both" if run_physical else "logical",
+                cluster_db=ROOT / "outputs" / "agent" / "topic_clusters.db")
+            logical = result.get("logical") or {}
+            physical = result.get("physical") or {}
+            return {
+                "status": result.get("status"),
+                "physical_run": run_physical,
+                "empty_docs": logical.get("empty_docs_count", 0),
+                "dup_hashes": logical.get("dup_hashes_count", 0),
+                "dup_flag_leaks": logical.get("dup_flag_leaks_count", 0),
+                "missing_meta": logical.get("missing_meta_count", 0),
+                "bm25_missing": (physical.get("bm25") or {}).get("meta_missing_count", 0),
+                "lance_missing": (physical.get("lance") or {}).get("missing_count", 0),
+                "spam_hashes": (physical.get("spam_chunks") or {}).get("same_site_hashes", 0),
+            }
 
         _scheduler = IdleScheduler([
             # Tier 1 — CPU/IO, sin VRAM. Prioridad: higiene → memoria →
-            # topificación → promoción → cognitivo.
+            # topificación → promoción → cognitivo → auditoría.
             IdleTask("hygiene_sessions", 1, 10, _t_hygiene,
                      resources=frozenset({RES_AGENT_DB}), cooldown_seconds=120),
             IdleTask("consolidate_sessions", 1, 20, _t_consolidate,
@@ -2655,9 +2940,14 @@ def main() -> None:
             IdleTask("topify_reporter", 1, 31, _t_topify(_reporter_corpus, "reporter"),
                      resources=frozenset({RES_CLUSTER_STORE, RES_EMBEDDINGS, RES_CORPUS_REPORTER}),
                      cooldown_seconds=300),
+            IdleTask("topify_research_staging", 1, 32,
+                     _t_topify(_research_staging_corpus, "research_staging"),
+                     resources=frozenset({RES_CLUSTER_STORE, RES_EMBEDDINGS, RES_CORPUS_RESEARCH}),
+                     cooldown_seconds=300),
             IdleTask("promotion_queue", 1, 40, _t_promotion,
                      resources=frozenset({RES_CLUSTER_STORE, RES_CORPUS_MAIN,
-                                          RES_CORPUS_REPORTER, RES_EMBEDDINGS}),
+                                          RES_CORPUS_REPORTER, RES_CORPUS_RESEARCH,
+                                          RES_EMBEDDINGS}),
                      cooldown_seconds=300),
             IdleTask("cog_user_model", 1, 50, _t_cog_user_model,
                      resources=frozenset({RES_USER_MODEL}), cooldown_seconds=300),
@@ -2667,12 +2957,23 @@ def main() -> None:
                      resources=frozenset({RES_STRATEGIC}), cooldown_seconds=300),
             IdleTask("cog_agenda", 1, 53, _t_cog_agenda,
                      resources=frozenset({RES_UNCERTAINTY}), cooldown_seconds=300),
+            # Auditoría read-only: capa lógica barata por ciclo, física cada
+            # IPA_AUDIT_PHYSICAL_HOURS (default 6h). Última: usa los stores
+            # que topify/promoción escriben — mejor que vea estado estable.
+            IdleTask("index_audit", 1, 60, _t_index_audit,
+                     resources=frozenset({RES_CLUSTER_STORE, RES_CORPUS_MAIN}),
+                     cooldown_seconds=int(os.environ.get(
+                         "IPA_AUDIT_LOGICAL_SECONDS", "900") or 900)),
             # Tier 2 — LLM (un solo pase serial)
             IdleTask("deep_topify_main", 2, 10, _t_deep_topify(lambda: MAIN_CORPUS, "main"),
                      resources=frozenset({RES_LLM, RES_CLUSTER_STORE, RES_CORPUS_MAIN}),
                      cooldown_seconds=300, needs_llm=True),
             IdleTask("deep_topify_reporter", 2, 11, _t_deep_topify(_reporter_corpus, "reporter"),
                      resources=frozenset({RES_LLM, RES_CLUSTER_STORE, RES_CORPUS_REPORTER}),
+                     cooldown_seconds=300, needs_llm=True),
+            IdleTask("deep_topify_research_staging", 2, 12,
+                     _t_deep_topify(_research_staging_corpus, "research_staging"),
+                     resources=frozenset({RES_LLM, RES_CLUSTER_STORE, RES_CORPUS_RESEARCH}),
                      cooldown_seconds=300, needs_llm=True),
             # Review batched: veredictos de 128 tok — el caso de uso ideal del
             # motor batch. Prioridad 15: después de los labels, antes de los
@@ -2717,9 +3018,16 @@ def main() -> None:
                     continue
 
                 idle_mins = (time.time() - LAST_ACTIVITY["ts"]) / 60.0
+                # Lease cross-process: el drain de embeddings y este ciclo
+                # mutan los mismos stores/indexes y deben ir serializados.
+                from ipa.agentic.embedding_maintenance import claim_job, release_job
+                if not claim_job("idle_scheduler"):
+                    _ilog("  [idle-sched] embedding/index maintenance busy — skipping", flush=True)
+                    continue
                 # Lock de instancia: dos dashboards compartiendo store no
                 # pueden enriquecer a la vez.
                 if not ENRICHMENT_LOCK.acquire(blocking=False):
+                    release_job("idle_scheduler")
                     _ilog(f"  [idle-sched] lock busy — skipping", flush=True)
                     continue
                 try:
@@ -2820,6 +3128,7 @@ def main() -> None:
                                     _ilog(f"  [idle-sched T2] re-warm falló: {_rw_exc}", flush=True)
                 finally:
                     ENRICHMENT_LOCK.release()
+                    release_job("idle_scheduler")
             except Exception as exc:
                 # Don't let the worker die on errors
                 _ilog(f"  [idle-sched] error: {exc}", flush=True)

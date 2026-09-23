@@ -99,8 +99,26 @@ def main() -> None:
     parser.add_argument("--clear-history", action="store_true",
                         help="Clear scrape_history.db before scraping (re-scrape everything). "
                              "Use when you want to re-discover articles that were already scraped.")
+    parser.add_argument("--done-file", default=None,
+                        help="Sentinel file written when the run ends (success or failure). "
+                             "Used by the fast-path watcher's --idle-gate: the scraper process "
+                             "itself is the source of truth, so the gate fires even if the "
+                             "orchestrating pipeline dies.")
     args = parser.parse_args()
 
+    try:
+        _run(args)
+    finally:
+        if args.done_file:
+            done_path = Path(args.done_file)
+            try:
+                done_path.parent.mkdir(parents=True, exist_ok=True)
+                done_path.write_text("done", encoding="utf-8")
+            except OSError as exc:
+                print(f"  [scraper] WARNING: could not write done-file {done_path}: {exc}")
+
+
+def _run(args: argparse.Namespace) -> None:
     # Build site list
     if args.url:
         sites = [ScrapeSite(

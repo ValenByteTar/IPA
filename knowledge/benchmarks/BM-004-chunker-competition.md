@@ -3,13 +3,15 @@ id: BM-004
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [chunking, ingestion, retrieval, performance]
 tags: [fixed-window, recursive, token, semantic, chunks]
 related: [BM-003, PAT-002]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/benchmarks/run_parser_benchmark.py", "tests/test_chunkers_alt.py"]
+affects: ["scripts/benchmarks/run_parser_benchmark.py"]
 ---
 
 # BM-004 â€” Competencia de chunkers
@@ -21,7 +23,7 @@ Comparar fixed-window, recursive, token y semantic chunking para el procesamient
 ## Entorno
 
 - Dataset: 50 PDFs.
-- Artefacto: `outputs/experiments/E5/benchmark_report.json`.
+- Artefacto: `outputs/experiments/E5/benchmark_report.json` (histórico, ya no en disco — ver PM-002).
 - Métricas: throughput, duplicación, tamaño y calidad observable.
 
 ## Resultados

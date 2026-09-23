@@ -2,6 +2,8 @@
 
 Policy:
   - configured_scrape: auto-promote (trusted source, no score threshold)
+  - user_provided: auto-promote (URL pasted by the user — a known source;
+    still passes the curation gates for duplicates/insufficient evidence)
   - agent_research: promote only if promotion_score >= 0.70
 
 This is independent of the Reporter. The Reporter can still produce reports,
@@ -40,7 +42,7 @@ def evaluate_promotion(
 
     Args:
         document_id: The document ID.
-        provenance: "configured_scrape" or "agent_research".
+        provenance: "configured_scrape", "user_provided" or "agent_research".
         decision: The curation decision (optional, for decision-based checks).
         scores: The score bundle (optional, for score-based checks).
 
@@ -51,9 +53,12 @@ def evaluate_promotion(
     if decision is not None and scores is None:
         scores = decision.scores
 
-    # --- Policy: configured_scrape → auto-promote ---
-    if provenance == "configured_scrape":
-        # Even for configured sources, skip duplicates and insufficient evidence
+    # --- Policy: configured_scrape / user_provided → auto-promote ---
+    # user_provided = URL pegada por el usuario en el chat (seed explícita de
+    # una corrida research): fuente conocida por autorización directa, mismo
+    # tratamiento que un sitio configurado. Ambas igual respetan los gates de
+    # curación (duplicate / insufficient_evidence).
+    if provenance in ("configured_scrape", "user_provided"):
         if decision is not None:
             if decision.decision == ReporterDecision.DUPLICATE:
                 return PromotionDecision(
@@ -64,7 +69,7 @@ def evaluate_promotion(
                     document_id, False, "insufficient evidence", provenance, None
                 )
         return PromotionDecision(
-            document_id, True, "configured source: auto-promote", provenance, None
+            document_id, True, f"{provenance}: auto-promote", provenance, None
         )
 
     # --- Policy: agent_research → score >= 0.70 ---

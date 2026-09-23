@@ -13,13 +13,77 @@ After a successful copy the promoted documents are PURGED from the source
 (staging) corpus — the main corpus is canonical and the staging copy would
 otherwise accumulate forever and double-count metrics. Raw source files in
 Landing/web are NOT moved; the landing zone remains the artifact registry.
+
+The purge is the only destructive step, so it is gated by a vector-coverage
+preflight (PM-004): if any live source chunk still lacks a vector in main
+LanceDB, the promotion DEFERS — the source stays intact, the queue entry stays
+pending, and the embedding drain finishes the missing vectors first. Opt out
+with IPA_PROMOTION_REQUIRE_VECTORS=0 (emergency only).
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+
+def _promotion_requires_vectors() -> bool:
+    """Preflight gate (default ON): no purge without verified vector coverage."""
+    return os.environ.get(
+        "IPA_PROMOTION_REQUIRE_VECTORS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _uncovered_vector_ids(
+    document_ids: list[str],
+    source_store_db: Path,
+    main_lance: Any,
+) -> set[str] | None:
+    """Live source chunks of `document_ids` with no vector row in main LanceDB.
+
+    PM-004: the Lance phase only copies the vectors that exist at copy time,
+    so purging while chunks are still unvectorized silently drops hybrid
+    retrieval for that content (the 52,198-chunk incident). A non-empty result
+    means the promotion must DEFER, not purge. If main cannot be read, every
+    live source chunk is reported as uncovered (conservative). Returns None
+    when the source chunks cannot even be enumerated — coverage is then
+    unverifiable, which the caller also treats as a defer. A missing source
+    store means there is nothing left to protect: empty set, let the purge
+    no-op and the queue drain.
+    """
+    if not document_ids:
+        return set()
+    if not Path(source_store_db).exists():
+        return set()
+    try:
+        conn = sqlite3.connect(
+            f"file:{Path(source_store_db).resolve()}?mode=ro", uri=True,
+            timeout=30)
+        try:
+            placeholders = ",".join("?" * len(document_ids))
+            rows = conn.execute(
+                f"SELECT chunk_id FROM chunks "
+                f"WHERE document_id IN ({placeholders}) AND tombstoned=0",
+                document_ids,
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    source_ids = {row[0] for row in rows}
+    if not source_ids:
+        return set()
+    if getattr(main_lance, "_table", None) is None:
+        return source_ids
+    # Lectura proyectada (solo chunk_id, sin vectores). None = ilegible →
+    # reportar todo como sin cobertura → defer seguro (PM-004).
+    from ipa.indexes.lancedb_index import table_chunk_id_list
+    main_ids = table_chunk_id_list(main_lance._table)
+    if main_ids is None:
+        return source_ids
+    return source_ids - set(main_ids)
 
 
 def promote_documents_to_main(
@@ -152,20 +216,22 @@ def promote_documents_to_main(
             if source_lance._table is not None:
                 existing_ids: set[str] = set()
                 if main_lance._table is not None:
-                    try:
-                        tbl = main_lance._table.to_arrow()
-                        existing_ids = set(tbl.column("chunk_id").to_pylist())
-                    except Exception as exc:
-                        # If we can't read existing IDs, skip the merge
-                        # rather than risk duplicates.
-                        print(f"  [promote] cannot read main LanceDB IDs: {exc}", flush=True)
+                    from ipa.indexes.lancedb_index import table_chunk_id_list
+                    main_ids = table_chunk_id_list(main_lance._table)
+                    if main_ids is None:
+                        # If we can't read existing IDs, defer rather than
+                        # risk duplicates — and never let the queue mark done.
+                        print("  [promote] cannot read main LanceDB IDs", flush=True)
                         main_lance.close()
                         source_lance.close()
                         return {
                             "promoted_docs": promoted_docs,
                             "promoted_chunks": promoted_chunks,
                             "promoted_vectors": 0,
+                            "deferred": True,
+                            "defer_reason": "cannot read main LanceDB ids",
                         }
+                    existing_ids = set(main_ids)
 
                 source_tbl = source_lance._table.to_arrow()
 
@@ -228,13 +294,73 @@ def promote_documents_to_main(
     print(f"  [promote] phase lance: {_time.time()-_t_lance:.1f}s "
           f"({promoted_vectors} vectors)", flush=True)
 
+    # 3. Vector-coverage preflight (PM-004): the purge is the only destructive
+    #    step. The Lance phase only copies vectors that exist at copy time, so
+    #    purging while live source chunks are still unvectorized silently
+    #    drops hybrid retrieval for them. DEFER instead: keep the source
+    #    intact, leave the queue pending, let the embedding drain finish.
+    uncovered: set[str] | None = set()
+    if _promotion_requires_vectors():
+        try:
+            from ipa.indexes.lancedb_index import LanceDBIndex
+            main_lance = LanceDBIndex(main_lancedb, vector_dim=1024)
+            try:
+                uncovered = _uncovered_vector_ids(
+                    document_ids, source_store_db, main_lance)
+            finally:
+                main_lance.close()
+        except Exception as exc:
+            print(f"  [promote] vector preflight unreadable: {exc}", flush=True)
+            uncovered = _uncovered_vector_ids(document_ids, source_store_db, None)
+    if uncovered is None:
+        print(f"  [promote] DEFERRED: chunks del source ilegibles — cobertura "
+              f"inverificable, source intacto y cola pending", flush=True)
+        return {
+            "promoted_docs": promoted_docs,
+            "promoted_chunks": promoted_chunks,
+            "promoted_vectors": promoted_vectors,
+            "deferred": True,
+            "defer_reason": "source chunks unreadable",
+        }
+    if uncovered:
+        print(f"  [promote] DEFERRED: {len(uncovered)} live chunks sin vector en "
+              f"main — source intacto, la cola reintenta tras el drain "
+              f"(ej: {sorted(uncovered)[:3]})", flush=True)
+        return {
+            "promoted_docs": promoted_docs,
+            "promoted_chunks": promoted_chunks,
+            "promoted_vectors": promoted_vectors,
+            "deferred": True,
+            "missing_vectors": len(uncovered),
+            "missing_sample": sorted(uncovered)[:5],
+        }
+
     _t_purge = _time.time()
-    # 3. Purge the source copies — the main corpus is canonical. Without
+    # 4. Purge the source copies — the main corpus is canonical. Without
     # this the staging corpus retains every promoted document forever and
     # its metrics diverge from the main corpus.
     purged = purge_promoted_from_source(document_ids, source_corpus_path, main_corpus_path)
     print(f"  [promote] phase purge: {_time.time()-_t_purge:.1f}s "
           f"({purged.get('purged_docs', 0)} docs)", flush=True)
+
+    if purged.get("incomplete_steps"):
+        # Purga parcial: la copia a main ya está hecha y es idempotente,
+        # pero la limpieza del source quedó incompleta (típico: bm25_index.db
+        # lockeado por una ingesta concurrente). Deferir para que el próximo
+        # ciclo de la cola reintente los pasos que fallaron en vez de dejar
+        # índices desincronizados en el staging.
+        steps = ", ".join(purged["incomplete_steps"])
+        print(f"  [promote] DEFERRED: purga incompleta ({steps}) — "
+              f"la cola reintenta", flush=True)
+        return {
+            "promoted_docs": promoted_docs,
+            "promoted_chunks": promoted_chunks,
+            "promoted_vectors": promoted_vectors,
+            "purged_docs": purged.get("purged_docs", 0),
+            "purged_chunks": purged.get("purged_chunks", 0),
+            "deferred": True,
+            "defer_reason": f"purge incomplete: {steps}",
+        }
 
     return {
         "promoted_docs": promoted_docs,
@@ -245,11 +371,68 @@ def promote_documents_to_main(
     }
 
 
+# Reintentos del paso BM25 de la purga: el staging suele estar lockeado por
+# una ingesta fast-path concurrente durante segundos/minutos. Un fallo
+# definitivo se reporta como paso incompleto para que la cola reintente —
+# nunca se loguea y olvida (dejaba FTS vivo para docs purgados, 2026-09-23).
+_BM25_PURGE_ATTEMPTS = 4
+_BM25_PURGE_SLEEP_S = 3.0
+_BM25_PURGE_BUSY_MS = 10000
+
+
+def _purge_source_bm25(confirmed: list[str], bm25_db: Path) -> bool:
+    """Tombstone the promoted docs in the source BM25 index.
+
+    Takes the writer lock up front (BEGIN IMMEDIATE) so a contended index
+    fails fast and can be retried; bounded attempts absorb transient locks
+    from a concurrent fast-path ingestion. Returns False when the index
+    never yielded — the caller reports the purge as incomplete so the
+    promotion queue retries the batch later instead of leaving live FTS
+    rows for documents already gone from the staging DocumentStore.
+    """
+    import time as _time
+
+    from ipa import BM25Index
+
+    ph = ",".join("?" * len(confirmed))
+    for attempt in range(_BM25_PURGE_ATTEMPTS):
+        try:
+            bm25 = BM25Index(bm25_db)
+            try:
+                bm25._conn.execute(
+                    f"PRAGMA busy_timeout = {_BM25_PURGE_BUSY_MS}")
+                bm25._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    bm25._conn.execute(
+                        f"DELETE FROM chunks_fts WHERE chunk_id IN "
+                        f"(SELECT chunk_id FROM chunks_meta WHERE document_id IN ({ph}))",
+                        confirmed,
+                    )
+                    bm25._conn.execute(
+                        f"UPDATE chunks_meta SET tombstoned = 1 WHERE document_id IN ({ph})",
+                        confirmed,
+                    )
+                    bm25._conn.execute("COMMIT")
+                except Exception:
+                    bm25._conn.execute("ROLLBACK")
+                    raise
+                return True
+            finally:
+                bm25.close()
+        except Exception as exc:
+            if attempt == _BM25_PURGE_ATTEMPTS - 1:
+                print(f"  [promote] source BM25 purge failed after "
+                      f"{_BM25_PURGE_ATTEMPTS} attempts: {exc}", flush=True)
+            else:
+                _time.sleep(_BM25_PURGE_SLEEP_S)
+    return False
+
+
 def purge_promoted_from_source(
     document_ids: list[str],
     source_corpus_path: Path,
     main_corpus_path: Path,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Remove promoted documents from the source (staging) corpus.
 
     Promotion copies; without a purge the staging corpus keeps every promoted
@@ -262,7 +445,9 @@ def purge_promoted_from_source(
     LanceDB table. All indexes are derived and rebuildable, so this is safe.
 
     Returns:
-        Dict with purged_docs, purged_chunks counts.
+        Dict with purged_docs, purged_chunks counts. When any step fails it
+        is listed in `incomplete_steps` — the caller defers the batch so the
+        queue retries instead of dropping the desync on the floor.
     """
     if not document_ids:
         return {"purged_docs": 0, "purged_chunks": 0}
@@ -293,6 +478,7 @@ def purge_promoted_from_source(
 
     purged_docs = 0
     purged_chunks = 0
+    incomplete: list[str] = []
 
     # 1. Source DocumentStore: count live chunks, then tombstone docs + chunks
     #    and drop their stale embedding-job rows.
@@ -329,29 +515,14 @@ def purge_promoted_from_source(
             source_store.close()
     except Exception as exc:
         print(f"  [promote] source DocumentStore purge failed: {exc}", flush=True)
+        incomplete.append("document_store")
 
-    # 2. Source BM25 index: drop chunk text from FTS.
+    # 2. Source BM25 index: drop chunk text from FTS. A locked index is
+    #    retried inside the helper; a definitive failure marks the purge
+    #    incomplete so the batch defers and retries — never silent desync.
     bm25_db = source_corpus_path / "bm25_index.db"
-    if bm25_db.exists():
-        try:
-            from ipa import BM25Index
-            bm25 = BM25Index(bm25_db)
-            try:
-                ph = ",".join("?" * len(confirmed))
-                bm25._conn.execute(
-                    f"DELETE FROM chunks_fts WHERE chunk_id IN "
-                    f"(SELECT chunk_id FROM chunks_meta WHERE document_id IN ({ph}))",
-                    confirmed,
-                )
-                bm25._conn.execute(
-                    f"UPDATE chunks_meta SET tombstoned = 1 WHERE document_id IN ({ph})",
-                    confirmed,
-                )
-                bm25._conn.commit()
-            finally:
-                bm25.close()
-        except Exception as exc:
-            print(f"  [promote] source BM25 purge failed: {exc}", flush=True)
+    if bm25_db.exists() and not _purge_source_bm25(confirmed, bm25_db):
+        incomplete.append("bm25")
 
     # 3. Source LanceDB: delete vectors of promoted documents.
     if source_lancedb.exists():
@@ -364,8 +535,12 @@ def purge_promoted_from_source(
             source_lance.close()
         except Exception as exc:
             print(f"  [promote] source LanceDB purge failed: {exc}", flush=True)
+            incomplete.append("lancedb")
 
-    return {"purged_docs": purged_docs, "purged_chunks": purged_chunks}
+    result: dict[str, Any] = {"purged_docs": purged_docs, "purged_chunks": purged_chunks}
+    if incomplete:
+        result["incomplete_steps"] = incomplete
+    return result
 
 
 def process_promotion_queue(
@@ -411,6 +586,7 @@ def process_promotion_queue(
     total_chunks = 0
     total_vectors = 0
     processed = 0
+    deferred_docs = 0
 
     for src_path_str, doc_ids in by_source.items():
         src_path = Path(src_path_str)
@@ -431,7 +607,27 @@ def process_promotion_queue(
         # Process in batches
         for i in range(0, len(doc_ids), batch_size):
             batch = doc_ids[i:i + batch_size]
-            result = promote_documents_to_main(batch, src_path, main_corpus_path)
+            try:
+                result = promote_documents_to_main(batch, src_path, main_corpus_path)
+            except Exception as exc:
+                # Conservative: a batch we could not run is never marked done.
+                # Leave it pending so a later cycle retries, and keep
+                # processing the remaining batches/sources of this cycle.
+                deferred_docs += len(batch)
+                print(f"  [promote] batch de {len(batch)} docs falló ({exc}) "
+                      f"— quedan pending en la cola", flush=True)
+                continue
+            if result.get("deferred"):
+                # PM-004 preflight: the batch's vectors are not fully covered
+                # in main yet. Keep the source intact and the queue pending —
+                # the embedding drain finishes the missing vectors first and
+                # a later cycle retries this batch (copy is idempotent).
+                deferred_docs += len(batch)
+                reason = result.get("defer_reason") or (
+                    f"{result.get('missing_vectors', '?')} vectores faltantes")
+                print(f"  [promote] batch de {len(batch)} docs diferido ({reason}) "
+                      f"— quedan pending en la cola", flush=True)
+                continue
             total_docs += result["promoted_docs"]
             total_chunks += result["promoted_chunks"]
             total_vectors += result["promoted_vectors"]
@@ -440,9 +636,18 @@ def process_promotion_queue(
                 cluster_store.mark_promotion_done(doc_id)
                 processed += 1
 
+    if total_docs:
+        # Gate "corpus changed": topify_main/topify_reporter early-exit sin
+        # este flag (y sin cambio de conteo/cobertura).
+        try:
+            cluster_store.set_meta(f"dirty:{main_corpus_path.resolve()}", "1")
+        except Exception:
+            pass
+
     return {
         "promoted_docs": total_docs,
         "promoted_chunks": total_chunks,
         "promoted_vectors": total_vectors,
         "processed": processed,
+        "deferred_docs": deferred_docs,
     }

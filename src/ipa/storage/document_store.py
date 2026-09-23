@@ -68,10 +68,26 @@ CREATE TABLE IF NOT EXISTS document_sources (
     source_domain TEXT,
     provenance    TEXT NOT NULL,
     quality_score REAL,
+    published_at  TEXT,
     recorded_at   TEXT NOT NULL,
     FOREIGN KEY (document_id) REFERENCES documents(document_id)
 );
 CREATE INDEX IF NOT EXISTS idx_document_sources_provenance ON document_sources(provenance);
+
+-- Derived per-document signals computed once at ingest (Tier 0) instead of
+-- being re-derived by every idle topify cycle: normalized content hash
+-- (reporter_curation.normalized_hash format), extracted title, publish date
+-- and free-form extras (novelty hints, duplicate flags).
+CREATE TABLE IF NOT EXISTS document_metadata (
+    document_id     TEXT PRIMARY KEY,
+    normalized_hash TEXT,
+    title           TEXT,
+    published_at    TEXT,
+    char_count      INTEGER,
+    extra_json      TEXT NOT NULL DEFAULT '{}',
+    computed_at     TEXT NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES documents(document_id)
+);
 """
 
 
@@ -114,6 +130,11 @@ class DocumentStore:
         if "spans_json" not in columns:
             self._conn.execute(
                 "ALTER TABLE documents ADD COLUMN spans_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        source_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(document_sources)")}
+        if "published_at" not in source_columns:
+            self._conn.execute(
+                "ALTER TABLE document_sources ADD COLUMN published_at TEXT"
             )
         self._conn.execute(
             "INSERT OR IGNORE INTO embedding_jobs (chunk_id) "
@@ -279,7 +300,8 @@ class DocumentStore:
     # --- Document provenance ---
 
     def put_source(self, document_id: str, source_url: str, source_domain: str,
-                   provenance: str, quality_score: float = 0.0) -> None:
+                   provenance: str, quality_score: float = 0.0,
+                   published_at: str | None = None) -> None:
         """Record the provenance of a document (where it came from).
 
         provenance: "configured_scrape" (known source) or "agent_research" (agent search).
@@ -287,20 +309,23 @@ class DocumentStore:
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self._conn.execute(
             "INSERT OR REPLACE INTO document_sources "
-            "(document_id, source_url, source_domain, provenance, quality_score, recorded_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (document_id, source_url, source_domain, provenance, quality_score, now),
+            "(document_id, source_url, source_domain, provenance, quality_score, "
+            "published_at, recorded_at) VALUES (?,?,?,?,?,?,?)",
+            (document_id, source_url, source_domain, provenance, quality_score,
+             published_at, now),
         )
 
     def get_source(self, document_id: str) -> dict | None:
         """Return provenance info for a document, or None if not recorded."""
         row = self._conn.execute(
-            "SELECT source_url, source_domain, provenance, quality_score FROM document_sources WHERE document_id = ?",
+            "SELECT source_url, source_domain, provenance, quality_score, published_at "
+            "FROM document_sources WHERE document_id = ?",
             (document_id,),
         ).fetchone()
         if not row:
             return None
-        return {"source_url": row[0], "source_domain": row[1], "provenance": row[2], "quality_score": row[3]}
+        return {"source_url": row[0], "source_domain": row[1], "provenance": row[2],
+                "quality_score": row[3], "published_at": row[4]}
 
     def document_stored_at(self, document_id: str) -> str | None:
         """Return stored_at for a live document, or None."""
@@ -321,9 +346,11 @@ class DocumentStore:
     def all_sources(self) -> dict[str, dict]:
         """Return all document provenance records as {document_id: {source_url, source_domain, provenance, quality_score}}."""
         rows = self._conn.execute(
-            "SELECT document_id, source_url, source_domain, provenance, quality_score FROM document_sources"
+            "SELECT document_id, source_url, source_domain, provenance, quality_score, "
+            "published_at FROM document_sources"
         ).fetchall()
-        return {row[0]: {"source_url": row[1], "source_domain": row[2], "provenance": row[3], "quality_score": row[4]} for row in rows}
+        return {row[0]: {"source_url": row[1], "source_domain": row[2], "provenance": row[3],
+                         "quality_score": row[4], "published_at": row[5]} for row in rows}
 
     def all_document_texts(self) -> dict[str, str]:
         """Return {document_id: text} for every live (non-tombstoned) document."""
@@ -339,4 +366,85 @@ class DocumentStore:
             (provenance,),
         ).fetchall()
         return {row[0]: {"source_url": row[1], "source_domain": row[2], "quality_score": row[3]} for row in rows}
+
+    # --- Document metadata (derived signals computed at ingest) ---
+
+    def put_doc_meta(self, document_id: str, *, normalized_hash: str | None = None,
+                     title: str | None = None, published_at: str | None = None,
+                     char_count: int | None = None, extra: dict | None = None) -> None:
+        """Store derived per-document signals (computed once, e.g. at ingest).
+
+        ``extra`` is merged into ``extra_json`` — callers add keys like
+        ``novelty_hint`` or ``duplicate_of_main`` without clobbering others.
+        """
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row = self._conn.execute(
+            "SELECT extra_json FROM document_metadata WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        merged_extra: dict = {}
+        if row:
+            try:
+                merged_extra = json.loads(row[0] or "{}") or {}
+            except (TypeError, ValueError):
+                merged_extra = {}
+        if extra:
+            merged_extra.update(extra)
+        self._conn.execute(
+            "INSERT INTO document_metadata "
+            "(document_id, normalized_hash, title, published_at, char_count, "
+            "extra_json, computed_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(document_id) DO UPDATE SET "
+            "normalized_hash = COALESCE(excluded.normalized_hash, normalized_hash), "
+            "title = COALESCE(excluded.title, title), "
+            "published_at = COALESCE(excluded.published_at, published_at), "
+            "char_count = COALESCE(excluded.char_count, char_count), "
+            "extra_json = excluded.extra_json, computed_at = excluded.computed_at",
+            (document_id, normalized_hash, title, published_at, char_count,
+             json.dumps(merged_extra, ensure_ascii=False), now),
+        )
+
+    def get_doc_meta(self, document_id: str) -> dict | None:
+        """Return derived metadata for a document, or None."""
+        row = self._conn.execute(
+            "SELECT normalized_hash, title, published_at, char_count, extra_json "
+            "FROM document_metadata WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            extra = json.loads(row[4] or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+        return {"normalized_hash": row[0], "title": row[1], "published_at": row[2],
+                "char_count": row[3], "extra": extra}
+
+    def all_doc_meta(self) -> dict[str, dict]:
+        """Return {document_id: metadata dict} for every document with a row."""
+        rows = self._conn.execute(
+            "SELECT document_id, normalized_hash, title, published_at, char_count, "
+            "extra_json FROM document_metadata"
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for row in rows:
+            try:
+                extra = json.loads(row[5] or "{}")
+            except (TypeError, ValueError):
+                extra = {}
+            out[row[0]] = {"normalized_hash": row[1], "title": row[2],
+                           "published_at": row[3], "char_count": row[4],
+                           "extra": extra}
+        return out
+
+    def url_normalized_hashes(self) -> dict[str, str]:
+        """{source_url: normalized_hash} — cheap replacement for re-hashing
+        every document text on each curation cycle."""
+        rows = self._conn.execute(
+            "SELECT s.source_url, m.normalized_hash FROM document_sources s "
+            "JOIN document_metadata m ON m.document_id = s.document_id "
+            "WHERE s.source_url IS NOT NULL AND s.source_url != '' "
+            "AND m.normalized_hash IS NOT NULL"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
 

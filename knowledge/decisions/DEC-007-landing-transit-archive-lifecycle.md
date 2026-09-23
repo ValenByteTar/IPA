@@ -10,6 +10,7 @@ tags: [landing, transit, archive, lifecycle, human-confirmation, provenance, swe
 related: [DEC-003, PAT-001, PAT-003, PAT-005, PM-003]
 supersedes: null
 superseded_by: null
+affects: ["Landing/**", "src/ipa/ingestion/**"]
 ---
 
 # DEC-007 — Ciclo de vida Landing → Transit → Archive con confirmación humana

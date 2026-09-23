@@ -3,13 +3,15 @@ id: DEC-006
 category: decision
 status: accepted
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-23
 author: human
 components: [agent_core, task_planner, strategic_memory, skill_library, uncertainty, user_model, system_tools, agent_identity]
 tags: [cognitive-layer, planning, strategic-memory, skills, uncertainty, user-model, autonomy, bounded]
 related: [DEC-002, DEC-005, RES-005, RES-006]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agent/task_planner.py", "tests/test_cognitive_layer.py"]
+affects: ["src/ipa/agent/task_planner.py", "src/ipa/agent/strategic_memory.py", "src/ipa/agent/skill_library.py", "src/ipa/agent/uncertainty.py", "src/ipa/agent/user_model.py", "configs/agent_identity.yaml"]
 ---
 
 # DEC-006 — Capa cognitiva del agente

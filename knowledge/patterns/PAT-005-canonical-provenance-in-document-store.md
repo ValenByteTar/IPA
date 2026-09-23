@@ -3,13 +3,15 @@ id: PAT-005
 category: pattern
 status: accepted
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-23
 author: human
 components: [document_store, ingestion, agentic_runtime, provenance]
 tags: [provenance, document_sources, configured_scrape, agent_research, canonical, backfill]
 related: [PAT-001, PAT-003, DEC-003]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/ingestion/provenance.py", "tests/test_ingest_metadata.py"]
+affects: ["src/ipa/storage/**", "src/ipa/ingestion/provenance.py"]
 ---
 
 # PAT-005 — Proveniencia canónica en DocumentStore

@@ -3,13 +3,15 @@ id: EXP-001
 category: experiment
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [enrichment, retrieval, lexical_index, vector_index]
 tags: [summary, synthetic_queries, claims, qwen, recall]
 related: [BM-005, PAT-003]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agentic/chunk_enrichment.py", "tests/test_chunk_enrichment.py"]
+affects: ["src/ipa/agentic/chunk_enrichment.py"]
 ---
 
 # EXP-001 â€” Enrichment selectivo para retrieval
@@ -23,7 +25,7 @@ Summaries, synthetic queries y claims generados selectivamente pueden mejorar re
 - Dataset: 2.000 chunks.
 - Modelo: qwen3.5:4b-q4_K_M, `think=False`, 3 workers.
 - Total: 8.000 inferencias.
-- Artefacto: `outputs/experiments/E9-experiment/benchmark_report.json`.
+- Artefacto: `outputs/experiments/E9-experiment/benchmark_report.json` (histórico, ya no en disco — ver PM-002).
 
 ## Resultados
 

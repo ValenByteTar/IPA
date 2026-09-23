@@ -112,6 +112,31 @@ def build_enriched_text(summary: str, questions: list[str], original: str) -> st
     return "\n\n".join(parts)
 
 
+def enriched_text(text: str, metadata: dict | None) -> str:
+    """Representación derivada de un chunk para embed/index — única fuente.
+
+    El `chunks.text` queda canónico: el enrichment vive en
+    `metadata.enrichment` y esta función compone la representación que se
+    embebe/indexa. Compat con filas legacy (text ya mutado con el prefijo
+    "[Summary]"): se devuelve tal cual.
+    """
+    enr = (metadata or {}).get("enrichment") or {}
+    if not enr:
+        return text
+    if text.startswith("[Summary]"):  # legacy: text ya mutado
+        return text
+    stored = enr.get("enriched_text")
+    if stored:
+        return str(stored)
+    if enr.get("summary") or enr.get("questions"):
+        return build_enriched_text(
+            str(enr.get("summary") or ""),
+            list(enr.get("questions") or []),
+            str(enr.get("canonical_text") or text),
+        )
+    return text
+
+
 def _metadata(text: str | None) -> dict:
     try:
         value = json.loads(text or "{}")
@@ -155,13 +180,16 @@ def scan_chunks(conn: sqlite3.Connection, *, min_chars: int = 800,
     scan.total = len(rows)
     for chunk_id, doc_id, text, content_hash, metadata_json in rows:
         meta = _metadata(metadata_json)
-        if text.startswith("[Summary]"):
+        enr = meta.get("enrichment") or {}
+        # Enriquecido = flag en metadata (formato nuevo, text canónico) o el
+        # prefijo legacy "[Summary]" (text ya mutado por corridas viejas).
+        if text.startswith("[Summary]") or enr.get("status") == "enriched":
             scan.already_enriched += 1
             # Re-embed pendiente: checkpoint no commiteado o texto cambió.
-            enr = meta.get("enrichment", {})
+            rep = enriched_text(text, meta)
             if (enr.get("embedding_status") != "complete"
-                    or enr.get("text_hash") != _enriched_hash(text)):
-                scan.pending_reembed.append((chunk_id, doc_id, text, content_hash))
+                    or enr.get("text_hash") != _enriched_hash(rep)):
+                scan.pending_reembed.append((chunk_id, doc_id, rep, content_hash))
             continue
         if limit is not None and len(scan.to_process) >= limit:
             continue
@@ -186,9 +214,16 @@ def count_pending(store_db: Path, *, min_chars: int = 800) -> int:
         conn.close()
 
 
-def write_enrichment(conn: sqlite3.Connection, chunk_id: str,
-                     enriched_text: str, original_text: str) -> None:
-    """Marca el chunk como enriquecido (embedding_status=pending)."""
+def write_enrichment(conn: sqlite3.Connection, chunk_id: str, summary: str,
+                     questions: list[str], enriched: str) -> None:
+    """Marca el chunk como enriquecido (embedding_status=pending).
+
+    NO muta ``chunks.text``: el texto canónico queda intacto (content_hash
+    sigue siendo válido, invariante "DocumentStore stays canonical"
+    restaurado) y la representación enriquecida vive en
+    ``metadata.enrichment`` — ``enriched_text()`` la resuelve para
+    embed/index.
+    """
     row = conn.execute(
         "SELECT metadata_json FROM chunks WHERE chunk_id = ?", (chunk_id,)
     ).fetchone()
@@ -197,21 +232,27 @@ def write_enrichment(conn: sqlite3.Connection, chunk_id: str,
         "version": ENRICHMENT_VERSION,
         "status": "enriched",
         "embedding_status": "pending",
-        "text_hash": _enriched_hash(enriched_text),
+        "text_hash": _enriched_hash(enriched),
         "enriched_at": time.time(),
+        "summary": summary,
+        "questions": questions,
+        "enriched_text": enriched,
     })
-    meta["enrichment"].setdefault("canonical_text", original_text)
     conn.execute(
-        "UPDATE chunks SET text = ?, metadata_json = ? WHERE chunk_id = ?",
-        (enriched_text, json.dumps(meta, ensure_ascii=False), chunk_id),
+        "UPDATE chunks SET metadata_json = ? WHERE chunk_id = ?",
+        (json.dumps(meta, ensure_ascii=False), chunk_id),
     )
 
 
 def reembed_batch(lancedb: Any, embedding: Any,
-                  chunks: list[tuple[str, str, str, str]]) -> int:
-    """Re-embede chunks enriquecidos en LanceDB (denso+sparse en un paso).
+                  chunks: list[tuple[str, str, str, str]],
+                  bm25: Any = None) -> int:
+    """Re-indexa chunks enriquecidos en LanceDB + BM25 (representación derivada).
 
-    add_chunks es idempotente (borra chunk_ids existentes antes de insertar).
+    add_chunks es idempotente en ambos (borra chunk_ids existentes antes de
+    insertar). BM25 recibe el texto enriquecido — el win medido de EXP-001
+    (lexical + summary, +14.3% recall@10) — mientras el store canónico queda
+    intacto.
     """
     if not chunks:
         return 0
@@ -221,6 +262,10 @@ def reembed_batch(lancedb: Any, embedding: Any,
     ]
     dense, sparse = embedding.embed_texts_hybrid([c.text for c in objs])
     lancedb.add_chunks(objs, dense, sparse_weights=sparse)
+    if bm25 is not None:
+        for c in objs:
+            bm25.remove_chunk(c.chunk_id)
+        bm25.add_chunks(objs)
     return len(chunks)
 
 
@@ -246,13 +291,13 @@ def mark_reembedded(conn: sqlite3.Connection,
 
 def _flush_reembed(conn: sqlite3.Connection, lancedb: Any, embedding: Any,
                    pending: list[tuple[str, str, str, str]],
-                   reembed_batch_size: int) -> int:
-    """Drena la cola de re-embed en lotes; devuelve cuántos se re-embedieron."""
+                   reembed_batch_size: int, bm25: Any = None) -> int:
+    """Drena la cola de re-embed en lotes; devuelve cuántos se re-indexaron."""
     done = 0
     while pending:
         batch, pending[:] = pending[:reembed_batch_size], pending[reembed_batch_size:]
         conn.commit()  # DB consistente antes de tocar LanceDB
-        done += reembed_batch(lancedb, embedding, batch)
+        done += reembed_batch(lancedb, embedding, batch, bm25=bm25)
         mark_reembedded(conn, batch)
     return done
 
@@ -263,6 +308,7 @@ def enrich_chunks(
     *,
     lancedb: Any = None,
     embedding: Any = None,
+    bm25: Any = None,
     limit: int | None = None,
     min_chars: int = 800,
     max_new_tokens: int = MAX_NEW_TOKENS,
@@ -277,6 +323,8 @@ def enrich_chunks(
         Ollama (generate_chat serial — generate_many lo resuelve).
     lancedb/embedding: si alguno es None, los chunks quedan enriquecidos con
         embedding_status=pending y se re-embeden en un pase posterior.
+    bm25: índice lexical a actualizar con el texto enriquecido (EXP-001:
+        el mayor win medido era lexical+summary, +14.3% recall@10).
     should_abort: se consulta entre lotes (preempción del idle scheduler).
     Devuelve stats del pase.
     """
@@ -300,10 +348,11 @@ def enrich_chunks(
         can_embed = lancedb is not None and embedding is not None
         pending_reembed = list(scan.pending_reembed)
 
-        # Recuperar re-embeds de corridas interrumpidas (trabajo ya generado).
+        # Recuperar re-indexes de corridas interrumpidas (trabajo ya generado).
         if pending_reembed and can_embed:
             stats["reembedded"] += _flush_reembed(
-                conn, lancedb, embedding, pending_reembed, reembed_batch_size)
+                conn, lancedb, embedding, pending_reembed, reembed_batch_size,
+                bm25=bm25)
 
         batch_size = max(1, int(getattr(provider, "batch_size", 1) or 1))
         for start in range(0, len(scan.to_process), batch_size):
@@ -324,16 +373,17 @@ def enrich_chunks(
                 if not summary and not questions:
                     stats["errors"] += 1
                     continue
-                enriched_text = build_enriched_text(summary, questions, text)
-                write_enrichment(conn, chunk_id, enriched_text, text)
+                enriched = build_enriched_text(summary, questions, text)
+                write_enrichment(conn, chunk_id, summary, questions, enriched)
                 stats["enriched"] += 1
-                pending_reembed.append((chunk_id, doc_id, enriched_text, content_hash))
+                pending_reembed.append((chunk_id, doc_id, enriched, content_hash))
 
             conn.commit()  # checkpoint durable por lote
 
             if can_embed and len(pending_reembed) >= reembed_batch_size:
                 stats["reembedded"] += _flush_reembed(
-                    conn, lancedb, embedding, pending_reembed, reembed_batch_size)
+                    conn, lancedb, embedding, pending_reembed, reembed_batch_size,
+                    bm25=bm25)
 
             done = min(start + batch_size, len(scan.to_process))
             log(f"  [enrich] {done}/{len(scan.to_process)} "
@@ -344,7 +394,8 @@ def enrich_chunks(
         conn.commit()
         if pending_reembed and can_embed:
             stats["reembedded"] += _flush_reembed(
-                conn, lancedb, embedding, pending_reembed, reembed_batch_size)
+                conn, lancedb, embedding, pending_reembed, reembed_batch_size,
+                bm25=bm25)
         stats["pending_reembed"] = len(pending_reembed)
         return stats
     finally:
@@ -356,6 +407,7 @@ __all__ = [
     "MAX_NEW_TOKENS", "TEMPERATURE", "REEMBED_BATCH",
     "ChunkScan", "scan_chunks", "count_pending",
     "enrichment_messages", "parse_enrichment", "build_enriched_text",
+    "enriched_text",
     "write_enrichment", "reembed_batch", "mark_reembedded",
     "enrich_chunks",
 ]

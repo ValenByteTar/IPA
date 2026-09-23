@@ -98,6 +98,35 @@ def test_failed_artifact_is_deleted(env):
     assert not path.exists()
 
 
+def test_no_text_artifact_is_deleted(env):
+    """Parse OK pero sin texto utilizable → igual que failed: delete."""
+    path, aid = _artifact(env["landing"], "web/site-x/blank.pdf", "BLANK")
+    _register(env["staging"], aid, "no_text", str(path))
+
+    stats = _sweep(env)
+
+    assert stats["deleted"] == 1
+    assert not path.exists()
+
+
+def test_no_text_artifact_deleted_from_transit(env):
+    """Un no_text que ya había pasado a Transit se borra en la re-evaluación."""
+    path, aid = _artifact(env["landing"], "web/site-x/blank.pdf", "BLANK")
+    _register(env["staging"], aid, "indexed", str(path))
+    _store_doc(env["staging"], aid, "doc-blank")
+    _sweep(env)
+    transit_file = env["transit"] / "web/site-x/blank.pdf"
+    assert transit_file.exists()
+
+    # La curación/corrección posterior lo reclasifica como no_text.
+    _register(env["staging"], aid, "no_text", str(path))
+
+    stats = _sweep(env)
+
+    assert stats["deleted"] == 1
+    assert not transit_file.exists()
+
+
 def test_unregistered_file_stays(env):
     _artifact(env["landing"], "web/site-c/docC.md", "unknown-content")
 

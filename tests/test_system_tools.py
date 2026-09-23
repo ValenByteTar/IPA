@@ -330,3 +330,116 @@ def test_identity_file_has_updated_capabilities():
     for cap in ("search_corpus", "compile_report", "research_topic", "list_promotions"):
         assert cap in identity.capabilities
     assert identity.skills, "skills section missing from agent_identity.yaml"
+
+
+# ---------------------------------------------------------------------------
+# get_document — apertura de un doc por id (identidad/provenance/lifecycle)
+# ---------------------------------------------------------------------------
+
+def _mk_corpus(corpus_dir: Path, doc_id: str, text: str,
+               *, tombstone: bool = False) -> None:
+    from ipa import DocumentStore
+    from ipa.contracts import CanonicalDocument, DocumentChunk
+
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    store = DocumentStore(corpus_dir / "document_store.db")
+    store.put_document(
+        CanonicalDocument(document_id=doc_id, parser_id="test",
+                          mime_type="text/plain", pages=1, text=text,
+                          elements=[], source_spans=[]), "art:1")
+    store.put_chunks([DocumentChunk(
+        chunk_id=f"{doc_id}:c0", document_id=doc_id, content_hash="h",
+        text=text[:200], metadata={}, source_span=None)])
+    store.put_doc_meta(doc_id, normalized_hash="sha256:abc", title="Doc T",
+                       published_at="2026-09-01", char_count=len(text),
+                       extra={"duplicate_of_main": "m1"})
+    store.put_source(doc_id, "https://x.com/a", "x.com", "agent_research",
+                     quality_score=0.8, published_at="2026-09-01")
+    if tombstone:
+        store.tombstone_document(doc_id)
+    store.commit()
+    store.close()
+
+
+def _mk_cluster_db(path: Path) -> None:
+    import sqlite3
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE promotion_queue (
+            document_id TEXT PRIMARY KEY, reason TEXT, provenance TEXT,
+            source_corpus TEXT DEFAULT '', status TEXT DEFAULT 'pending',
+            queued_at TEXT, promoted_at TEXT);
+        CREATE TABLE curation_decisions (
+            decision_id TEXT PRIMARY KEY, document_id TEXT,
+            report_id TEXT, payload_json TEXT, created_at TEXT);
+        """)
+    conn.execute(
+        "INSERT INTO promotion_queue VALUES ('d1','score 0.8','agent_research',"
+        "'research_staging','pending','2026-09-23T00:00:00Z',NULL)")
+    conn.execute(
+        "INSERT INTO curation_decisions VALUES ('dec1','d1','rep1',?, 'x')",
+        (json.dumps({"decision": "reporter_only", "promotion_score": 0.62}),))
+    conn.commit()
+    conn.close()
+
+
+def test_get_document_returns_full_record(tmp_path, monkeypatch):
+    corpus = tmp_path / "main"
+    _mk_corpus(corpus, "d1", "texto del documento de prueba" * 30)
+    monkeypatch.setattr(system_tools, "_doc_corpora",
+                        lambda: [("main", corpus)])
+    cluster_db = tmp_path / "topic_clusters.db"
+    _mk_cluster_db(cluster_db)
+    monkeypatch.setattr(system_tools, "TOPIC_CLUSTER_DB", cluster_db)
+
+    res = system_tools.execute_system_tool("get_document", {"doc_id": "d1"})
+    assert res.ok, res.error
+    d = res.data
+    assert d["document_id"] == "d1" and d["corpus"] == "main"
+    assert d["tombstoned"] is False and d["title"] == "Doc T"
+    assert d["provenance"]["provenance"] == "agent_research"
+    assert d["provenance"]["source_url"] == "https://x.com/a"
+    assert d["extra"]["duplicate_of_main"] == "m1"
+    assert d["promotion_queue"]["status"] == "pending"
+    assert d["curation_decision"]["promotion_score"] == 0.62
+    assert d["chunks_live"] == 1 and "texto del documento" in d["text_preview"]
+
+
+def test_get_document_finds_staging_doc(tmp_path, monkeypatch):
+    """Un doc pendiente de promoción vive en staging, no en main."""
+    main = tmp_path / "main"
+    _mk_corpus(main, "m1", "doc de main")
+    staging = tmp_path / "staging"
+    _mk_corpus(staging, "s1", "doc recién investigado")
+    monkeypatch.setattr(system_tools, "_doc_corpora",
+                        lambda: [("main", main), ("research_staging", staging)])
+    monkeypatch.setattr(system_tools, "TOPIC_CLUSTER_DB",
+                        tmp_path / "nope.db")
+
+    res = system_tools.execute_system_tool("get_document", {"doc_id": "s1"})
+    assert res.ok and res.data["corpus"] == "research_staging"
+
+
+def test_get_document_reports_tombstoned(tmp_path, monkeypatch):
+    corpus = tmp_path / "main"
+    _mk_corpus(corpus, "d1", "doc muerto", tombstone=True)
+    monkeypatch.setattr(system_tools, "_doc_corpora",
+                        lambda: [("main", corpus)])
+    monkeypatch.setattr(system_tools, "TOPIC_CLUSTER_DB",
+                        tmp_path / "nope.db")
+    res = system_tools.execute_system_tool("get_document", {"doc_id": "d1"})
+    assert res.ok and res.data["tombstoned"] is True
+
+
+def test_get_document_not_found(tmp_path, monkeypatch):
+    corpus = tmp_path / "main"
+    _mk_corpus(corpus, "d1", "doc")
+    monkeypatch.setattr(system_tools, "_doc_corpora",
+                        lambda: [("main", corpus)])
+    res = system_tools.execute_system_tool("get_document", {"doc_id": "zzz"})
+    assert not res.ok and "no encontrado" in res.error
+
+
+def test_get_document_requires_doc_id():
+    res = system_tools.execute_system_tool("get_document", {})
+    assert not res.ok and "doc_id" in res.error

@@ -53,6 +53,7 @@ principles:
 
 capabilities:
   - search_corpus
+  - get_document
   - list_topics
   - get_topic_info
   - recall_conversation
@@ -77,6 +78,8 @@ capabilities:
 skills:
   - name: responder_con_evidencia
     flow: "search_corpus → fundamentar la respuesta en los hits (sin marcadores [n] visibles)"
+  - name: auditar_origen
+    flow: "search_corpus → get_document(doc_id del hit) para ver provenance real, estado y texto completo"
   - name: responder_a_cita
     flow: "mensaje con [cita: «…»] → recall_conversation(query=texto citado) para recuperar el pasaje → responder en foco a esa sección"
   - name: reporte_fino

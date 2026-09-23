@@ -134,7 +134,10 @@ class BM25Index:
         # (~80ms per row at 80k rows — the promotion bottleneck). chunks_meta
         # has a PK on chunk_id, so look up which ids actually exist first and
         # delete only those. Freshly indexed chunks (the common case) skip
-        # the delete entirely.
+        # the delete entirely. Tombstoned meta rows are skipped too: the
+        # tombstone operation already removed their FTS row, so they cannot
+        # exist there — mass restores would otherwise pay one full FTS scan
+        # per resurrected chunk for deletes that are no-ops.
         chunk_ids = [chunk.chunk_id for chunk in chunks]
         existing: set[str] = set()
         # SQLite caps bound variables (~32k); large batches exceed it, so
@@ -144,7 +147,8 @@ class BM25Index:
             placeholders = ",".join("?" * len(group))
             existing.update(
                 row[0] for row in self._conn.execute(
-                    f"SELECT chunk_id FROM chunks_meta WHERE chunk_id IN ({placeholders})",
+                    f"SELECT chunk_id FROM chunks_meta WHERE tombstoned = 0 "
+                    f"AND chunk_id IN ({placeholders})",
                     group,
                 )
             )

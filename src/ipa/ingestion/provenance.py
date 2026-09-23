@@ -215,6 +215,7 @@ def record_agent_research(
     source_url: str,
     source_domain: str = "",
     quality_score: float = 0.0,
+    provenance: str = "agent_research",
 ) -> None:
     """Record that a document was acquired by the agent's research executor.
 
@@ -224,10 +225,13 @@ def record_agent_research(
         source_url: The URL the document was fetched from.
         source_domain: The domain of the source URL.
         quality_score: Quality score from the fetch (if available).
+        provenance: "agent_research" (search-discovered, promotion needs
+            score >= 0.70) or "user_provided" (URL pasted by the user —
+            auto-promote like configured_scrape; DEC-003).
     """
     if not source_domain:
         source_domain = _domain_from_url(source_url)
-    store.put_source(document_id, source_url, source_domain, "agent_research", quality_score)
+    store.put_source(document_id, source_url, source_domain, provenance, quality_score)
     store.commit()
 
 

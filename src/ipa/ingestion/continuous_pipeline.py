@@ -330,7 +330,7 @@ def main() -> None:
     parser.add_argument("--lancedb-incremental", action="store_true",
                         help="Build LanceDB incrementally as chunks are added (not just at end).")
     parser.add_argument("--lancedb-batch-size", type=int, default=256,
-                        help="How many chunks to embed per incremental LanceDB batch.")
+                        help="BGE forward batch per incremental write (overrides device defaults; CPU baseline is 4).")
     args = parser.parse_args()
 
     landing = Path(args.landing)

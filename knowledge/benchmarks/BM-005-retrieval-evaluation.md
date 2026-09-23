@@ -3,13 +3,15 @@ id: BM-005
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [retrieval, lexical_index, vector_index, evaluation]
 tags: [tantivy, lancedb, hybrid, recall, mrr, rrf]
 related: [BM-001, BM-002]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/benchmarks/run_retrieval_eval.py", "tests/test_retrieval_eval.py"]
+affects: ["scripts/benchmarks/run_retrieval_eval.py"]
 ---
 
 # BM-005 â€” Evaluación lexical, vectorial e híbrida
@@ -21,7 +23,7 @@ Medir qué backend funciona mejor según la forma de la consulta y evaluar si la
 ## Entorno
 
 - Dataset: 200 consultas sobre 166k chunks.
-- Artefacto: `outputs/experiments/E10/benchmark_report.json`.
+- Artefacto: `outputs/experiments/E10/benchmark_report.json` (histórico, ya no en disco — ver PM-002).
 - Métricas: recall@10, MRR y latencia p50.
 
 ## Resultados

@@ -98,6 +98,105 @@ def _main_corpus_dir() -> Path | None:
     return None
 
 
+def _research_staging_dir() -> Path:
+    """Staging corpus for agent research (DEC-003): judge → staging → T1
+    curation → promotion_policy → promotion_queue → main.
+
+    Fixed path on purpose: it must NOT track the reporter's
+    active-reporter-output pointer — that moves between pipeline runs and
+    reporter cleanup can delete old runs, orphaning pending research docs.
+    """
+    return PROJECT_ROOT / "outputs" / "agent" / "research_staging"
+
+
+def _doc_corpora() -> list[tuple[str, Path]]:
+    """Candidate corpora a document may live in, ordered by priority.
+
+    (label, dir) pairs: main first, then the research staging (DEC-003),
+    then reporter staging corpora — the persisted active pointer first and
+    the rest of quality-check/*/corpus by recency (docs pending promotion
+    live in staging, not main)."""
+    out: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+
+    def _add(label: str, path: Path | None) -> None:
+        if path is None:
+            return
+        p = Path(path)
+        if (p / "document_store.db").exists() and p not in seen:
+            seen.add(p)
+            out.append((label, p))
+
+    _add("main", _main_corpus_dir())
+    _add("research_staging", _research_staging_dir())
+    try:
+        pointer = json.loads(
+            (PROGRESS_DIR / "active_reporter_output.json").read_text(
+                encoding="utf-8"))
+        _add("reporter_staging", Path(str(pointer.get("path") or "")) / "corpus")
+    except Exception:
+        pass
+    qc = REPORTER_ROOT / "quality-check"
+    if qc.exists():
+        corpora = sorted(
+            (d / "corpus" for d in qc.iterdir() if (d / "corpus").is_dir()),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+        for c in corpora:
+            _add("reporter_staging", c)
+    return out
+
+
+def _research_ingest_corpus() -> Path | None:
+    """Corpus destino de TODA ingesta originada por research (corrida y cola
+    de review): el staging por default; main si IPA_RESEARCH_STAGING=0
+    (kill switch de emergencia)."""
+    if os.environ.get("IPA_RESEARCH_STAGING", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return _main_corpus_dir()
+    return _research_staging_dir()
+
+
+def _spawn_embed_drain(corpus_dir: Path, *, min_pending: int = 1) -> bool:
+    """Lanza el drain standalone sobre un corpus con chunks vivos sin vector.
+
+    La promoción DEFIERE hasta que cada chunk vivo tenga vector en main
+    (PM-004): un backlog residual sin productor deja la cola esperando
+    vectores que nadie genera. El drain toma su propio lease, es resumible
+    y escala al lote GPU si el backlog lo amerita. Best-effort: False si
+    no hay pendientes o el spawn falla."""
+    try:
+        import sqlite3
+        corpus = Path(corpus_dir)
+        if not (corpus / "document_store.db").exists():
+            return False
+        conn = sqlite3.connect(str(corpus / "document_store.db"))
+        try:
+            live = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE tombstoned=0").fetchone()[0]
+        finally:
+            conn.close()
+        from ipa.indexes.lancedb_index import LanceDBIndex
+        lance = LanceDBIndex(corpus / "vector" / "lancedb")
+        try:
+            vec = (lance._table.count_rows()
+                   if lance.is_queryable() and lance._table is not None else 0)
+        finally:
+            lance.close()
+        if live - vec < min_pending:
+            return False
+        import subprocess
+        drain = PROJECT_ROOT / "scripts" / "operations" / "run_embed_drain.py"
+        subprocess.Popen(
+            [sys.executable, str(drain), "--corpus", str(corpus), "--background"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if sys.platform == "win32" else 0),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _research_progress() -> dict[str, Any]:
     return _read_progress("research")
 
@@ -507,6 +606,141 @@ def tool_search_corpus(args: dict[str, Any]) -> SystemToolResult:
     return SystemToolResult(tool_name="search_corpus", ok=True, summary=summary, data=data)
 
 
+def tool_get_document(args: dict[str, Any]) -> SystemToolResult:
+    """Open a document by id: identity, provenance, lifecycle and text.
+
+    Searches the doc across every corpus it may live in (main → research
+    staging → reporter staging) — a doc pending promotion is NOT in main
+    yet, and that is exactly when this tool matters ("¿por qué está en la
+    cola?"). Read-only: raw RO sqlite reads like index_audit, never the
+    DocumentStore write path.
+    """
+    doc_id = str(args.get("doc_id") or args.get("document_id") or "").strip()
+    if not doc_id:
+        return SystemToolResult(
+            tool_name="get_document", ok=False, summary="", data={},
+            error="falta doc_id (viene en los hits de search_corpus)")
+    try:
+        max_chars = max(200, min(8000, int(args.get("max_chars", 3000))))
+    except (TypeError, ValueError):
+        max_chars = 3000
+
+    import sqlite3
+    found: dict[str, Any] | None = None
+    corpus_label = ""
+    searched: list[str] = []
+    for label, cdir in _doc_corpora():
+        searched.append(label)
+        conn = sqlite3.connect(
+            f"file:{cdir / 'document_store.db'}?mode=ro", uri=True, timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT mime_type, pages, stored_at, tombstoned, "
+                "substr(text, 1, ?) FROM documents WHERE document_id = ?",
+                (max_chars + 1, doc_id)).fetchone()
+            if row is None:
+                continue
+            corpus_label = label
+            meta_row = conn.execute(
+                "SELECT normalized_hash, title, published_at, char_count, "
+                "extra_json FROM document_metadata WHERE document_id = ?",
+                (doc_id,)).fetchone()
+            src_row = conn.execute(
+                "SELECT source_url, source_domain, provenance, quality_score,"
+                " published_at FROM document_sources WHERE document_id = ?",
+                (doc_id,)).fetchone()
+            chunks_live = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ? "
+                "AND tombstoned = 0", (doc_id,)).fetchone()[0]
+            chunks_total = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                (doc_id,)).fetchone()[0]
+            found = {"doc": row, "meta": meta_row, "src": src_row,
+                     "chunks_live": chunks_live, "chunks_total": chunks_total}
+            break
+        finally:
+            conn.close()
+
+    if found is None:
+        return SystemToolResult(
+            tool_name="get_document", ok=False, summary="", data={},
+            error=f"documento '{doc_id}' no encontrado en: {', '.join(searched) or 'sin corpus'}")
+
+    mime, pages, stored_at, tombstoned, text = found["doc"]
+    meta = found["meta"]
+    src = found["src"]
+    extra: dict[str, Any] = {}
+    title = published_at = normalized_hash = char_count = None
+    if meta:
+        normalized_hash, title, published_at, char_count, extra_json = meta
+        try:
+            extra = json.loads(extra_json or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+    source = ({"source_url": src[0], "source_domain": src[1],
+               "provenance": src[2], "quality_score": src[3],
+               "published_at": src[4]} if src else None)
+
+    # Cola de promoción + decisión de curación (read-only sobre el cluster db).
+    queue_status = curation = None
+    if TOPIC_CLUSTER_DB.exists():
+        try:
+            cconn = sqlite3.connect(
+                f"file:{TOPIC_CLUSTER_DB}?mode=ro", uri=True, timeout=10)
+            try:
+                qrow = cconn.execute(
+                    "SELECT status, reason, queued_at, promoted_at "
+                    "FROM promotion_queue WHERE document_id = ?",
+                    (doc_id,)).fetchone()
+                if qrow:
+                    queue_status = {"status": qrow[0], "reason": qrow[1],
+                                    "queued_at": qrow[2], "promoted_at": qrow[3]}
+                drow = cconn.execute(
+                    "SELECT payload_json FROM curation_decisions "
+                    "WHERE document_id = ?", (doc_id,)).fetchone()
+                if drow:
+                    try:
+                        curation = json.loads(drow[0])
+                    except (TypeError, ValueError):
+                        curation = {"raw": str(drow[0])[:500]}
+            finally:
+                cconn.close()
+        except sqlite3.Error:
+            pass
+
+    data = {
+        "document_id": doc_id,
+        "corpus": corpus_label,
+        "tombstoned": bool(tombstoned),
+        "mime_type": mime,
+        "pages": pages,
+        "stored_at": stored_at,
+        "title": title,
+        "char_count": char_count,
+        "normalized_hash": normalized_hash,
+        "published_at": published_at,
+        "provenance": source,
+        "extra": {k: v for k, v in extra.items()
+                  if k in ("duplicate_of_main", "novelty_hint")} or None,
+        "chunks_live": found["chunks_live"],
+        "chunks_total": found["chunks_total"],
+        "promotion_queue": queue_status,
+        "curation_decision": curation,
+        "text_preview": text,
+        "text_truncated": text is not None and len(text) > max_chars,
+    }
+    estado = "tombstoned" if tombstoned else "live"
+    prov = (source or {}).get("provenance") or "sin provenance"
+    summary = (
+        f"{doc_id} [{corpus_label}, {estado}] — '{title or '(sin título)'}' — "
+        f"{prov}, {found['chunks_live']} chunks vivos"
+        + (f", cola: {queue_status['status']}" if queue_status else "")
+        + "."
+    )
+    return SystemToolResult(
+        tool_name="get_document", ok=True, summary=summary, data=data)
+
+
 def tool_list_topics(args: dict[str, Any]) -> SystemToolResult:
     """List emergent topic clusters (derived index over corpus embeddings)."""
     try:
@@ -582,9 +816,12 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
 
     Searches the web, judges snippets/content with the deterministic
     HeuristicJudge (no VRAM — safe alongside chat), ingests what passes
-    into the main corpus with provenance=agent_research. Progress is
-    written to outputs/web_dashboard/research_progress.json so the
-    dashboard watcher can notify the session when it finishes.
+    into the research staging corpus (DEC-003): T1 curation + the
+    promotion policy decide what reaches the main corpus
+    (agent_research >= 0.70; URLs pegadas por el usuario auto-promueven
+    como user_provided). Progress is written to
+    outputs/web_dashboard/research_progress.json so the dashboard watcher
+    can notify the session when it finishes.
     """
     session_id = args.pop("_session_id", None)
     auto = bool(args.pop("_auto", False))
@@ -605,13 +842,26 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
         if extra:
             query = (query + " " + " ".join(extra)).strip()
     try:
-        max_urls = max(1, min(20, int(args.get("max_urls", 5))))
+        max_urls = max(1, min(50, int(args.get("max_urls", 5))))
     except (TypeError, ValueError):
         max_urls = 5
     try:
         max_seconds = max(30, min(600, int(args.get("max_seconds", 120))))
     except (TypeError, ValueError):
         max_seconds = 120
+    # Facetas del mismo tema escritas por el agente — cada una corre su
+    # propia búsqueda y ensancha el pool de candidatos (máx 8).
+    _raw_subs = args.get("sub_queries")
+    sub_queries: list[str] = []
+    if isinstance(_raw_subs, (list, tuple)):
+        _seen_sq = {query.lower()}
+        for _s in _raw_subs:
+            _s = str(_s).strip()[:300]
+            if _s and _s.lower() not in _seen_sq:
+                _seen_sq.add(_s.lower())
+                sub_queries.append(_s)
+            if len(sub_queries) >= 8:
+                break
     _force_raw = args.get("force")
     force = _force_raw if isinstance(_force_raw, bool) else str(_force_raw or "").strip().lower() in ("1", "true", "yes", "si", "sí")
 
@@ -672,6 +922,8 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
     _write_research_progress({
         "status": "running", "query": query,
         "max_urls": max_urls, "max_seconds": max_seconds,
+        "sub_queries": sub_queries,
+        "phase": "starting", "phase_detail": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "session_id": session_id,
         "notified": False,
@@ -684,19 +936,25 @@ def tool_research_topic(args: dict[str, Any]) -> SystemToolResult:
     # watcher picks it up and notifies the session.
     import subprocess as _sp
     research_script = Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "operations" / "run_research.py"
+    cmd = [sys.executable, str(research_script), query, str(max_urls), str(max_seconds)]
+    if sub_queries:
+        cmd.append(json.dumps(sub_queries, ensure_ascii=False))
     _sp.Popen(
-        [sys.executable, str(research_script), query, str(max_urls), str(max_seconds)],
+        cmd,
         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
         creationflags=_sp.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
+    _sq_note = f" + {len(sub_queries)} sub-queries" if sub_queries else ""
     return SystemToolResult(
         tool_name="research_topic", ok=True,
         summary=(
-            f"Investigación iniciada: '{query}' — busco en la web, filtro con "
-            f"juez heurístico e injesto lo relevante al corpus (máx {max_urls} "
+            f"Investigación iniciada: '{query}'{_sq_note} — busco en la web, filtro con "
+            f"juez heurístico y dejo lo aceptado en revisión (staging): el pipeline "
+            f"de curación decide qué entra al corpus principal (máx {max_urls} "
             f"fuentes, {max_seconds}s). Te aviso cuando termine."
         ),
-        data={"query": query, "max_urls": max_urls, "max_seconds": max_seconds},
+        data={"query": query, "max_urls": max_urls, "max_seconds": max_seconds,
+              "sub_queries": sub_queries},
     )
 
 
@@ -1163,6 +1421,19 @@ _SYSTEM_TOOLS: tuple[SystemToolSpec, ...] = (
         fn=tool_search_corpus,
     ),
     SystemToolSpec(
+        name="get_document",
+        description=(
+            "abre un documento por su doc_id (viene en los hits de "
+            "search_corpus o en la cola de promoción): título, provenance "
+            "real (URL, dominio, clase), estado live/tombstoned, decisión de "
+            "curación, lugar en la cola de promoción y texto. Busca también "
+            "en los corpus staging — un doc pendiente de promoción no está "
+            "en main todavía."
+        ),
+        args_doc='{"doc_id": "doc:...", "max_chars": <int ≤8000 de texto, opcional>}',
+        fn=tool_get_document,
+    ),
+    SystemToolSpec(
         name="list_topics",
         description="lista tópicos del corpus.",
         args_doc='{"limit": <int 1-50, opcional>}',
@@ -1189,21 +1460,29 @@ _SYSTEM_TOOLS: tuple[SystemToolSpec, ...] = (
     SystemToolSpec(
         name="research_topic",
         description=(
-            "investiga un tema en la web (async). URLs incluidas en la query se "
-            "scrapean directo como fuentes explícitas. Si ya investigué algo muy "
-            "parecido hace poco, la tool lo indica y no relanza — pasar force=true "
-            "solo si el usuario pide explícitamente investigar de nuevo."
+            "investiga/acumula información sobre UN TEMA en la web (async). ES la "
+            "tool correcta para ingesta temática: 'traé/guardate mucha info sobre X' "
+            "→ max_urls alto (hasta 50) + sub_queries con facetas o variantes del "
+            "tema (máx 8) para un barrido amplio; cada faceta corre su propia "
+            "búsqueda. URLs en la query se scrapean directo como fuentes explícitas. "
+            "Si ya investigué algo muy parecido hace poco, la tool lo indica y no "
+            "relanza — pasar force=true solo si el usuario pide explícitamente "
+            "investigar de nuevo."
         ),
-        args_doc='{"query": "tema o URL a investigar", "max_urls": <int 1-20>, "max_seconds": <int 30-600>, "force": <bool>}',
+        args_doc='{"query": "tema o URL a investigar", "max_urls": <int 1-50>, "max_seconds": <int 30-600>, "sub_queries": ["faceta del tema", ...], "force": <bool>}',
         fn=tool_research_topic,
     ),
     SystemToolSpec(
         name="run_ingestion",
         description=(
-            "lanza ingesta de fuentes (async). VOS determinás la ventana de fechas "
-            "según el objetivo: sin args usa los baselines por sitio (incremental); "
-            "days_back N amplía la ventana global (N>30 fuerza re-descubrimiento del "
-            "historial, más lento); date_from/date_to fija un rango exacto."
+            "barrido de ingesta de TODAS las fuentes configuradas (scrape_sites.yaml), "
+            "SIN filtro temático — no acepta query. Usar solo para refrescar las "
+            "fuentes guardadas o cuando el usuario pida scrapear esas fuentes "
+            "explícitamente; para acumular info sobre un tema usar research_topic. "
+            "VOS determinás la ventana de fechas según el objetivo: sin args usa "
+            "los baselines por sitio (incremental); days_back N amplía la ventana "
+            "global (N>30 fuerza re-descubrimiento del historial, más lento); "
+            "date_from/date_to fija un rango exacto."
         ),
         args_doc='{} o {"days_back": <int 0-365>} o {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}',
         fn=tool_run_ingestion,
@@ -1383,7 +1662,7 @@ BASE_TOOLS: frozenset[str] = frozenset({
 # Grafo de progresión: al usar una tool, se desbloquean estas.
 # Determinístico — el LLM no decide qué se desbloquea.
 TOOL_PROGRESSION: dict[str, frozenset[str]] = {
-    "search_corpus": frozenset({"compile_report", "list_topics"}),
+    "search_corpus": frozenset({"compile_report", "list_topics", "get_document"}),
     "research_topic": frozenset({"compile_report", "list_promotions"}),
     "plan_task": frozenset({"list_tasks", "get_task", "resume_task"}),
     "compile_report": frozenset({"get_report"}),

@@ -1,0 +1,62 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "^(edit|write|apply_patch|notebook_edit)$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": ".venv/Scripts/python.exe scripts/hooks/permit_guard.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": ".venv/Scripts/python.exe scripts/hooks/permit_guard.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": ".venv/Scripts/python.exe scripts/hooks/permit_guard.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": ".venv/Scripts/python.exe scripts/hooks/permit_guard.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PostCompaction": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": ".venv/Scripts/python.exe scripts/hooks/permit_guard.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}

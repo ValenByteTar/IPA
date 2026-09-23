@@ -5,12 +5,19 @@ Flow (the agent reads and judges; tools are deterministic adapters):
   1. web search (DuckDuckGo HTML, no API key) → URLs with snippets
   2. agent reads snippets → semantic judgment of which URLs are worth
      scraping (LLMJudge; HeuristicJudge as cheap scaffold + fallback)
-  3. scrape accepted URLs (existing E4 adapter)
+  3. scrape accepted URLs (existing E4 adapter) into a per-run work dir
+     (``outputs/agent/research/<run_id>/``, not the shared ``Landing/web``)
   4. agent reads raw scraped text → judges each document:
-     - accept  → save to Landing + ingest into corpus
+     - accept  → save to the run dir + ingest into the canonical corpus
      - reject  → discard with explicit reason (paywall, stub, duplicate, stale)
-  5. FastPath ingestion of the accepted material only
+  5. FastPath ingestion of the accepted material only, under the heavy-work
+     lock and with a post-scrape budget (``max_ingest_seconds``)
   6. retrieval with citations over the corpus
+
+Steps 4-5 (ingest + embeddings) are the heavy phase: they take the heavy-work
+lock with interactive priority and embed only this run's chunks — sharing the
+landing dir with a concurrent pipeline made a 120 s research run take 27 min
+(PM-004).
 
 Every judgment is recorded (url, stage, verdict, reason, judge) — PAT-004
 budgets + traceability. Web material remains derived and labeled, never
@@ -18,6 +25,8 @@ canonical authority (PAT-003).
 """
 from __future__ import annotations
 
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -205,17 +214,57 @@ def _article_age_days(date_str: str | None) -> int | None:
 MAX_ARTICLE_AGE_DAYS = 365  # 0 = no age filter
 DUPLICATE_JACCARD_THRESHOLD = 0.80
 
+ROOT = Path(__file__).resolve().parents[3]
+# Dir de trabajo por corrida: el scrape NO comparte Landing/web con el scraper
+# del pipeline. Compartirlo hacía que la ingesta de la research recorriera los
+# ~600 archivos de la ingesta masiva (heredaba su trabajo) y que ambos
+# escribieran el mismo árbol — medido 2026-09-22 (PM-004). El handoff al corpus
+# principal sigue intacto: la ingesta registra provenance agent_research en el
+# corpus canónico; el material queda acá como traza de auditoría.
+RESEARCH_WORK_ROOT = ROOT / "outputs" / "agent" / "research"
+# Presupuesto de las etapas post-scrape (ingesta + embeddings). El
+# ``max_seconds`` de la tool solo acota el loop de scrape; sin este límite una
+# corrida con presupuesto de 120 s podía tardar horas en el embed (PM-004).
+DEFAULT_INGEST_BUDGET_S = float(os.environ.get("IPA_RESEARCH_INGEST_BUDGET", "600") or 600)
+EMBED_BATCH_SIZE = int(os.environ.get("IPA_RESEARCH_EMBED_BATCH", "64") or 64)
 
-def _embed_new_chunks(corpus: Path, ctx: Any) -> int:
-    """Embed corpus chunks that lack a vector and add them to LanceDB.
+
+def _research_run_dir(query: str) -> Path:
+    """Dir de trabajo privado de una corrida de research."""
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")[:40] or "research"
+    return RESEARCH_WORK_ROOT / f"{_compact_stamp()}-{slug}"
+
+
+def _source_url_from_artifact(path_str: str) -> str:
+    """URL real de un artefacto scrapeado: el scraper escribe
+    ``Source: <url>`` en la cabecera del .txt (``source_uri`` en landing.db
+    es el path local, no la URL). Vacío si no se puede leer."""
+    try:
+        with open(path_str, "r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(12):
+                line = fh.readline()
+                if not line:
+                    break
+                if line.startswith("Source:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _embed_new_chunks(corpus: Path, ctx: Any, *, document_ids: set[str] | None = None,
+                      deadline: float | None = None,
+                      batch_size: int = EMBED_BATCH_SIZE) -> int:
+    """Embed this run's chunks that lack a vector and add them to LanceDB.
 
     Completes the ingestion pipeline: DocumentStore + BM25 (FastPath) →
     dense vectors (BGE-M3) → LanceDB. Returns the number of chunks embedded.
     Non-fatal: retrieval falls back to BM25 if this fails.
-    """
-    from ipa.storage.document_store import DocumentStore
-    from ipa.indexes.lancedb_index import LanceDBIndex
 
+    ``document_ids`` acota el embed a los documentos de ESTA corrida (antes se
+    embebía todo chunk pendiente del corpus canónico — miles, en una sola
+    llamada sin deadline: PM-004). ``deadline`` (monotonic) corta entre batches.
+    """
     store = ctx.document_store()
     lance = ctx.lance_index()
     if store is None or lance is None:
@@ -224,29 +273,83 @@ def _embed_new_chunks(corpus: Path, ctx: Any) -> int:
     # Chunks in the store that are not yet in the vector table
     existing_ids: set[str] = set()
     try:
-        if lance.is_queryable():
-            table = lance._table
-            existing_ids = {
-                row["chunk_id"] for row in table.to_arrow().to_pylist()
-            } if table is not None else set()
+        if lance.is_queryable() and lance._table is not None:
+            existing_ids = lance.chunk_ids()  # lectura proyectada, sin vectores
     except Exception:
         existing_ids = set()
 
     pending = [
         chunk for chunk in store.all_chunks()
         if chunk.chunk_id not in existing_ids
+        and (document_ids is None or chunk.document_id in document_ids)
     ]
     if not pending:
         return 0
 
     embed = ctx.embedding_adapter()
-    vectors, sparse_weights = embed.embed_texts_hybrid([c.text for c in pending])
-    lance.add_chunks(pending, vectors, sparse_weights=sparse_weights)
+    if embed is None:
+        return 0
+
+    # Backlog grande → escalar al lote GPU exclusivo: el mismo mecanismo del
+    # drain standalone (estado de mantenimiento publicado → el chat se pausa,
+    # vram_lock, descarga del LLM, BGE-M3 en CUDA, restauración al terminar).
+    # Antes la research embebía siempre inline por CPU — con el chat cargado
+    # el gate de VRAM jamás daba CUDA y un backlog de miles tardaba horas en
+    # vez de segundos (~45x medido en PM-004).
+    from ipa.agentic.chunk_enrichment import enriched_text
+    bulk_session: dict | None = None
+    job_claimed = False
+    maintenance = None
+    try:
+        from ipa.agentic import embedding_maintenance as maintenance
+        from ipa.ingestion.fast_path_cli import (
+            EMBED_GPU_BULK_ENABLED, EMBED_GPU_MIN_BACKLOG,
+            _finish_bulk_gpu, _start_bulk_gpu, _update_bulk_gpu)
+        if (EMBED_GPU_BULK_ENABLED and len(pending) >= EMBED_GPU_MIN_BACKLOG
+                and maintenance.claim_job("research_embed", wait_s=0)):
+            job_claimed = True
+            # El wait por VRAM queda acotado al budget de ingesta (max 120s):
+            # una generación en vuelo termina en segundos; si el lock no se
+            # libera, cae a CPU y sigue — nunca deadlockea la respuesta.
+            remaining = (deadline - time.monotonic()) if deadline is not None else 120.0
+            bulk_session = _start_bulk_gpu(
+                embed, corpus=Path(corpus), total=store.count_chunks(),
+                vectorized=max(0, store.count_chunks() - len(pending)),
+                pending=len(pending), embedded_before=0,
+                wait_s=max(0.0, min(120.0, remaining)))
+    except Exception:
+        bulk_session = None
+
+    embedded = 0
+    try:
+        for start in range(0, len(pending), batch_size):
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            batch = pending[start:start + batch_size]
+            vectors, sparse_weights = embed.embed_texts_hybrid(
+                [enriched_text(c.text, getattr(c, "metadata", None) or {})
+                 for c in batch])
+            lance.add_chunks(batch, vectors, sparse_weights=sparse_weights)
+            embedded += len(batch)
+            if bulk_session:
+                _update_bulk_gpu(
+                    bulk_session, embedded=embedded,
+                    total=store.count_chunks(),
+                    vectorized_before=bulk_session["vectorized_before"],
+                    pending=max(0, len(pending) - embedded))
+    finally:
+        if bulk_session:
+            _finish_bulk_gpu(embed, bulk_session, status="completed")
+            # close() deja device="cuda": sin esto el próximo embed del ctx
+            # recargaría BGE-M3 en GPU encima del chat recién restaurado.
+            embed.release_gpu()
+        if job_claimed and maintenance is not None:
+            maintenance.release_job("research_embed")
     try:
         lance.create_fts_index()
     except Exception:
         pass  # FTS index may already exist (pre-existing LanceDB quirk)
-    return len(pending)
+    return embedded
 
 
 def _enqueue_review(
@@ -290,7 +393,12 @@ def execute_research(
     max_age_days: int = MAX_ARTICLE_AGE_DAYS,
     freshness: str = "lenient",
     judge: Any | None = None,
-    landing_dir: str | Path = "Landing/web",
+    landing_dir: str | Path | None = None,
+    max_ingest_seconds: float | None = None,
+    on_heavy_wait: Any | None = None,
+    sub_queries: list[str] | None = None,
+    staging_corpus_dir: str | Path | None = None,
+    on_progress: Any | None = None,
 ) -> tuple[ToolCall, ToolResult, ResearchResult]:
     """Execute a bounded, agent-driven research request end-to-end.
 
@@ -313,7 +421,31 @@ def execute_research(
             "strict" — articles older than max_age_days are rejected outright
             (for news / time-sensitive topics).
         judge: Judge instance (LLMJudge or HeuristicJudge). None → HeuristicJudge.
-        landing_dir: Where scraped content lands (Landing/web by default).
+        landing_dir: Where scraped content lands. None (default) → dir de
+            trabajo privado por corrida bajo ``outputs/agent/research/``; así
+            la research no comparte ``Landing/web`` con el scraper del pipeline
+            (PM-004). El override explícito sigue disponible para tests/CLIs.
+        max_ingest_seconds: Budget de las etapas post-scrape (ingesta +
+            embeddings). None → ``IPA_RESEARCH_INGEST_BUDGET`` (600 s).
+        on_heavy_wait: Callback opcional ``(elapsed_s, holder)`` que se llama
+            mientras se espera el lock de trabajos pesados (para reportar
+            "encolado detrás de <kind>" en el progreso).
+        sub_queries: Facetas extra del mismo tema escritas por el agente
+            (máx 8). Cada una corre su propia búsqueda web y sus resultados
+            entran al pool deduplicado por URL; el prefilter y el juicio de
+            snippets/contenido se hacen contra la query que produjo cada
+            candidato — una faceta con vocabulario propio no debería fallar
+            por no matchear la query principal.
+        staging_corpus_dir: Corpus de staging donde aterriza la ingesta
+            (DEC-003): juez por fuente → staging → curación T1 → política de
+            promoción → main. ``None`` (default) → ``ctx.corpus_dir``
+            (comportamiento legacy: directo al corpus dado). El retrieval de
+            la respuesta final sigue consultando ``ctx.corpus_dir`` (main)
+            y suma los hits del staging recién ingerido.
+        on_progress: Callback opcional ``(phase, detail: dict)`` invocado en
+            cada transición de fase — search → judge → scrape (por URL) →
+            ingest → embed → retrieval. Best-effort: las excepciones del
+            callback se tragan, nunca cortan la investigación.
 
     Returns:
         (ToolCall, ToolResult, ResearchResult) — contract records + structured output.
@@ -322,6 +454,10 @@ def execute_research(
         raise ValueError(f"freshness must be 'lenient' or 'strict', got: {freshness!r}")
     if judge is None:
         judge = HeuristicJudge()
+    if landing_dir is None:
+        landing_dir = _research_run_dir(query)
+    if max_ingest_seconds is None:
+        max_ingest_seconds = DEFAULT_INGEST_BUDGET_S
 
     call_id = f"tool_call:{_compact_stamp()}"
     result_id = f"tool_result:{_compact_stamp()}"
@@ -330,6 +466,13 @@ def execute_research(
 
     research = ResearchResult(query=query)
     judgments: list[SourceJudgment] = []
+
+    def _emit(phase: str, **detail: Any) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(phase, detail)
+            except Exception:
+                pass
 
     try:
         # 1. URLs embebidas en la query (pegadas por el usuario, o reinyectadas
@@ -358,21 +501,48 @@ def execute_research(
                 judge="heuristic", confidence=1.0,
             ))
 
-        # 1a. Web search sobre el remanente textual
-        search_summary = search_web(judge_query, max_results=max_urls * 3, timeout=15)
-        research.search_results_count = len(search_summary.results)
+        # 1a. Web search sobre el remanente textual + sub-queries del
+        #     agente. Cada sub-query es una faceta del mismo tema: corre su
+        #     propia búsqueda y sus resultados entran al pool deduplicado
+        #     por URL, recordando qué query los produjo (el prefilter y el
+        #     juicio se hacen contra esa query, no contra la principal).
+        sub_queries = [
+            s.strip() for s in (sub_queries or [])
+            if isinstance(s, str) and s.strip() and s.strip() != judge_query
+        ][:8]
 
-        # Con seeds, un fallo de búsqueda no invalida la investigación: las
-        # fuentes explícitas se procesan igual (se registra el error).
-        if search_summary.error and not seed_results:
-            raise RuntimeError(f"web search failed: {search_summary.error}")
-        if search_summary.error:
+        summaries: list[tuple[str, SearchSummary]] = [
+            (judge_query, search_web(judge_query, max_results=max_urls * 3, timeout=15)),
+        ]
+        for sq in sub_queries:
+            summaries.append((sq, search_web(sq, max_results=max_urls, timeout=15)))
+
+        result_query: dict[str, str] = {}
+        merged_results: list[SearchResult] = []
+        search_errors: list[str] = []
+        for q, summary in summaries:
+            if summary.error:
+                search_errors.append(f"{q}: {summary.error}")
+                continue
+            for r in summary.results:
+                if r.url not in result_query:
+                    result_query[r.url] = q
+                    merged_results.append(r)
+        research.search_results_count = len(merged_results)
+        _emit("search", results=len(merged_results), seeds=len(seed_results),
+              sub_queries=len(sub_queries), errors=len(search_errors))
+
+        # Con seeds o resultados de alguna sub-query, un fallo de búsqueda
+        # no invalida la investigación (se registra el error igual).
+        if search_errors and not merged_results and not seed_results:
+            raise RuntimeError(f"web search failed: {search_errors[0]}")
+        for err in search_errors:
             judgments.append(SourceJudgment(
                 url="(web search)", stage="search", verdict="error",
-                reason=search_summary.error, judge="heuristic",
+                reason=err, judge="heuristic",
             ))
 
-        candidates = search_summary.results
+        candidates = merged_results
         if allowed_domains:
             allowed_lower = {d.lower() for d in allowed_domains}
             candidates = [r for r in candidates if any(d in r.domain.lower() for d in allowed_lower)]
@@ -383,20 +553,31 @@ def execute_research(
         #    only send plausible candidates to the LLM (cheap → expensive).
         prefiltered = [
             r for r in candidates
-            if _snippet_relevance(judge_query, r.title, r.snippet) >= SNIPPET_RELEVANCE_THRESHOLD
+            if _snippet_relevance(result_query.get(r.url, judge_query), r.title, r.snippet)
+            >= SNIPPET_RELEVANCE_THRESHOLD
         ]
         if not prefiltered and not seed_results:
             raise RuntimeError("no search results passed the deterministic snippet pre-filter")
 
-        snippet_payloads = [
-            {"url": r.url, "title": r.title, "snippet": r.snippet} for r in prefiltered
-        ]
-        snippet_judgments = judge.judge_snippets(judge_query, snippet_payloads) if snippet_payloads else []
-        for payload, j in zip(snippet_payloads, snippet_judgments):
-            judgments.append(SourceJudgment(
-                url=payload["url"], stage="snippet", verdict=j.verdict,
-                reason=j.reason, judge=j.judge, confidence=j.confidence,
-            ))
+        # El juicio de snippets se hace por faceta: un candidato producido
+        # por una sub-query se evalúa contra esa sub-query, no contra la
+        # query principal (vocabulario de faceta ≠ vocabulario del tema).
+        snippet_judgments: list[Any] = [None] * len(prefiltered)
+        by_query: dict[str, list[int]] = {}
+        for i, r in enumerate(prefiltered):
+            by_query.setdefault(result_query.get(r.url, judge_query), []).append(i)
+        for q, idxs in by_query.items():
+            payloads = [
+                {"url": prefiltered[i].url, "title": prefiltered[i].title,
+                 "snippet": prefiltered[i].snippet}
+                for i in idxs
+            ]
+            for i, j in zip(idxs, judge.judge_snippets(q, payloads)):
+                snippet_judgments[i] = j
+                judgments.append(SourceJudgment(
+                    url=prefiltered[i].url, stage="snippet", verdict=j.verdict,
+                    reason=j.reason, judge=j.judge, confidence=j.confidence,
+                ))
 
         # Retry buffer: iterate ALL snippet-accepted candidates in relevance
         # order. max_urls counts successful ingestions, not attempts — when a
@@ -406,8 +587,10 @@ def execute_research(
         # candidatos aceptados por snippet — sin duplicar URLs ya seedeadas.
         accepted_candidates = seed_results + [
             result for result, j in zip(prefiltered, snippet_judgments)
-            if j.verdict == "accept" and result.url not in seed_url_set
+            if j is not None and j.verdict == "accept" and result.url not in seed_url_set
         ]
+        _emit("judge", candidates=len(prefiltered),
+              accepted=len(accepted_candidates), seeds=len(seed_results))
         if not accepted_candidates:
             raise RuntimeError("agent rejected all search results at the snippet stage")
 
@@ -431,6 +614,8 @@ def execute_research(
         rejection_reasons: list[str] = []
 
         for result in accepted_candidates:
+            _emit("scrape", done=attempted_count, total=len(accepted_candidates),
+                  accepted=scraped_count, rejected=rejected_count)
             if scraped_count >= max_urls:
                 break  # budget: successful ingestions reached
             if time.monotonic() - t0 > max_seconds:
@@ -461,7 +646,10 @@ def execute_research(
                     ))
 
                 # Deterministic scaffold first (cheap): structure + date.
-                quality, reason = _content_quality(scrape_result.text, judge_query)
+                # El candidato se evalúa contra la query que lo produjo
+                # (faceta), no contra la query principal.
+                effective_query = result_query.get(result.url, judge_query)
+                quality, reason = _content_quality(scrape_result.text, effective_query)
                 if quality < CONTENT_QUALITY_THRESHOLD:
                     rejected_count += 1
                     msg = f"{result.url}: {reason} (quality={quality:.2f})"
@@ -499,7 +687,7 @@ def execute_research(
                 # heuristic fallback). This is the direct-reading capability:
                 # the text never needs to be ingested first to be evaluated.
                 content_judgment: Judgment = judge.judge_content(
-                    judge_query, scrape_result.title or result.title, scrape_result.text,
+                    effective_query, scrape_result.title or result.title, scrape_result.text,
                     age_days=age_days,
                 )
                 judgments.append(SourceJudgment(
@@ -565,6 +753,8 @@ def execute_research(
                 ))
                 continue  # research is best-effort per URL
 
+        _emit("scrape", done=attempted_count, total=len(accepted_candidates),
+              accepted=scraped_count, rejected=rejected_count)
         research.web_sources = web_sources
         research.scraped_count = scraped_count
         research.rejected_count = rejected_count
@@ -577,98 +767,261 @@ def execute_research(
                 + ("; ".join(rejection_reasons[:3]) if rejection_reasons else "all scrapes failed")
             )
 
-        # 4. Ingestion — FastPath over the landing directory (accepted only,
-        #    because rejected content was never saved).
+        # 4. Ingestion — FastPath over THIS run's private work dir (accepted
+        #    only: rejected content was never saved). Ingesta + embeddings son
+        #    la fase pesada: corren bajo el lock de trabajos pesados (prioridad
+        #    interactiva) y con budget propio, para no quedar detrás de un job
+        #    de background ni heredar su carga (PM-004).
         ingested = 0
         embedded = 0
-        if ctx.corpus_dir:
-            try:
-                from ipa.ingestion.fast_path import FastPathRunner
-                corpus = Path(ctx.corpus_dir)
-                runner = FastPathRunner(
-                    landing_db=str(corpus / "landing.db"),
-                    store_db=str(corpus / "document_store.db"),
-                    index_db=str(corpus / "bm25_index.db"),
-                    landing_root=str(landing_dir),
-                )
-                results = runner.ingest_directory(str(landing_dir), progress=False, skip_indexed=True)
-                ingested = sum(1 for r in results if r.document_id is not None)
-                runner.close()
+        ingest_budget_used: dict[str, Any] = {
+            "max_ingest_seconds": max_ingest_seconds,
+            "heavy_lock_acquired": False,
+            "heavy_wait_seconds": 0.0,
+        }
+        heavy_wait_state: dict[str, Any] = {"seconds": 0.0, "holder": None}
 
-                # 4a. Record provenance — agent research documents get
-                #     provenance="agent_research" so the promotion policy
-                #     applies the score threshold (>= 0.70).
-                if ingested > 0:
-                    try:
-                        import sqlite3 as _sql3
-                        from ipa.storage.document_store import DocumentStore
-                        from ipa.ingestion.provenance import record_agent_research
-                        agent_store = DocumentStore(corpus / "document_store.db")
-                        try:
-                            # Build source_uri → web_source URL map from landing zone
-                            landing_conn = _sql3.connect(str(corpus / "landing.db"))
-                            try:
-                                art_rows = landing_conn.execute(
-                                    "SELECT artifact_id, source_uri FROM artifacts"
-                                ).fetchall()
-                            finally:
-                                landing_conn.close()
-
-                            # Build artifact_id → source_uri
-                            art_to_uri = {row[0]: row[1] for row in art_rows}
-
-                            # For each ingested result, find matching web_source
-                            for r in results:
-                                if r.document_id is None or not r.artifact_id:
-                                    continue
-                                source_uri = art_to_uri.get(r.artifact_id, "")
-                                if not source_uri:
-                                    continue
-                                # Match web_source by URL contained in the source_uri path
-                                matched_url = ""
-                                for ws in web_sources:
-                                    if ws.source_url and ws.source_url in source_uri:
-                                        matched_url = ws.source_url
-                                        break
-                                if not matched_url and web_sources:
-                                    # Fallback: use the first web_source
-                                    matched_url = web_sources[0].source_url
-                                if matched_url:
-                                    record_agent_research(
-                                        agent_store, r.document_id, matched_url,
-                                    )
-                        finally:
-                            agent_store.close()
-                    except Exception:
-                        pass  # non-fatal; provenance is best-effort
-            except Exception:
-                pass  # non-fatal; web_sources are still valid
-
-            # 4b. Embedding — index the new chunks into LanceDB so retrieval
-            #     uses dense vectors, not only the BM25 fallback.
-            if ingested > 0:
+        def _on_heavy_wait(elapsed_s: float, current: dict[str, Any] | None) -> None:
+            heavy_wait_state["seconds"] = elapsed_s
+            heavy_wait_state["holder"] = (current or {}).get("kind")
+            if on_heavy_wait is not None:
                 try:
-                    embedded = _embed_new_chunks(corpus, ctx)
+                    on_heavy_wait(elapsed_s, current)
                 except Exception:
-                    pass  # non-fatal; BM25 retrieval still works
+                    pass
+
+        ingest_phase_start = time.monotonic()
+        # DEC-003: la research aterriza en el staging corpus — la promoción a
+        # main la decide la curación T1 + promotion_policy, no el juez de
+        # fuentes. URLs semilla (pegadas por el usuario) se marcan
+        # provenance="user_provided" → auto-promoción como configured_scrape.
+        ingest_corpus_dir = staging_corpus_dir or ctx.corpus_dir
+        if ingest_corpus_dir:
+            from ipa.agentic import heavy_lock
+
+            _emit("ingest")
+            with heavy_lock.heavy_phase(
+                    "research_ingest", heavy_lock.PRIORITY_INTERACTIVE,
+                    wait_s=heavy_lock.DEFAULT_WAIT_S,
+                    on_wait=_on_heavy_wait) as held:
+                ingest_budget_used["heavy_lock_acquired"] = held
+                ingest_budget_used["heavy_wait_seconds"] = round(heavy_wait_state["seconds"], 2)
+                ingest_budget_used["heavy_lock_holder"] = heavy_wait_state["holder"]
+                ingest_deadline = time.monotonic() + float(max_ingest_seconds)
+                run_document_ids: set[str] = set()
+                try:
+                    from ipa.ingestion.fast_path import FastPathRunner
+                    corpus = Path(ingest_corpus_dir)
+                    corpus.mkdir(parents=True, exist_ok=True)
+                    runner = FastPathRunner(
+                        landing_db=str(corpus / "landing.db"),
+                        store_db=str(corpus / "document_store.db"),
+                        index_db=str(corpus / "bm25_index.db"),
+                        landing_root=str(landing_dir),
+                    )
+                    results = runner.ingest_directory(str(landing_dir), progress=False, skip_indexed=True)
+                    ingested = sum(1 for r in results if r.document_id is not None)
+                    run_document_ids = {r.document_id for r in results if r.document_id}
+                    runner.close()
+                    _emit("ingest", docs=ingested)
+
+                    # 4a. Record provenance — agent research documents get
+                    #     provenance="agent_research" so the promotion policy
+                    #     applies the score threshold (>= 0.70).
+                    if ingested > 0:
+                        try:
+                            import sqlite3 as _sql3
+                            from ipa.storage.document_store import DocumentStore
+                            from ipa.ingestion.provenance import record_agent_research
+                            _seed_norm = {u.rstrip("/") for u in seed_url_set}
+                            agent_store = DocumentStore(corpus / "document_store.db")
+                            try:
+                                # Build source_uri → web_source URL map from landing zone
+                                landing_conn = _sql3.connect(str(corpus / "landing.db"))
+                                try:
+                                    art_rows = landing_conn.execute(
+                                        "SELECT artifact_id, source_uri FROM artifacts"
+                                    ).fetchall()
+                                finally:
+                                    landing_conn.close()
+
+                                # Build artifact_id → source_uri
+                                art_to_uri = {row[0]: row[1] for row in art_rows}
+
+                                # For each ingested result, resolve its real
+                                # URL. El header "Source:" del artefacto es
+                                # autoritativo: source_uri es el path LOCAL
+                                # (slugs con '-'), así que el match URL-en-path
+                                # casi nunca disparaba y el viejo fallback
+                                # (web_sources[0]) asignaba una URL ajena —
+                                # eso corrompió document_sources y el dedupe
+                                # tombstoneó 373 docs legítimos (repair
+                                # 2026-09-23). Sin URL → no registrar nada.
+                                for r in results:
+                                    if r.document_id is None or not r.artifact_id:
+                                        continue
+                                    source_uri = art_to_uri.get(r.artifact_id, "")
+                                    if not source_uri:
+                                        continue
+                                    matched_url = _source_url_from_artifact(source_uri)
+                                    if not matched_url:
+                                        for ws in web_sources:
+                                            if ws.source_url and ws.source_url in source_uri:
+                                                matched_url = ws.source_url
+                                                break
+                                    if matched_url:
+                                        # URL semilla = pegada por el usuario
+                                        # → fuente conocida (auto-promoción);
+                                        # el resto → agent_research (gate
+                                        # promotion_score >= 0.70 en T1).
+                                        _prov = (
+                                            "user_provided"
+                                            if matched_url.rstrip("/") in _seed_norm
+                                            else "agent_research"
+                                        )
+                                        record_agent_research(
+                                            agent_store, r.document_id, matched_url,
+                                            provenance=_prov,
+                                        )
+                            finally:
+                                agent_store.close()
+                        except Exception:
+                            pass  # non-fatal; provenance is best-effort
+                except Exception:
+                    pass  # non-fatal; web_sources are still valid
+
+                # Señales Tier 0: doc metadata derivada (hash/title/fecha) +
+                # flag de duplicado exacto vs main — mismas señales que el
+                # pipeline, así T1 no las re-deriva en cada ciclo idle.
+                if run_document_ids:
+                    try:
+                        from ipa.ingestion.ingest_metadata import record_ingest_metadata
+                        from ipa.agent.system_tools import _main_corpus_dir
+                        _run_store = DocumentStore(corpus / "document_store.db")
+                        try:
+                            _main_path = _main_corpus_dir()
+                            _ms = (DocumentStore(_main_path / "document_store.db")
+                                   if _main_path and _main_path != corpus else None)
+                            try:
+                                record_ingest_metadata(
+                                    _run_store, run_document_ids,
+                                    main_store=_ms)
+                            finally:
+                                if _ms is not None:
+                                    _ms.close()
+                        finally:
+                            _run_store.close()
+                        # Flag "corpus changed" para el gate de topify.
+                        try:
+                            from ipa.agentic.topic_clusters import TopicClusterStore
+                            _cs = TopicClusterStore()
+                            try:
+                                _cs.set_meta(f"dirty:{corpus.resolve()}", "1")
+                            finally:
+                                _cs.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass  # non-fatal; T1 backfill sigue como fallback
+
+                # 4b. Embedding — only THIS run's chunks (document_ids) into
+                #     LanceDB so retrieval uses dense vectors, not only the
+                #     BM25 fallback. Batched y con deadline: el embed de un
+                #     corpus entero no tenía corte (PM-004).
+                if ingested > 0:
+                    _emit("embed")
+                    try:
+                        embedded = _embed_new_chunks(
+                            corpus, ctx, document_ids=run_document_ids,
+                            deadline=ingest_deadline)
+                    except Exception:
+                        pass  # non-fatal; BM25 retrieval still works
+                    _emit("embed", chunks=embedded)
+        ingest_budget_used["ingest_elapsed_seconds"] = round(
+            time.monotonic() - ingest_phase_start, 2)
+        ingest_budget_used["ingest_budget_exceeded"] = (
+            time.monotonic() - ingest_phase_start > float(max_ingest_seconds))
+
+        # Backlog residual de embeddings en el staging (< umbral del lote GPU
+        # o cortado por el deadline): la promoción DEFIERE hasta que cada
+        # chunk vivo tenga vector en main (PM-004), así que un remanente sin
+        # productor dejaría la cola esperando vectores que nadie genera. El
+        # drain standalone corre post heavy_phase, sin compartir escritor
+        # con la ingesta.
+        if ingest_corpus_dir and ingested > 0:
+            try:
+                from ipa.agent.system_tools import _spawn_embed_drain
+                _spawn_embed_drain(Path(ingest_corpus_dir))
+            except Exception:
+                pass  # non-fatal; la cola de promoción reintenta en ciclos T1
 
         research.ingested_count = ingested
         research.embedded_count = embedded
 
         # 5. Retrieval with citations over the corpus (now including new material)
         retrieval_hits = []
-        if ctx.corpus_dir and ingested > 0:
-            try:
-                from ipa.agent.agent_tools import _search_corpus
-                result_dict, _ = _search_corpus({"query": judge_query, "limit": 5}, ctx)
-                retrieval_hits = result_dict.get("hits", [])
-            except Exception as exc:
-                research._retrieval_error = str(exc)  # non-fatal
+        if ingest_corpus_dir and ingested > 0:
+            _emit("retrieval")
+            _stage_path = Path(ingest_corpus_dir)
+            _main_path = Path(ctx.corpus_dir) if ctx.corpus_dir else None
+            _staged = (_main_path is None
+                       or _stage_path.resolve() != _main_path.resolve())
+            if _staged:
+                # El material nuevo vive en staging hasta que T1 lo promueva —
+                # BM25 directo (recién construido por FastPath), sin cargar un
+                # segundo embedding adapter ni depender de que el embed haya
+                # terminado.
+                try:
+                    from ipa.indexes.bm25_index import BM25Index
+                    from ipa.storage.document_store import DocumentStore
+                    _s_store = DocumentStore(_stage_path / "document_store.db")
+                    _s_bm25 = BM25Index(_stage_path / "bm25_index.db")
+                    try:
+                        _seen_doc: set[str] = set()
+                        for hit in _s_bm25.search(judge_query, limit=5):
+                            _ch = _s_store.get_chunk(hit.chunk_id)
+                            _did = _ch.document_id if _ch else "unknown"
+                            if _did in _seen_doc:
+                                continue
+                            _seen_doc.add(_did)
+                            _src = ((_s_store.get_source(_did)
+                                     if _did != "unknown" else None) or {})
+                            _txt = _ch.text if _ch else ""
+                            retrieval_hits.append({
+                                "chunk_id": hit.chunk_id,
+                                "document_id": _did,
+                                "score": round(hit.score, 4),
+                                "retrieval_backend": "staging_bm25",
+                                "published_at": (_s_store.document_stored_at(_did)
+                                                 if _did != "unknown" else None),
+                                "source_domain": _src.get("source_domain"),
+                                "provenance": _src.get("provenance"),
+                                "text_preview": ((_txt[:200] + "...")
+                                                 if len(_txt) > 200 else _txt),
+                            })
+                    finally:
+                        _s_bm25.close()
+                        _s_store.close()
+                except Exception:
+                    pass  # non-fatal; el retrieval de main abajo sigue valiendo
+            if ctx.corpus_dir:
+                try:
+                    from ipa.agent.agent_tools import _search_corpus
+                    result_dict, _ = _search_corpus(
+                        {"query": judge_query, "limit": 5}, ctx)
+                    _covered = {h.get("document_id") for h in retrieval_hits}
+                    for h in result_dict.get("hits", []):
+                        if h.get("document_id") not in _covered:
+                            retrieval_hits.append(h)
+                except Exception as exc:
+                    research._retrieval_error = str(exc)  # non-fatal
 
         research.retrieval_hits = retrieval_hits
+        _emit("retrieval", hits=len(retrieval_hits))
         research.budget_used = {
             "max_urls": max_urls,
             "max_seconds": max_seconds,
+            "sub_queries": sub_queries,
             "elapsed_seconds": round(time.monotonic() - t0, 2),
             "urls_searched": research.search_results_count,
             "seed_urls": len(seed_results),
@@ -678,10 +1031,14 @@ def execute_research(
             "urls_rejected": rejected_count,
             "urls_ingested": ingested,
             "chunks_embedded": embedded,
+            "work_dir": str(landing_dir),
+            "ingest_corpus": str(ingest_corpus_dir) if ingest_corpus_dir else None,
+            "ingest": ingest_budget_used,
         }
 
         result_dict = {
             "query": query,
+            "sub_queries": sub_queries,
             "web_sources": [ws.web_source_id for ws in web_sources],
             "web_source_details": [ws.to_contract() for ws in web_sources],
             "search_results_count": research.search_results_count,
@@ -704,7 +1061,8 @@ def execute_research(
             tool_call_id=call_id, session_id=session_id, episode_id=episode_id,
             tool_name="research_topic",
             arguments={"query": query, "max_urls": max_urls, "max_seconds": max_seconds,
-                       "freshness": freshness, "max_age_days": max_age_days},
+                       "freshness": freshness, "max_age_days": max_age_days,
+                       "sub_queries": sub_queries},
             called_at=started, status="completed",
         )
         result = ToolResult(
@@ -731,7 +1089,8 @@ def execute_research(
             tool_call_id=call_id, session_id=session_id, episode_id=episode_id,
             tool_name="research_topic",
             arguments={"query": query, "max_urls": max_urls, "max_seconds": max_seconds,
-                       "freshness": freshness, "max_age_days": max_age_days},
+                       "freshness": freshness, "max_age_days": max_age_days,
+                       "sub_queries": sub_queries},
             called_at=started, status="failed", error=error_msg,
         )
         result = ToolResult(

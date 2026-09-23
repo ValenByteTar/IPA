@@ -3,13 +3,14 @@ id: PM-002
 category: postmortem
 status: accepted
 created: 2026-09-06
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [provenance, benchmarks, eks]
 tags: [provenance, raw-outputs, cleanup, reproducibility, benchmarks]
 related: [BM-001, BM-002, BM-003, BM-004, BM-005, EXP-001, EXP-002, RES-001]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/storage/**", "src/ipa/ingestion/provenance.py"]
 ---
 
 # PM-002 — Pérdida de artefactos crudos de benchmarks históricos (E0-E11)

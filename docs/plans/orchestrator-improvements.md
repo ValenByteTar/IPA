@@ -26,5 +26,12 @@ exponential backoff (`run_job_with_retry`, `--retries`/`--backoff`), backpressur
 via bounded resource slots (`acquire_slot`/`release_slot`, `--resource`/
 `--max-concurrent`), and the per-line idle fix that makes stuck detection
 functional at runner level. Independent lifecycle states per job remain
-spec-level (one state file per job). Pending for `preferred`: operational
-mileage of real orchestrator jobs running with retries and resource slots.
+spec-level (one state file per job).
+
+**Superseded (2026-09-22)**: the "operational mileage" pending item is closed
+as superseded — the console orchestrator chain (scraper → fast_path → lancedb →
+hammer → enrichment) was deprecated in v0.1.2. Jobs now launch from the
+dashboard and background LLM work runs through the idle scheduler (Tiers 1/2),
+which is where production mileage accrues. The mechanisms verified by EXP-005
+(atomic lock, heartbeat, retries, resource slots) remain available in
+`run_job_with_retry`/`acquire_slot` for any future process that needs them.

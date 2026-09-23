@@ -81,9 +81,12 @@ class Orchestrator:
             try:
                 existing = json.loads(ORCHESTRATOR_LOCK.read_text(encoding="utf-8"))
                 pid = int(existing.get("pid", 0))
+                no_window = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+                             if os.name == "nt" else 0)
                 if pid and subprocess.run(
                     ["tasklist", "/FI", f"PID eq {pid}"],
                     capture_output=True, text=True, check=False,
+                    creationflags=no_window,
                 ).stdout.find(str(pid)) >= 0:
                     raise RuntimeError(
                         f"Another orchestrator is already running (pid={pid}, "

@@ -3,13 +3,15 @@ id: PAT-004
 category: pattern
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [agentic_runtime, planner, retrieval, context, evaluation]
 tags: [bounded-loop, query-ir, evidence-set, context-package, citations]
 related: [EXP-003]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agent/research_executor.py", "tests/test_agentic_runtime.py"]
+affects: ["src/ipa/agentic/**", "src/ipa/agent/research_executor.py"]
 ---
 
 # PAT-004 — Context agentivo acotado

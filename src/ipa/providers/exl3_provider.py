@@ -330,45 +330,12 @@ def query_gpu_info() -> dict:
 # ---------------------------------------------------------------------------
 
 def _unload_ollama_models(timeout_s: float = 20.0) -> None:
-    """Pide a Ollama que descargue sus modelos (libera VRAM para ExL3).
-
-    El dashboard puede haber recargado qwen3.5 en background; sin esto, la
-    carga de ExL3 muere con "Insufficient VRAM in split for model and cache".
-    La liberación es async (el llama-server tarda unos segundos en devolver
-    la VRAM): hay que esperar a que /api/ps quede vacío antes de medir la
-    libre para el split.
-    """
-    import json as _json
-    import urllib.request as _ur
-    base = os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    """Compatibility wrapper over the shared Ollama VRAM release routine."""
+    from .ollama_provider import unload_ollama_models
     try:
-        with _ur.urlopen(f"{base}/api/ps", timeout=3) as resp:
-            loaded = _json.loads(resp.read()).get("models", [])
+        unload_ollama_models(timeout_s=timeout_s)
     except Exception:
-        return
-    if not loaded:
-        return
-    for m in loaded:
-        name = m.get("name") or m.get("model")
-        if not name:
-            continue
-        body = _json.dumps({"model": name, "keep_alive": 0}).encode()
-        req = _ur.Request(f"{base}/api/generate", data=body,
-                          headers={"Content-Type": "application/json"})
-        try:
-            with _ur.urlopen(req, timeout=15):
-                pass
-        except Exception:
-            pass
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        time.sleep(0.5)
-        try:
-            with _ur.urlopen(f"{base}/api/ps", timeout=3) as resp:
-                if not _json.loads(resp.read()).get("models", []):
-                    return
-        except Exception:
-            return  # server caído: no hay nada que liberar
+        pass
 
 
 class ExL3Provider:
@@ -469,9 +436,19 @@ class ExL3Provider:
 
     def load(self) -> float:
         """Carga el modelo en GPU. Retorna segundos de carga."""
-        # Lock de VRAM: ExL3 y Ollama no conviven en 6 GB. Si otro motor lo
-        # tiene, fallamos claro en vez de morir con OOM a mitad de generación.
+        # Si Ollama está generando, esperar a que cierre su lease antes de
+        # descargar el modelo server-side. Un batch de embeddings o una segunda
+        # instancia ExL3, en cambio, conserva prioridad/ownership y hace fallar
+        # este load con un error claro.
         from . import vram_lock
+        deadline = time.monotonic() + 300
+        while True:
+            holder = vram_lock.holder()
+            if holder is None or holder.get("owner") != "ollama":
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Ollama sigue usando la VRAM; ExL3 no inició la carga")
+            time.sleep(0.2)
         if not vram_lock.acquire("exl3"):
             h = vram_lock.holder() or {}
             raise RuntimeError(

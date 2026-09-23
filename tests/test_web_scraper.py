@@ -623,6 +623,39 @@ class TestDownloadDocuments:
             assert "doc1.pdf" in content
             assert "doc2.docx" in content
 
+    def test_save_article_manifest_uses_basenames_only(self, tmp_path):
+        """Regression: absolute local paths must never reach the saved text.
+
+        Run dirs like ".../20260923t170315875100-jev-llm-architecture" carried
+        query-matching tokens — BM25 ranked those manifest chunks first for
+        the query and retrieval surfaced paths instead of content
+        (repair 2026-09-23). Only basenames belong in the file; the
+        authoritative full-path list lives in scrape_report.json.
+        """
+        abs_paths = [
+            "C:\\Users\\X\\run\\20260923t170315875100-jev-llm-architecture\\arxiv_1706.03762.pdf",
+            "/home/user/run/20260923t170315875100-jev-llm-architecture/notes.docx",
+        ]
+        with WebScraper(output_dir=tmp_path) as s:
+            result = ScrapeResult(
+                url="https://example.com/news/test",
+                title="Test Article",
+                text="Article content.",
+                document_paths=abs_paths,
+            )
+            filepath = s.save_article(result)
+            content = filepath.read_text(encoding="utf-8")
+            assert "arxiv_1706.03762.pdf" in content
+            assert "notes.docx" in content
+            # No run-dir slugs or absolute path fragments leaked into text.
+            assert "jev-llm-architecture" not in content
+            assert "Users\\X" not in content
+            assert "/home/user" not in content
+            for line in content.splitlines():
+                if line.startswith("[Document "):
+                    assert "\\" not in line
+                    assert line.count("/") == 0
+
 
 class TestArxivLinkFollowing:
     """Tests for arxiv link detection and PDF download."""

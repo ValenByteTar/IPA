@@ -6,7 +6,7 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ipa.reporter.reporter_contracts import ReporterDecision, ReporterDocumentDecision, ReviewStatus, ScoreBundle, generation_provenance
@@ -149,6 +149,18 @@ def classify_tiers(
     return tiers
 
 
+def _bounded_float(raw: Any, fallback: float) -> float:
+    """float(raw) clamped to [0,1]; fallback on non-numeric input.
+
+    quality_score/max_cosine/LLM judge values can arrive as strings
+    ('significant', 'high') from upstream classifiers — one unparseable
+    value used to abort the whole curation batch."""
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return fallback
+
+
 def promotion_score(scores: ScoreBundle) -> float:
     return round(0.30 * scores.relevance + 0.20 * scores.novelty + 0.20 * scores.source_quality + 0.15 * scores.impact + 0.10 * scores.depth + 0.05 * scores.actionability, 4)
 
@@ -200,10 +212,16 @@ _ACTION_VERBS = re.compile(
 def _in_period(value: str | None, start: str, end: str) -> bool:
     if not value or not start or not end:
         return True
+
+    def _parse(raw: str):
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        # Fechas naive ("2026-09-10", típicas de trafilatura) se interpretan
+        # UTC — comparar naive vs aware lanza TypeError fuera del try.
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
     try:
-        current = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return datetime.fromisoformat(start.replace("Z", "+00:00")) <= current < datetime.fromisoformat(end.replace("Z", "+00:00"))
-    except ValueError:
+        return _parse(start) <= _parse(value) < _parse(end)
+    except (ValueError, TypeError):
         return False
 
 
@@ -222,8 +240,10 @@ def curate_documents(
     interest_embeddings: list[list[float]] | None = None,
     historical_embeddings: list[list[float]] | None = None,
     known_url_hashes: dict[str, str] | None = None,
+    novelty_hints: dict[str, dict] | None = None,
 ) -> list[ReporterDocumentDecision]:
     historical_documents = historical_documents or []
+    novelty_hints = novelty_hints or {}
     document_embeddings = document_embeddings or {}
     interest_embeddings = interest_embeddings or []
     historical_embeddings = historical_embeddings or []
@@ -251,14 +271,19 @@ def curate_documents(
     _hist_mat = _norm_rows(historical_embeddings)
     _interest_mat = _norm_rows(interest_embeddings)
 
-    def _max_cosine(emb: list[float], mat: "_np.ndarray | None") -> float:
+    def _max_cosine(emb: list[float], mat: "_np.ndarray | None") -> tuple[float, int | None]:
+        """Return (max cosine, index of the matching row) — index needed so
+        the novelty gate can confirm lexical overlap against the matched
+        historical document's text."""
         if mat is None:
-            return 0.0
+            return 0.0, None
         d = _np.asarray(emb, dtype=_np.float32)
         n = _np.linalg.norm(d)
         if n == 0:
-            return 0.0
-        return float((mat @ (d / n)).max())
+            return 0.0, None
+        sims = mat @ (d / n)
+        idx = int(sims.argmax())
+        return float(sims[idx]), idx
     decisions: list[ReporterDocumentDecision] = []
     llm_progress_callback = None
     if progress_callback is not None:
@@ -272,24 +297,44 @@ def curate_documents(
         text = str(document.get("text", ""))
         url = str(document.get("canonical_url") or document.get("source_url") or "")
         content_hash = str(document.get("content_hash") or normalized_hash(text))
-        score = float(document.get("quality_score") or 0.0)
+        # Hash normalizado consistente con known_url_hashes (Tier 0 lo
+        # persiste en document_metadata; antes se comparaba contra
+        # sha256(text)[:32] — formato distinto, nunca matcheaba).
+        norm_hash = str(document.get("normalized_hash") or normalized_hash(text))
+        score = _bounded_float(document.get("quality_score"), 0.0)
         domain = str(document.get("source_domain") or "")
         doc_emb = document_embeddings.get(document_id)
+        hint = novelty_hints.get(document_id)
 
         # --- Relevance: cosine similarity with interest embeddings (semantic) ---
         if doc_emb and _interest_mat is not None:
             # Clamp: floating-point cosine can exceed [0,1] by epsilon and
             # one out-of-range score aborts the whole curation batch.
-            relevance = max(0.0, min(1.0, _max_cosine(doc_emb, _interest_mat)))
+            relevance = max(0.0, min(1.0, _max_cosine(doc_emb, _interest_mat)[0]))
         elif not interests:
             relevance = 0.5
         else:
             relevance = min(1.0, 0.3 + 0.2 * sum(1 for term in interests if term.lower() in (document.get("title", "") + " " + text).lower()))
 
         # --- Novelty: cosine distance to historical embeddings (semantic) ---
-        if doc_emb and _hist_mat is not None:
-            novelty = max(0.0, min(1.0, 1.0 - _max_cosine(doc_emb, _hist_mat)))
+        # Un novelty_hint precomputado (Tier 0, post-drain) reemplaza la
+        # búsqueda contra toda la matriz histórica: mismo valor, sin cargarla.
+        hint_text = ""
+        hint_doc_id: Any = None
+        if hint is not None:
+            novelty_via_embedding = True
+            hist_sim = _bounded_float(hint.get("max_cosine"), 0.0)
+            hist_idx = None
+            hint_text = str(hint.get("nearest_text") or "")
+            hint_doc_id = hint.get("nearest_doc_id")
+            novelty = max(0.0, min(1.0, 1.0 - hist_sim))
+        elif doc_emb and _hist_mat is not None:
+            novelty_via_embedding = True
+            hist_sim, hist_idx = _max_cosine(doc_emb, _hist_mat)
+            novelty = max(0.0, min(1.0, 1.0 - hist_sim))
         else:
+            novelty_via_embedding = False
+            hist_idx = None
             novelty = 1.0 - max((_lexical_similarity(text, old.get("text", "")) for old in historical_documents), default=0.0)
 
         # --- Source quality: domain trust + scraper score ---
@@ -320,7 +365,7 @@ def curate_documents(
             decision, reason = ReporterDecision.INSUFFICIENT_EVIDENCE, "El documento no contiene texto utilizable."
         elif score and score < quality_threshold:
             decision, reason = ReporterDecision.IRRELEVANT, "El quality gate del scraper estÃ¡ por debajo del umbral."
-        elif url and url in known_url_hashes and content_hash == known_url_hashes[url]:
+        elif url and url in known_url_hashes and norm_hash == known_url_hashes[url]:
             # Identical re-download: same canonical URL AND same normalized
             # content as an already-approved main document. Only this exact
             # case is a duplicate — a same-URL document with different
@@ -333,30 +378,53 @@ def curate_documents(
             decision, duplicate_of, reason = (
                 ReporterDecision.DUPLICATE, by_url[url],
                 "Canonical URL duplicada.")
-        elif content_hash in by_hash:
-            decision, duplicate_of, reason = ReporterDecision.DUPLICATE, by_hash[content_hash], "Content hash duplicado."
+        elif norm_hash in by_hash:
+            decision, duplicate_of, reason = ReporterDecision.DUPLICATE, by_hash[norm_hash], "Content hash duplicado."
         elif relevance < 0.3:
             decision, reason = ReporterDecision.REPORTER_ONLY, "Relevancia baja para los intereses configurados; se conserva para anÃ¡lisis neutral."
         elif novelty < 0.05:
-            # Near-identical content (>0.95 cosine to a historical document):
-            # a re-download with cosmetic differences. Distinct articles of
-            # the same domain routinely reach 0.8+ similarity (shared
-            # boilerplate) — flagging those as duplicates discarded genuine
-            # new content at scale, so the gate only fires near-identical.
-            decision, reason = ReporterDecision.DUPLICATE, "Contenido casi idÃ©ntico al corpus histÃ³rico."
+            # Near-identical embedding (>0.95 cosine to a historical doc) is
+            # NOT sufficient evidence of duplication on its own: a single
+            # doc-level vector is dominated by site boilerplate, so distinct
+            # articles in a recurring series (weekly CVE alerts, interview
+            # spotlights, product announcements sharing a template) measure
+            # ~identical semantically while carrying different content.
+            # Confirm with lexical overlap >= 0.85 against the matched
+            # historical document's text before discarding; otherwise keep
+            # the document for the reporter corpus. When novelty came from
+            # the lexical fallback it already IS a token overlap >0.95, so
+            # no extra confirmation is needed. When no aligned historical
+            # text is available to verify against, keep the document — an
+            # unverifiable fuzzy match must not cause deletion.
+            if novelty_via_embedding:
+                matched_text = ""
+                matched_doc_id: Any = None
+                if hint is not None:
+                    matched_text = hint_text
+                    matched_doc_id = hint_doc_id
+                elif hist_idx is not None and hist_idx < len(historical_documents):
+                    matched = historical_documents[hist_idx]
+                    matched_text = str(matched.get("text", "") or "")
+                    matched_doc_id = matched.get("document_id")
+                if matched_text and _lexical_similarity(text, matched_text) >= 0.85:
+                    decision, duplicate_of, reason = (
+                        ReporterDecision.DUPLICATE,
+                        str(matched_doc_id) if matched_doc_id else "__main__",
+                        "Contenido casi idéntico al corpus histórico (embedding + léxico).")
+                else:
+                    decision, reason = ReporterDecision.REPORTER_ONLY, (
+                        "Similitud semántica alta con el corpus histórico (template/sitio "
+                        "compartido) pero contenido léxico distinto; se conserva.")
+            else:
+                decision, reason = ReporterDecision.DUPLICATE, "Contenido casi idÃ©ntico al corpus histÃ³rico."
         else:
             decision = ReporterDecision.PROMOTE
             reason = "Contenido relevante y suficientemente novedoso; requiere revisiÃ³n humana para promociÃ³n."
         by_url[url] = document_id
-        by_hash[content_hash] = document_id
+        by_hash[norm_hash] = document_id
         semantic = batch_results[index] if index < len(batch_results) else (classifier(document) if classifier else {})
         if semantic:
-            def _safe_float(raw, fallback):
-                try:
-                    return max(0.0, min(1.0, float(raw)))
-                except (TypeError, ValueError):
-                    return fallback
-            values = {key: _safe_float(semantic.get(key, value), value) for key, value in {
+            values = {key: _bounded_float(semantic.get(key, value), value) for key, value in {
                 "relevance": relevance, "novelty": novelty, "source_quality": source_quality, "impact": impact,
                 "depth": depth, "actionability": actionability,
             }.items()}

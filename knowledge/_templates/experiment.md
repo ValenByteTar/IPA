@@ -10,6 +10,10 @@ tags: []
 related: []
 supersedes: null
 superseded_by: null
+affects: []
+evidence: []
+author_model: null
+trigger: null
 ---
 
 # EXP-001 — Título
@@ -45,6 +49,5 @@ Hipótesis confirmada, refutada o inconclusa.
 
 - [ ] Mantener como Experiment
 - [ ] Congelar como Benchmark
-- [ ] Crear Decision
-- [ ] Proponer ADR
+- [ ] Crear Decision (DEC-* es el formato ADR del proyecto, DEC-008)
 - [ ] Nothing

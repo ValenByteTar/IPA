@@ -4,8 +4,7 @@
       "command": ".venv\\Scripts\\python.exe",
       "args": ["tools/eks_mcp_server.py"],
       "env": {
-        "IPA_EKS_ROOT": "knowledge",
-        "IPA_EKS_REFERENCE_ROOTS": "docs/adr"
+        "IPA_EKS_ROOT": "knowledge"
       }
     },
     "ipa": {

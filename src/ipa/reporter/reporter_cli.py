@@ -64,7 +64,7 @@ def main() -> int:
     llm_provider = None
     if args.embeddings:
         from ipa.indexes.embedding_adapter import EmbeddingAdapter
-        embedding = EmbeddingAdapter(batch_size=64, show_progress=False)
+        embedding = EmbeddingAdapter(show_progress=False)
     if args.llm:
         from ipa.providers.exl3_provider import create_star_provider
         llm_provider = create_star_provider(interactive=args.interactive)

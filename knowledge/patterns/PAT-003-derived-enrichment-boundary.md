@@ -3,13 +3,15 @@ id: PAT-003
 category: pattern
 status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-23
 author: human
 components: [enrichment, provenance, retrieval, document_store]
 tags: [canonical-text, derived-data, input-hash, fingerprint]
 related: [EXP-001, PAT-001]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/enrichment/enrichment.py"]
+affects: ["src/ipa/enrichment/**"]
 ---
 
 # PAT-003 — Boundary de enrichment derivado

@@ -1,15 +1,16 @@
 ---
 id: RES-004
 category: research
-status: proposed
+status: superseded
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-23
 author: human
 components: [tutor, providers, configuration, evaluation, performance]
 tags: [llm, engine, exllamav3, ollama, exl3, gguf, benchmark, vram]
 related: [RES-003, EXP-004, BM-006, DEC-001]
 supersedes: null
-superseded_by: null
+superseded_by: BM-006
+affects: ["src/ipa/providers/**"]
 ---
 
 # RES-004 — Protocolo de benchmark de engines y modelos LLM
@@ -73,3 +74,10 @@ El ranking debe ser multidimensional: tutoría, assessment, tool use, eficiencia
 ## Estado
 
 Research propuesto. La ejecución y los resultados deben registrarse en `EXP-004` y, si se congelan, en `BM-006`.
+
+## Cierre (2026-09-23)
+
+Ejecutado y congelado según lo previsto: el protocolo corrió en EXP-004 y el
+benchmark quedó como autoridad vigente en **BM-006** (que supersede a este
+documento como referencia del protocolo y sus resultados; DEC-001 fija el
+perfil operacional resultante).

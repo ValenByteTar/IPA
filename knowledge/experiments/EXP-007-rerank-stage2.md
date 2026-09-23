@@ -3,13 +3,14 @@ id: EXP-007
 category: experiment
 status: accepted
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-23
 author: agent
 components: [retrieval, indexes, reranker]
 tags: [rerank, cross-encoder, hybrid-retrieval, vram-gate, wddm, evaluation]
 related: [EXP-003, PAT-004, DEC-006]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/indexes/reranker_adapter.py"]
 ---
 
 # EXP-007 — Rerank stage-2 (cross-encoder) sobre el retrieval híbrido
@@ -54,6 +55,18 @@ Misma ganancia de calidad (recall@1 +20.0pp, MRR +0.144) a ~+0.7 s/query.
 Con el LLM en VRAM (4,486 MiB usados de 6,141) y rerank forzado a CPU: fase de
 retrieval **3.2 s** en régimen (embed BGE-M3 CPU + search_hybrid + rerank CPU),
 lección end-to-end ~20 s. Sin errores ni OOM.
+
+## Auditoría de configuración (2026-09-23; no es un benchmark nuevo)
+
+El wrapper actual resuelve `IPA_RERANK_DEVICE=auto` por VRAM física; no garantiza
+CPU por sí solo — en esta máquina quedó fijado `cpu` vía launcher
+(`start_ipa_dashboard.ps1`) y env de usuario (ver CHANGELOG). En CPU ejecuta
+FP32; en CUDA activa FP16. El `FlagReranker` instalado
+expone `batch_size=128` por default, que el adapter no sobrescribe, y el wrapper
+pasa `max_length=8192` a `compute_score` (por encima del default 512 de la
+librería). No hay un sweep registrado de batch, threads ni max length del
+reranker. Los resultados CPU de este EXP son una referencia de calidad/latencia,
+no evidencia de que esos knobs sean óptimos.
 
 ## Conclusiones
 

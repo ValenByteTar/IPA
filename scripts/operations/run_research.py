@@ -31,18 +31,26 @@ def write_progress(payload: dict) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: run_research.py <query> [max_urls] [max_seconds]")
+        print("Usage: run_research.py <query> [max_urls] [max_seconds] [sub_queries_json]")
         sys.exit(1)
     query = sys.argv[1]
     max_urls = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     max_seconds = int(sys.argv[3]) if len(sys.argv) > 3 else 180
+    sub_queries: list[str] = []
+    if len(sys.argv) > 4:
+        try:
+            raw = json.loads(sys.argv[4])
+            if isinstance(raw, list):
+                sub_queries = [str(s) for s in raw if str(s).strip()]
+        except Exception:
+            pass
 
     sys.path.insert(0, str(ROOT / "src"))
 
     from ipa.agent.agent_memory import AgentMemory
     from ipa.agent.agent_tools import ToolContext
     from ipa.agent.research_executor import execute_research
-    from ipa.agent.system_tools import _main_corpus_dir
+    from ipa.agent.system_tools import _main_corpus_dir, _research_ingest_corpus
 
     corpus_dir = _main_corpus_dir()
     if corpus_dir is None:
@@ -62,15 +70,48 @@ def main() -> None:
         sid, turn_role="user", content=query, identity_hash="system",
     )
     ctx = ToolContext(memory=memory, corpus_dir=str(corpus_dir))
+
+    def on_heavy_wait(elapsed_s: float, current: dict | None) -> None:
+        # La fase pesada (ingesta + embeddings) se serializa con el pipeline:
+        # reportar la espera para que el dashboard muestre por qué no avanza.
+        write_progress({
+            "status": "running", "query": query,
+            "heavy_wait": {
+                "seconds": round(elapsed_s, 1),
+                "blocked_by": (current or {}).get("kind"),
+            },
+        })
+
+    def on_progress(phase: str, detail: dict) -> None:
+        # Avance granular: el indicador del dashboard muestra en qué fase va
+        # (search→judge→scrape→ingest→embed→retrieval) en vez de "running"
+        # minutos enteros. Cada fase nueva limpia el heavy_wait — el lock
+        # ya se resolvió si el executor avanzó a la fase siguiente.
+        write_progress({
+            "status": "running", "query": query,
+            "phase": phase, "phase_detail": detail,
+            "heavy_wait": None,
+        })
+
+    # DEC-003: la research aterriza en su staging propio — curación T1 +
+    # promotion_policy deciden qué entra a main. Kill-switch de emergencia:
+    # IPA_RESEARCH_STAGING=0 vuelve a la ingesta directa a main.
+    staging = _research_ingest_corpus()
+
     try:
         _call, result, research = execute_research(
             query, ctx,
             session_id=sid, episode_id=ep.episode_id,
             max_urls=max_urls, max_seconds=max_seconds,
+            on_heavy_wait=on_heavy_wait,
+            on_progress=on_progress,
+            sub_queries=sub_queries,
+            staging_corpus_dir=staging,
         )
         write_progress({
             "status": "done" if result.status == "completed" else "failed",
             "query": query,
+            "heavy_wait": None,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "result": {
                 "search_results": research.search_results_count,
@@ -83,6 +124,7 @@ def main() -> None:
     except Exception as exc:
         write_progress({
             "status": "failed", "query": query,
+            "heavy_wait": None,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "error": str(exc),
         })

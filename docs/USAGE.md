@@ -158,7 +158,7 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 |---|---|---|
 | `IPA_LLM_PROVIDER` | `ollama` | `ollama` o `exl3` (exl3 sin GPU cae a ollama) |
 | `IPA_OLLAMA_MODEL` | `qwen3.5:9b-q4_K_M` | modelo del chat |
-| `IPA_FORCE_CPU` | (no) | `1` fuerza modo 100% CPU |
+| `IPA_FORCE_CPU` | (no) | `1` desactiva GPU detection del provider; no fija globalmente EmbeddingAdapter ni reranker |
 | `IPA_AUTO_RESEARCH` | `1` | auto-research ante gap de corpus (`0` desactiva) |
 | `IPA_AUTO_RESEARCH_DEDUP_MINUTES` | `10` | ventana de dedup de research |
 | `IPA_IDLE_LLM_LOADED_ENRICHMENT` | `1` | Tier 2 con modelo ya cargado (≥5 min idle) |
@@ -177,6 +177,15 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 | `IPA_OLLAMA_REPEAT_LAST_N` | (servidor) | ventana del repetition penalty |
 | `IPA_OLLAMA_NUM_BATCH` | (servidor) | batch de prefill por request |
 | `IPA_EMBED_CACHE_SIZE` | `256` | LRU de embeddings de query (`0` desactiva) |
+| `IPA_EMBED_DEVICE` | `auto` | `auto`, `cpu` o `cuda`; `cpu` fija CPU explícitamente |
+| `IPA_EMBED_BATCH_CPU` / `_GPU` | `4` / `4` | batch interno del adapter; callers con batch explícito lo sobrescriben |
+| `IPA_EMBED_MIN_FREE_MB` | `2048` | headroom físico mínimo para que `device=auto` seleccione CUDA |
+| `IPA_EMBED_GPU_BULK` | `1` | habilita lease GPU exclusivo para backlog ≥512; `0` lo deshabilita pero no pinnea el adapter a CPU |
+| `IPA_EMBED_GPU_MIN_BACKLOG` / `_WAIT_SECONDS` | `512` / `1800` | umbral y espera máxima del lease GPU bulk |
+| `IPA_EMBED_PASS_CHUNKS` | `256` | chunks por pasada del drain |
+| `IPA_RERANK` | `1` | stage-2 cross-encoder habilitado (`0` lo desactiva) |
+| `IPA_RERANK_DEVICE` | `auto` (`cpu` en esta máquina) | `auto`, `cpu` o `cuda`; `auto` decide por VRAM física disponible. El launcher fija `cpu`: el reranker es un singleton lazy y si `auto` lo carga en CUDA con el LLM ausente, queda residente y compite por VRAM cuando el chat vuelve (EXP-008). El pin también está en la env de usuario |
+| `IPA_RERANK_MIN_FREE_MB` | `2048` | headroom físico mínimo para reranker CUDA |
 | `IPA_RERANK_CACHE_SIZE` | `128` | LRU de rankings del cross-encoder (`0` desactiva) |
 | `IPA_RETRIEVAL_CACHE_SIZE` / `_TTL` | `64` / `300` | cache TTL de resultados de retrieval (query→hits) |
 | `IPA_TOOL_CACHE_TTL` | `30` | TTL del cache de tools read-only (`0` desactiva; `get_system_status` nunca se cachea) |
@@ -192,9 +201,33 @@ el material aterriza después — consultar con `list_promotions`/`get_report`.
 ## Hardware: GPU o 100% CPU
 
 - **Con GPU**: modelo estrella en CUDA, OCR y Docling acelerados.
-- **Sin GPU**: fallback automático — chat/Tutor por Ollama (CPU), OCR y
-  Docling en `cpu`, embeddings en CPU. Nada falla al boot; `IPA_FORCE_CPU=1`
-  lo fuerza explícitamente.
+- **Sin CUDA disponible**: chat/Tutor por Ollama (CPU), OCR/Docling en `cpu` y
+  embeddings en CPU. `IPA_FORCE_CPU=1` afecta la detección de GPU del provider;
+  no fija por sí solo los devices de `EmbeddingAdapter` ni del reranker.
+- **Pin explícito**: `IPA_EMBED_DEVICE=cpu` fija BGE-M3 en CPU y
+  `IPA_RERANK_DEVICE=cpu` fija el cross-encoder en CPU. `IPA_EMBED_GPU_BULK=0`
+  o `run_embed_drain.py --cpu-only` solo deshabilitan el lease GPU bulk: con
+  `device=auto`, el adapter todavía puede elegir CUDA si el gate de VRAM lo permite.
+
+### Configuración efectiva de embeddings
+
+`EmbeddingAdapter` usa batch 4 por default y FP32 cuando el device es CPU. El
+baseline de PM-004 fijó `torch.set_num_threads(6)` en el probe; el adapter no fija
+threads, aunque el default de PyTorch de este venv reporta actualmente 6. Un
+caller puede sobrescribir el batch: `continuous_pipeline --lancedb-batch-size`
+defaultea a 256 y lo pasa al forward; workers `lancedb_incremental.py` y Tier 2
+re-embed usan 192, y el chunker semántico 16. Esos overrides no se cubren con el
+microbenchmark batch 4. En cambio, `run_embed_drain.py --batch-size` controla el
+flush hacia LanceDB, no el batch interno del modelo.
+
+`BAAI/bge-m3` en el adapter actual usa FP32 en CPU / FP16 en CUDA; no hay un
+switch FP8. El diseño experimental de FP8 E4M3/NVIDIA scaling para Ada está en
+`knowledge/experiments/EXP-009-bge-m3-fp8-rtx4050.md` (propuesto, no ejecutado).
+
+El reranker usa `device=auto` por default —no se asume CPU—, FP32 cuando resuelve
+CPU y FP16 en CUDA. El wrapper actual hereda batch 128 de FlagReranker y pasa
+`max_length=8192`; no hay tuning CPU de esos knobs validado. Ver EXP-007 para la
+evidencia de calidad/latencia existente.
 
 ### Ajuste de VRAM para velocidad (tok/s)
 

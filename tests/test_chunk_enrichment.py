@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from ipa.agentic.chunk_enrichment import (
-    ChunkScan, build_enriched_text, count_pending, enrich_chunks,
-    enrichment_messages, parse_enrichment, scan_chunks,
+    ChunkScan, build_enriched_text, count_pending, enriched_text,
+    enrich_chunks, enrichment_messages, parse_enrichment, scan_chunks,
 )
 
 
@@ -114,6 +114,21 @@ class _FakeLanceDB:
         self.added.extend(c.chunk_id for c in chunks)
 
 
+class _FakeBM25:
+    """Captura lo que reembed_batch indexa en el índice léxico."""
+
+    def __init__(self):
+        self.removed: list[str] = []
+        self.texts: dict[str, str] = {}
+
+    def remove_chunk(self, chunk_id):
+        self.removed.append(chunk_id)
+
+    def add_chunks(self, chunks):
+        for c in chunks:
+            self.texts[c.chunk_id] = c.text
+
+
 # ── parseo ─────────────────────────────────────────────────────────────
 
 def test_parse_enrichment_structured():
@@ -192,14 +207,26 @@ def test_count_pending(tmp_path):
 
 # ── pase completo ──────────────────────────────────────────────────────
 
+def test_enriched_text_resolution():
+    """Única fuente de la representación derivada: canónico / meta / legacy."""
+    canonical = "texto original"
+    assert enriched_text(canonical, None) == canonical
+    assert enriched_text(canonical, {}) == canonical
+    meta = {"enrichment": {"status": "enriched", "enriched_text": "ENR"}}
+    assert enriched_text(canonical, meta) == "ENR"
+    # Legacy: el propio text ya lleva el prefijo → se devuelve tal cual.
+    legacy = "[Summary] s\n\noriginal"
+    assert enriched_text(legacy, {"enrichment": {"status": "enriched"}}) == legacy
+
+
 def test_enrich_chunks_end_to_end(tmp_path):
     db = _make_db(tmp_path / "store.db", [
         ("c1", "d1", _low_density_text("a"), "h1", "{}"),
         ("c2", "d1", _low_density_text("b"), "h2", "{}"),
     ])
-    emb, lance = _FakeEmbedding(), _FakeLanceDB()
+    emb, lance, bm25 = _FakeEmbedding(), _FakeLanceDB(), _FakeBM25()
     stats = enrich_chunks(
-        _SerialProvider(), db, lancedb=lance, embedding=emb,
+        _SerialProvider(), db, lancedb=lance, embedding=emb, bm25=bm25,
         reembed_batch_size=1)
 
     assert stats["enriched"] == 2
@@ -207,19 +234,54 @@ def test_enrich_chunks_end_to_end(tmp_path):
     assert stats["errors"] == 0
     assert sorted(lance.added) == ["c1", "c2"]
 
+    # El índice léxico recibe la representación enriquecida (EXP-001:
+    # lexical+summary era el mayor win medido, +14.3% recall@10).
+    assert sorted(bm25.removed) == ["c1", "c2"]
+    for cid in ("c1", "c2"):
+        assert bm25.texts[cid].startswith("[Summary] un resumen")
+
     conn = sqlite3.connect(str(db))
     try:
-        for cid in ("c1", "c2"):
-            text, meta_raw = conn.execute(
-                "SELECT text, metadata_json FROM chunks WHERE chunk_id=?",
-                (cid,)).fetchone()
-            assert text.startswith("[Summary] un resumen")
+        for cid, orig in (("c1", _low_density_text("a")),
+                          ("c2", _low_density_text("b"))):
+            text, chash, meta_raw = conn.execute(
+                "SELECT text, content_hash, metadata_json FROM chunks "
+                "WHERE chunk_id=?", (cid,)).fetchone()
+            # Invariante: chunks.text queda CANÓNICO (no muta, content_hash
+            # sigue siendo válido — el desync de PM-003 no puede repetirse).
+            assert text == orig
+            assert chash == ("h1" if cid == "c1" else "h2")
             meta = json.loads(meta_raw)["enrichment"]
+            assert meta["status"] == "enriched"
             assert meta["embedding_status"] == "complete"
-            assert meta["text_hash"] == _sha(text)
-            assert "canonical_text" in meta  # original preservado
+            assert meta["summary"] == "un resumen"
+            assert meta["enriched_text"].startswith("[Summary] un resumen")
+            assert meta["enriched_text"].endswith(orig)
+            assert meta["text_hash"] == _sha(meta["enriched_text"])
+            # La representación derivada resuelve desde metadata.
+            assert enriched_text(text, json.loads(meta_raw)) == meta["enriched_text"]
     finally:
         conn.close()
+
+
+def test_scan_chunks_detects_meta_flag(tmp_path):
+    """Formato nuevo: enriquecido por flag en metadata, text canónico."""
+    canonical = _low_density_text("z")
+    enriched = build_enriched_text("s", ["q?"], canonical)
+    meta = {"enrichment": {
+        "status": "enriched", "embedding_status": "complete",
+        "text_hash": _sha(enriched), "enriched_text": enriched,
+    }}
+    db = _make_db(tmp_path / "store.db", [
+        ("c1", "d1", canonical, "h1", json.dumps(meta)),
+    ])
+    conn = sqlite3.connect(str(db))
+    try:
+        scan = scan_chunks(conn)
+    finally:
+        conn.close()
+    assert scan.already_enriched == 1
+    assert scan.pending == 0
 
 
 def test_enrich_chunks_is_resumable(tmp_path):

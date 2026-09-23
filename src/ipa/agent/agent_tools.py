@@ -185,12 +185,14 @@ def _execute_tool(
                 )
             else:
                 from ipa.agent.research_executor import execute_research
+                _subs = arguments.get("sub_queries")
                 call, result, _structured = execute_research(
                     str(arguments.get("query", "") or ""), ctx,
                     session_id=session_id, episode_id=episode_id,
                     max_urls=int(arguments.get("max_urls", 5)),
                     max_seconds=int(arguments.get("max_seconds", 120)),
                     freshness=str(arguments.get("freshness", "lenient")),
+                    sub_queries=[str(s) for s in _subs] if isinstance(_subs, list) else None,
                 )
             return call, result
         except Exception as exc:
@@ -396,14 +398,21 @@ def _list_topics(args: dict[str, Any], ctx: ToolContext) -> tuple[dict[str, Any]
     centroids = store.all_centroids()
     topics = []
     if centroids:
-        for doc_id, chunk_ids in list(centroids.items())[:limit]:
+        for doc_id, chunk_ids in centroids.items():
             doc = store.get_document(doc_id)
+            if doc is None:
+                # Centroide huérfano: el doc fue tombstoneado/eliminado tras
+                # indexar (repairs, dedupe). El índice derivado queda stale
+                # hasta el próximo topify — filtrar al leer.
+                continue
             topics.append({
                 "document_id": doc_id,
                 "representative_chunk_count": len(chunk_ids),
-                "mime_type": doc.mime_type if doc else "unknown",
-                "pages": doc.pages if doc else 0,
+                "mime_type": doc.mime_type,
+                "pages": doc.pages,
             })
+            if len(topics) >= limit:
+                break
     else:
         # Fallback: list documents by iterating chunks (no centroid index).
         seen_docs: set[str] = set()
@@ -411,11 +420,13 @@ def _list_topics(args: dict[str, Any], ctx: ToolContext) -> tuple[dict[str, Any]
             if chunk.document_id not in seen_docs:
                 seen_docs.add(chunk.document_id)
                 doc = store.get_document(chunk.document_id)
+                if doc is None:
+                    continue  # chunk huérfano de doc tombstoneado
                 topics.append({
                     "document_id": chunk.document_id,
                     "representative_chunk_count": 0,
-                    "mime_type": doc.mime_type if doc else "unknown",
-                    "pages": doc.pages if doc else 0,
+                    "mime_type": doc.mime_type,
+                    "pages": doc.pages,
                 })
                 if len(topics) >= limit:
                     break

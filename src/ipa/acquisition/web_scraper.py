@@ -1792,12 +1792,16 @@ class WebScraper:
                     lines.append(ocr_text)
                     lines.append("")
 
-        # Append document references if any were downloaded
+        # Append document references if any were downloaded. Only basenames —
+        # absolute local paths leaked machine-specific query-matching tokens
+        # into the corpus (a run dir like "…-jev-llm-architecture" ranked the
+        # manifest chunks first for that query). The authoritative list with
+        # full paths lives in scrape_report.json (document_paths).
         if result.document_paths:
             lines.append("")
             lines.append("--- Linked documents downloaded to Landing zone ---")
             for i, doc_path in enumerate(result.document_paths):
-                lines.append(f"[Document {i+1}] {doc_path}")
+                lines.append(f"[Document {i+1}] {Path(doc_path).name}")
             lines.append("")
 
         filepath.write_text("\n".join(lines), encoding="utf-8")

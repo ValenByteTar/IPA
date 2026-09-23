@@ -537,6 +537,12 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 self.send_json(enriched)
         elif parsed.path == "/api/deep-dive":
+            from ipa.agentic.embedding_maintenance import chat_block_reason, read_state
+            reason = chat_block_reason()
+            if reason:
+                self.send_json({"error": reason,
+                                "embedding_maintenance": read_state()}, 423)
+                return
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 from ipa.reporter.reporter_deep_dive import deep_dive
@@ -563,6 +569,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 400)
         elif parsed.path == "/api/deep-dive/stream":
+            from ipa.agentic.embedding_maintenance import chat_block_reason, read_state
+            reason = chat_block_reason()
+            if reason:
+                self.send_json({"error": reason,
+                                "embedding_maintenance": read_state()}, 423)
+                return
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 from ipa.reporter.reporter_deep_dive import deep_dive_prepare, deep_dive_stream, _clean_token
@@ -885,6 +897,29 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         try:
             body = self.read_body()
+            maintenance_guarded = {
+                "/api/agent/chat", "/api/agent/chat/stream",
+                "/api/fastpath/run", "/api/lancedb/run", "/api/pipeline/run",
+                "/api/reports/review", "/api/reports/delete",
+                "/api/promotions/process", "/api/decisions/review",
+            }
+            if parsed.path in maintenance_guarded:
+                from ipa.agentic.embedding_maintenance import (
+                    chat_block_reason, job_holder, read_state,
+                )
+                reason = chat_block_reason()
+                mutation_paths = {
+                    "/api/fastpath/run", "/api/lancedb/run", "/api/pipeline/run",
+                    "/api/reports/review", "/api/reports/delete",
+                    "/api/promotions/process", "/api/decisions/review",
+                }
+                holder = job_holder() if parsed.path in mutation_paths else None
+                if reason or holder:
+                    error = reason or (
+                        f"Operación de corpus bloqueada durante {holder['owner']}.")
+                    self.send_json({"error": error,
+                                    "embedding_maintenance": read_state()}, 423)
+                    return
             if parsed.path == "/api/topics/edit":
                 self.send_json(update_latest_topic(body))
             elif parsed.path == "/api/sources":

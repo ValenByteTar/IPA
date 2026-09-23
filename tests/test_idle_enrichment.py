@@ -471,6 +471,30 @@ def test_promotion_policy_configured_scrape_auto_promote():
     assert "auto-promote" in result.reason
 
 
+def test_promotion_policy_user_provided_auto_promote():
+    """user_provided (URL pegada por el usuario) → auto-promote sin umbral —
+    fuente conocida por autorización directa, como configured_scrape."""
+    from ipa.agentic.promotion_policy import evaluate_promotion
+    result = evaluate_promotion("d1", "user_provided")
+    assert result.should_promote is True
+    assert "auto-promote" in result.reason
+
+
+def test_promotion_policy_user_provided_respects_duplicate_gate():
+    """user_provided auto-promueve pero no escapa los gates de curación:
+    un DUPLICATE nunca promueve."""
+    from ipa.agentic.promotion_policy import evaluate_promotion
+    from ipa.reporter.reporter_contracts import (
+        ReporterDecision, ReporterDocumentDecision)
+    decision = ReporterDocumentDecision(
+        decision_id="dec:1", report_id="r1", document_id="d1",
+        artifact_id="a1", decision=ReporterDecision.DUPLICATE,
+        scores=None, reason="dup", evidence=[], generation={})
+    result = evaluate_promotion("d1", "user_provided", decision=decision)
+    assert result.should_promote is False
+    assert "duplicate" in result.reason
+
+
 def test_promotion_policy_agent_research_above_threshold():
     """agent_research with score >= 0.70 → promote."""
     from ipa.agentic.promotion_policy import evaluate_promotion
@@ -634,3 +658,150 @@ def test_document_store_sources_by_provenance(tmp_path):
         assert "d2" in agent
     finally:
         store.close()
+
+
+# ── Tier 2: zona gris (segunda opinión LLM sobre agent_research borderline) ──
+
+class _GrayResult:
+    def __init__(self, text):
+        self.ok = True
+        self.text = text
+
+
+class _GrayProvider:
+    """Provider batch fake: veredicto de segunda opinión con scores altos."""
+
+    engine = "exllamav3"
+    batch_size = 4
+    model_fingerprint = "fake-exl3"
+
+    def __init__(self, score: float = 0.9):
+        self.score = score
+        self.classified_titles: list[str] = []
+
+    def reset_generator(self):
+        pass
+
+    def generate_chat_batch(self, batch, max_new_tokens=None, timeout=None,
+                            temperature=None):
+        import json as _json
+        out = []
+        for conv in batch:
+            out.append(_GrayResult(_json.dumps({
+                "relevance": self.score, "novelty": self.score,
+                "source_quality": self.score, "impact": self.score,
+                "depth": self.score, "actionability": self.score,
+                "decision": "promote", "reason": "segunda opinión: relevante",
+            })))
+        return out
+
+    def generate_chat(self, messages, max_new_tokens=None, timeout=None,
+                      temperature=None):
+        return _GrayResult("{}")
+
+
+def _gray_decision(doc_id: str, score: float = 0.6) -> dict:
+    # promotion_score 0.30r+0.20n+0.20s+0.15i+0.10d+0.05a con todos = score
+    s = score
+    return {
+        "decision_id": f"cur:{doc_id}", "document_id": doc_id,
+        "report_id": "idle-enrichment", "decision": "reporter_only",
+        "reason": "score borderline", "duplicate_of": None,
+        "scores": {"relevance": s, "novelty": s, "source_quality": s,
+                   "impact": s, "depth": s, "actionability": s},
+        "evidence": [], "review_status": "pending", "generation": {},
+        "field_origins": {},
+    }
+
+
+def test_level2_gray_zone_rescues_borderline(fake_corpus, monkeypatch, tmp_path):
+    """agent_research reporter_only con score en [0.5, 0.7) → segunda opinión
+    LLM; si el nuevo score supera el umbral se encola para promoción."""
+    from ipa.agentic.idle_enrichment import enrich_corpus_level2
+
+    fake_store = FakeDocStore(
+        centroids={"d1": ["d1_c1"]},
+        texts={"d1": "Paper relevante sobre GPUs " * 40},
+        chunk_texts={"d1_c1": "GPUs"},
+        sources={"d1": {"provenance": "agent_research",
+                        "source_url": "https://arxiv.org/x",
+                        "source_domain": "arxiv.org"}},
+    )
+    fake_lance = FakeLanceIndex(doc_embeddings={"d1": [1.0, 0.0]})
+
+    import ipa
+    monkeypatch.setattr(ipa, "DocumentStore", lambda path: fake_store)
+    monkeypatch.setattr(
+        "ipa.indexes.lancedb_index.LanceDBIndex", lambda path: fake_lance)
+
+    cluster_store = TopicClusterStore(tmp_path / "clusters.db")
+    try:
+        # Ya procesado por L1: clustered + curated con decisión reporter_only.
+        cluster_store.mark_processed(["d1"], stage="clustered")
+        cluster_store.save_curation_decisions_batch([_gray_decision("d1", 0.6)])
+
+        result = enrich_corpus_level2(
+            fake_corpus, cluster_store, _GrayProvider(0.9))
+        assert result["gray_reviewed"] == 1
+        assert result["gray_rescued"] == 1
+
+        # La decisión quedó actualizada con la segunda opinión + fingerprint.
+        updated = cluster_store.list_curation_decisions()[0]
+        assert updated["scores"]["relevance"] == 0.9
+        assert updated["generation"]["generator"] == "idle-enrichment-grayzone"
+        assert "segunda opinión" in updated["reason"]
+
+        # Re-evaluación de política: agent_research con score 0.9 ≥ 0.70 →
+        # encolado para promoción.
+        pending = cluster_store.pending_promotions()
+        assert [p["document_id"] for p in pending] == ["d1"]
+
+        # Checkpoint: un segundo pase no re-revisa.
+        result2 = enrich_corpus_level2(
+            fake_corpus, cluster_store, _GrayProvider(0.9))
+        assert result2["gray_reviewed"] == 0
+    finally:
+        cluster_store.close()
+
+
+def test_level2_gray_zone_skips_definitive(fake_corpus, monkeypatch, tmp_path):
+    """Duplicados definitivos y docs sin provenance agent_research NO van al
+    LLM (no se gastan tokens ni se revierten decisiones con evidencia)."""
+    from ipa.agentic.idle_enrichment import enrich_corpus_level2
+
+    dup = _gray_decision("d_dup", 0.9)
+    dup["decision"] = "duplicate"
+    dup["duplicate_of"] = "__main__"
+    other_prov = _gray_decision("d_cfg", 0.6)
+    low = _gray_decision("d_low", 0.3)  # bajo la banda gris → definitivo
+
+    fake_store = FakeDocStore(
+        centroids={"d_dup": [], "d_cfg": [], "d_low": []},
+        texts={"d_dup": "dup", "d_cfg": "cfg", "d_low": "low"},
+        sources={
+            "d_dup": {"provenance": "agent_research"},
+            "d_cfg": {"provenance": "configured_scrape"},
+            "d_low": {"provenance": "agent_research"},
+        },
+    )
+    fake_lance = FakeLanceIndex(
+        doc_embeddings={"d_dup": [1.0], "d_cfg": [0.9], "d_low": [0.8]})
+
+    import ipa
+    monkeypatch.setattr(ipa, "DocumentStore", lambda path: fake_store)
+    monkeypatch.setattr(
+        "ipa.indexes.lancedb_index.LanceDBIndex", lambda path: fake_lance)
+
+    provider = _GrayProvider(0.95)
+    cluster_store = TopicClusterStore(tmp_path / "clusters.db")
+    try:
+        cluster_store.mark_processed(
+            ["d_dup", "d_cfg", "d_low"], stage="clustered")
+        cluster_store.save_curation_decisions_batch([dup, other_prov, low])
+
+        result = enrich_corpus_level2(fake_corpus, cluster_store, provider)
+        assert result["gray_reviewed"] == 0
+        assert result["gray_rescued"] == 0
+        assert cluster_store.pending_promotions() == []
+    finally:
+        cluster_store.close()

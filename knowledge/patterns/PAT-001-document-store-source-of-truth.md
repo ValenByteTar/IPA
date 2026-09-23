@@ -3,13 +3,15 @@ id: PAT-001
 category: pattern
 status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-23
 author: human
 components: [document_store, ingestion, lexical_index, vector_index, provenance]
 tags: [source-of-truth, derived-index, canonical-document, provenance]
 related: [BM-001, BM-002, BM-003]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/storage/document_store.py", "tests/test_fast_path.py"]
+affects: ["src/ipa/storage/**"]
 ---
 
 # PAT-001 — DocumentStore como fuente de verdad

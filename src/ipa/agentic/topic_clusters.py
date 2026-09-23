@@ -127,6 +127,20 @@ class TopicClusterStore:
                 queued_at TEXT NOT NULL,
                 promoted_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            -- Checkpoints NO ordenados (enrichment_progress es una
+            -- progresión clustered<curated de una fila por doc; marcas
+            -- ortogonales como gray_reviewed necesitan su propio espacio
+            -- para no pisar ese estado).
+            CREATE TABLE IF NOT EXISTS aux_progress (
+                document_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                processed_at TEXT NOT NULL,
+                PRIMARY KEY (document_id, stage)
+            );
         """)
         # Additive migration for stores created before coherence_score was
         # materialized. Derived stores remain rebuildable, but opening an old
@@ -138,6 +152,19 @@ class TopicClusterStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    # --- Meta KV (dirty flags, last-seen counts — gate "corpus changed") ----
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, value))
+        self._conn.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
 
     def save_cluster(self, cluster: TopicCluster) -> None:
         payload = cluster.to_contract()
@@ -240,6 +267,25 @@ class TopicClusterStore:
             return False
         order = {"clustered": 0, "curated": 1}
         return order.get(row[0], 0) >= order.get(stage, 0)
+
+    # --- Aux progress: marcas ortogonales NO ordenadas (gray_reviewed, etc.) --
+
+    def mark_stage(self, document_ids: list[str], stage: str) -> None:
+        """Marca docs en una stage independiente de la progresión principal."""
+        now = _now()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO aux_progress "
+            "(document_id, stage, processed_at) VALUES (?, ?, ?)",
+            [(d, stage, now) for d in document_ids],
+        )
+        self._conn.commit()
+
+    def stage_doc_ids(self, stage: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT document_id FROM aux_progress WHERE stage = ?",
+            (stage,),
+        ).fetchall()
+        return {row[0] for row in rows}
 
     # --- Curation decisions ---------------------------------------------------
 
@@ -394,6 +440,17 @@ class TopicClusterStore:
             "SELECT status FROM promotion_queue WHERE document_id = ?", (document_id,)
         ).fetchone()
         return row is not None and row[0] == "pending"
+
+    def promotion_queue_doc_ids(self) -> set[str]:
+        """Doc_ids ya rastreados por la cola (cualquier estado).
+
+        Un doc 'promoted' ya no necesita re-evaluación de política — sin este
+        set T1 lo re-encolaba cada ciclo (INSERT OR REPLACE resetea a
+        'pending' y el executor lo volvía a marcar done: churn eterno).
+        """
+        rows = self._conn.execute(
+            "SELECT document_id FROM promotion_queue").fetchall()
+        return {r[0] for r in rows}
 
     # --- Cluster queries ------------------------------------------------------
 

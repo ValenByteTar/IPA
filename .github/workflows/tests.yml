@@ -17,5 +17,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install development profile
         run: python -m pip install -e ".[dev,retrieval,parsers,chunkers,web,mcp]"
+      - name: Validate EKS
+        run: python scripts/validation/validate_eks.py
       - name: Run tests
         run: python -m pytest -q

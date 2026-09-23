@@ -3,13 +3,15 @@ id: BM-002
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [vector_index, embeddings, retrieval, performance]
 tags: [lancedb, sqlite-vec, bge-m3, vector, indexing]
 related: [RES-001]
 supersedes: null
 superseded_by: null
+evidence: ["scripts/benchmarks/run_index_benchmark.py", "tests/test_index_adapters.py"]
+affects: ["scripts/benchmarks/run_index_benchmark.py", "src/ipa/indexes/**"]
 ---
 
 # BM-002 â€” LanceDB vs sqlite-vec
@@ -23,7 +25,7 @@ Comparar dos implementaciones locales de almacenamiento y consulta vectorial baj
 - Corpus: 166k chunks.
 - Embeddings: representación vectorial local.
 - Métricas: throughput de indexación, latencia p50 y tamaño de disco.
-- Artefacto: `outputs/experiments/E6-full/benchmark_report.json`.
+- Artefacto: `outputs/experiments/E6-full/benchmark_report.json` (histórico, ya no en disco — ver PM-002).
 
 ## Resultados
 

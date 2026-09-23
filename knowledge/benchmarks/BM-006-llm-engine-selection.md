@@ -3,13 +3,15 @@ id: BM-006
 category: benchmark
 status: accepted
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [tutor, providers, evaluation, performance, configuration]
 tags: [llm, engine-selection, qwen3.5-9b, exllamav3, ollama, exl3, mtp]
 related: [RES-004, EXP-004, DEC-001]
-supersedes: null
+supersedes: RES-004
 superseded_by: null
+evidence: ["scripts/operations/test_exl3_provider.py"]
+affects: ["scripts/operations/test_exl3_provider.py", "src/ipa/providers/**"]
 ---
 
 # BM-006 — Selección operacional de modelo y engine para Tutor

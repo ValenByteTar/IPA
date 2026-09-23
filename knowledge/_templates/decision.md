@@ -10,6 +10,10 @@ tags: []
 related: []
 supersedes: null
 superseded_by: null
+affects: []
+evidence: []
+author_model: null
+trigger: null
 ---
 
 # DEC-001 — Título
@@ -30,6 +34,7 @@ Qué mejora, qué coste introduce y cómo se revierte.
 
 Tests, benchmarks, artefactos o referencias locales.
 
-## Por qué no es ADR
+## Alcance
 
-Explicar por qué es local/reversible y no cambia una frontera arquitectónica.
+Qué fronteras toca (si las hay — DEC-* es el formato ADR del proyecto,
+DEC-008) y cómo se revierte o supersede.

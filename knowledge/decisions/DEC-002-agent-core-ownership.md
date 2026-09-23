@@ -3,13 +3,14 @@ id: DEC-002
 category: decision
 status: accepted
 created: 2026-09-06
-updated: 2026-09-06
+updated: 2026-09-23
 author: human
 components: [agentic_runtime, agent_core, memory, configuration, eks]
 tags: [agent-core, user-model, ownership, sessions, episodes, identity, boundaries]
 related: [RES-002, RES-003, PAT-004, EXP-003]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/agent/**", "configs/agent_identity.yaml", "contracts/**"]
 ---
 
 # DEC-002 — Ownership del user model unificado y boundaries del agent core

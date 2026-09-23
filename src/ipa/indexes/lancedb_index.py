@@ -63,6 +63,33 @@ def _dict_to_span(d: dict) -> SourceSpan | None:
     )
 
 
+def table_chunk_id_list(table) -> list[str] | None:
+    """chunk_id list for a Lance table — projected read, ``to_arrow()``
+    fallback.
+
+    ``table.to_arrow()`` materializes every column including vectors
+    (~1024 floats/row); the ``select(["chunk_id"])`` projection only reads
+    the id column, so id-set consumers (audit, resume checkpoints,
+    promotion coverage) pay a fraction of the I/O. The fallback keeps
+    fakes and older tables without the query API working. Returns ``None``
+    when the table is unreadable — callers that must distinguish "empty"
+    from "cannot read" check for it (promotion defers on None).
+    """
+    if table is None:
+        return None
+    try:
+        arrow = table.search().select(["chunk_id"]).to_arrow()
+    except Exception:
+        try:
+            arrow = table.to_arrow()
+        except Exception:
+            return None
+    try:
+        return list(arrow.column("chunk_id").to_pylist())
+    except Exception:
+        return None
+
+
 class LanceDBIndex:
     """Vector index backed by LanceDB with cosine similarity and hybrid search."""
 
@@ -236,10 +263,9 @@ class LanceDBIndex:
     ) -> int:
         """Backfill scalar metadata columns from the canonical DocumentStore.
 
-        doc sources: document_sources (source_domain/provenance/quality_score)
-        + documents.stored_at → published_at (the canonical store does not track
-        a separate publication date; stored_at is the same proxy the dashboard
-        displays).
+        doc sources: document_sources (source_domain/provenance/quality_score
+        + published_at, registrado en ingesta por Tier 0). documents.stored_at
+        queda como fallback de published_at cuando la fuente no declara fecha.
 
         Args:
             store: DocumentStore bound to the same corpus.
@@ -269,7 +295,8 @@ class LanceDBIndex:
             src = sources.get(doc_id) or {}
             values = {
                 "source_domain": str(src.get("source_domain") or ""),
-                "published_at": str(stored_at.get(doc_id) or ""),
+                "published_at": str(
+                    src.get("published_at") or stored_at.get(doc_id) or ""),
                 "provenance": str(src.get("provenance") or ""),
                 "quality_score": float(src.get("quality_score") or 0.0),
             }
@@ -586,15 +613,28 @@ class LanceDBIndex:
         """True if at least one vector is indexed."""
         return self.count() > 0
 
+    def chunk_ids(self) -> set[str]:
+        """All indexed chunk_ids — column-projected read (no vectors).
+
+        Empty set for a missing or unreadable table; use
+        ``table_chunk_id_list`` when the caller must distinguish
+        "empty" from "cannot read" (promotion preflight defers on None).
+        """
+        return set(table_chunk_id_list(self._table) or [])
+
     def close(self) -> None:
         """LanceDB doesn't require explicit close."""
         pass
 
-    def document_embeddings(self) -> dict[str, list[float]]:
+    def document_embeddings(
+        self, doc_ids: set[str] | list[str] | None = None,
+    ) -> dict[str, list[float]]:
         """Return mean embedding vector per document_id.
 
-        Reads all chunk vectors from LanceDB, groups by document_id,
-        and computes the centroid (mean) for each document.
+        Reads chunk vectors from LanceDB, groups by document_id, and computes
+        the centroid (mean) for each document. ``doc_ids`` restricts the read
+        to those documents (idle enrichment only needs the pending subset —
+        a full-table scan per cycle was the Tier-1 O(corpus) bottleneck).
         Used by Reporter curation to avoid re-embedding documents.
         """
         import numpy as np
@@ -603,17 +643,24 @@ class LanceDBIndex:
         if self._table is None:
             return {}
         try:
-            tbl = self._table.to_arrow()
+            if doc_ids:
+                in_list = ", ".join(
+                    "'" + str(d).replace("'", "''") + "'" for d in doc_ids)
+                tbl = (self._table.query()
+                       .where(f"document_id IN ({in_list})")
+                       .to_arrow())
+            else:
+                tbl = self._table.to_arrow()
         except Exception:
             return {}
         if "document_id" not in tbl.column_names or "vector" not in tbl.column_names:
             return {}
 
-        doc_ids = tbl.column("document_id").to_pylist()
+        row_doc_ids = tbl.column("document_id").to_pylist()
         vectors = tbl.column("vector").to_pylist()
 
         docs: dict[str, list] = defaultdict(list)
-        for did, vec in zip(doc_ids, vectors):
+        for did, vec in zip(row_doc_ids, vectors):
             docs[did].append(np.array(vec, dtype=np.float32))
 
         result: dict[str, list[float]] = {}

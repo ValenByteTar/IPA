@@ -1,23 +1,36 @@
 ---
 name: adr-proposal
-description: Prepara propuestas de ADR cuando una decisión cambia una frontera arquitectónica de IPA.
+description: Prepara propuestas de decisión arquitectónica (DEC-*) cuando un cambio toca una frontera de IPA.
 triggers:
   - user
 allowed-tools:
   - read
   - grep
   - glob
+  - exec
+permissions:
+  allow:
+    - Read(knowledge/**)
+    - Read(docs/**)
+    - Read(contracts/**)
 ---
 
-Prepará una propuesta de ADR sin aceptarla automáticamente.
+Prepará una propuesta de decisión sin aceptarla automáticamente.
 
-1. Leé las reglas de `AGENTS.md`, `docs/` y los ADRs existentes si los hubiera.
-2. Buscá colisiones, supersession y decisiones EKS relacionadas.
-3. Verificá que exista evidencia local: tests, benchmark, experiment o postmortem.
-4. Diferenciá ADR de Decision, Pattern o Research.
-5. Redactá un borrador con estado `Propuesto`, contexto, decisión, consecuencias, alternativas, riesgos y criterios de aceptación.
-6. Mantené una única casa para ADRs: `docs/adr/`.
-7. No edites ni aceptes un ADR existente; no escribas el borrador hasta que el usuario lo apruebe.
+1. DEC-* ES el formato ADR del proyecto (DEC-008): las decisiones de
+   frontera viven en `knowledge/decisions/` con frontmatter EKS, no en
+   `docs/adr/` (ese path solo es reference root del MCP para ADRs
+   externos o legacy importados).
+2. Leé `knowledge/_schema/metadata.md`, `docs/` y las DEC existentes.
+3. Buscá colisiones, supersession y decisiones relacionadas
+   (`eks_search` / `eks_governing` sobre los paths que toca el cambio).
+4. Verificá que exista evidencia local: test, benchmark, experiment o
+   postmortem — sin evidencia verificable el record queda `proposed`.
+5. Redactá el borrador con `scripts/cli/eks_new.py decision --status proposed`
+   incluyendo `--evidence`, `--affects` (paths que gobierna) y
+   `--supersedes` si reemplaza una DEC vigente.
+6. No edites ni aceptes una DEC existente; no escribas el borrador como
+   `accepted` — la promoción requiere aprobación humana.
 
 La respuesta debe terminar con:
 

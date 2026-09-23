@@ -127,6 +127,86 @@ def test_curation_preserves_negative_decisions_without_deleting():
     assert len(docs) == 2
 
 
+def test_curation_survives_non_numeric_quality_score():
+    """Regression: a string quality_score ('significant' from an upstream
+    classifier) crashed the whole batch with ValueError — now it degrades
+    to the neutral fallback instead of aborting curation."""
+    doc = _doc("doc:one", "relevant novel content about photonic processors")
+    doc["quality_score"] = "significant"
+    decisions = curate_documents([doc], "report:2026-08:x", PERIOD_START, PERIOD_END)
+    assert len(decisions) == 1
+    assert decisions[0].document_id == "doc:one"
+    # String scores also survive inside the LLM judge payload.
+    doc2 = _doc("doc:two", "different relevant content about optical computing")
+    decisions = curate_documents(
+        [doc2], "report:2026-08:x", PERIOD_START, PERIOD_END,
+        classifier=lambda d: {"relevance": "high", "novelty": 0.9})
+    assert len(decisions) == 1
+    assert 0.0 <= decisions[0].scores.relevance <= 1.0
+    assert decisions[0].scores.novelty == 0.9
+
+
+def _emb(base: float, dims: int = 8) -> list[float]:
+    return [base + i * 0.001 for i in range(dims)]
+
+
+def test_novelty_gate_requires_lexical_confirmation_for_embedding_match():
+    """Cosine >0.95 alone must not discard: site boilerplate makes distinct
+    articles (weekly CVE alerts, series templates) look identical at the
+    document-embedding level. Without high lexical overlap vs the matched
+    document the doc stays REPORTER_ONLY (PM-004 false positives)."""
+    template = "weekly advisory published by the same agency " + "shared boilerplate navigation footer disclaimer " * 8
+    doc = _doc("doc:new", template + "CVE-2026-1111 affects Apache servers with remote code execution")
+    hist_text = template + "CVE-2025-9999 affects OpenSSL certificate validation routines"
+    decisions = curate_documents(
+        [doc], "report:x", PERIOD_START, PERIOD_END,
+        document_embeddings={"doc:new": _emb(1.0)},
+        historical_embeddings=[_emb(1.0)],
+        historical_documents=[{"document_id": "doc:old", "text": hist_text}],
+    )
+    assert decisions[0].decision == ReporterDecision.REPORTER_ONLY
+    assert decisions[0].duplicate_of is None
+
+
+def test_novelty_gate_confirms_duplicate_with_lexical_overlap():
+    """Cosine >0.95 AND token overlap >=0.85 vs the matched document →
+    true near-duplicate → DUPLICATE, with duplicate_of pointing at it."""
+    text = "identical article body about photonic processors and memory bandwidth limits " * 3
+    doc = _doc("doc:new", text)
+    decisions = curate_documents(
+        [doc], "report:x", PERIOD_START, PERIOD_END,
+        document_embeddings={"doc:new": _emb(1.0)},
+        historical_embeddings=[_emb(1.0)],
+        historical_documents=[{"document_id": "doc:old", "text": text}],
+    )
+    assert decisions[0].decision == ReporterDecision.DUPLICATE
+    assert decisions[0].duplicate_of == "doc:old"
+
+
+def test_novelty_gate_keeps_document_when_match_unverifiable():
+    """Cosine >0.95 with no aligned historical text to confirm → keep.
+    An unverifiable fuzzy match must never cause deletion."""
+    doc = _doc("doc:new", "distinct content about quantum networking and error correction")
+    decisions = curate_documents(
+        [doc], "report:x", PERIOD_START, PERIOD_END,
+        document_embeddings={"doc:new": _emb(1.0)},
+        historical_embeddings=[_emb(1.0)],
+    )
+    assert decisions[0].decision == ReporterDecision.REPORTER_ONLY
+
+
+def test_novelty_gate_lexical_fallback_still_rejects_near_copies():
+    """Without embeddings, novelty uses Jaccard directly; a >0.95 token
+    overlap IS lexical confirmation → DUPLICATE still applies."""
+    text = "identical body about memory hierarchy and cache coherence protocols " * 2
+    doc = _doc("doc:new", text)
+    decisions = curate_documents(
+        [doc], "report:x", PERIOD_START, PERIOD_END,
+        historical_documents=[{"document_id": "doc:old", "text": text}],
+    )
+    assert decisions[0].decision == ReporterDecision.DUPLICATE
+
+
 def test_topic_discovery_is_not_domain_taxonomy():
     docs = [
         _doc("doc:a", "quantum photonic processors improve optical computation"),

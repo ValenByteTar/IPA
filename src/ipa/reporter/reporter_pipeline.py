@@ -205,7 +205,7 @@ class ReporterPipeline:
 
             # Embed remaining chunks that weren't in main corpus
             if remaining_chunks:
-                embedding = EmbeddingAdapter(batch_size=64, show_progress=False)
+                embedding = EmbeddingAdapter(show_progress=False)
                 BATCH = 64
                 total_batches = (len(remaining_chunks) + BATCH - 1) // BATCH
                 for i in range(0, len(remaining_chunks), BATCH):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -43,6 +44,61 @@ def _log_perf(model: str, data: dict) -> None:
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+def loaded_ollama_models(base_url: str | None = None) -> list[dict[str, Any]]:
+    """Return models resident in Ollama VRAM (empty if none or API down)."""
+    base = (base_url or os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/ps", timeout=3) as response:
+            return json.loads(response.read()).get("models", [])
+    except Exception:
+        return []
+
+
+def unload_ollama_models(timeout_s: float = 20.0) -> list[str]:
+    """Unload resident Ollama models and wait until VRAM ownership is released."""
+    base = os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    loaded = loaded_ollama_models(base)
+    names = [str(m.get("name") or m.get("model") or "") for m in loaded]
+    names = [name for name in names if name]
+    if not names:
+        return []
+    for name in names:
+        body = json.dumps({"model": name, "keep_alive": 0}).encode()
+        request = urllib.request.Request(
+            f"{base}/api/generate", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15):
+                pass
+        except Exception:
+            pass
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not loaded_ollama_models(base):
+            return names
+        time.sleep(0.5)
+    raise TimeoutError("Ollama no liberó la VRAM dentro del timeout")
+
+
+def warmup_ollama_model(model: str, keep_alive: str = "30m") -> None:
+    """Reload one model after a GPU-exclusive embedding batch."""
+    base = os.environ.get("IPA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    body = json.dumps({
+        "model": model, "prompt": " ", "stream": False,
+        "keep_alive": keep_alive, "options": {"num_predict": 1},
+    }).encode()
+    request = urllib.request.Request(
+        f"{base}/api/generate", data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=180):
+        pass
+
+
+_OLLAMA_REQUEST_LOCK = threading.Lock()
 
 
 class OllamaProvider:
@@ -106,17 +162,19 @@ class OllamaProvider:
         detached and wait for readiness — the dashboard should not depend
         on Ollama having been started manually.
 
-        Si ExL3 tiene el lock de VRAM (batch en curso), falla claro: cargar
-        Ollama encima en 6 GB mata a ExL3 con OOM. Ollama NO toma el lock:
-        su modelo queda cargado con keep_alive y tomarlo bloquearía a ExL3
-        para siempre — solo lo respeta.
+        Si ExL3 o el lote de embeddings posee el lock de VRAM, falla claro:
+        cargar Ollama encima en 6 GB puede causar OOM. Durante inference,
+        generate_chat_stream mantiene el lock hasta terminar el request.
         """
         from . import vram_lock
         h = vram_lock.holder()
         if h is not None and h.get("owner") != "ollama":
+            owner = h.get("owner", "?")
+            detail = ("Chat temporalmente no disponible por ingesta masiva de embeddings."
+                      if owner == "bulk_embedding"
+                      else f"El chat queda sin backend hasta que termine {owner}.")
             raise RuntimeError(
-                f"VRAM ocupada por {h.get('owner', '?')} (pid {h.get('pid', '?')}): "
-                "el chat queda sin backend hasta que termine el batch ExL3")
+                f"VRAM ocupada por {owner} (pid {h.get('pid', '?')}): {detail}")
         self._ensure_server()
         try:
             resp = urllib.request.urlopen(f"{self.base_url}/api/tags", timeout=10)
@@ -189,10 +247,11 @@ class OllamaProvider:
             return False
         try:
             import subprocess
+            no_window = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
             out = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq ollama app.exe", "/NH"],
                 capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=no_window,
             ).stdout
             return "ollama" in out.lower()
         except Exception:
@@ -254,20 +313,65 @@ class OllamaProvider:
         temperature: Optional[float] = None,
         stop_sequences: Optional[List[str]] = None,
     ):
-        """Stream tokens from Ollama. Yields {"text": ..., "done": bool}."""
+        """Stream tokens from Ollama under an exclusive VRAM read lease."""
         if not self.is_loaded():
             yield {"text": "", "error": "model not loaded", "done": True}
             return
-        # Un request HTTP dispara la carga del modelo server-side aunque el
-        # provider ya esté "loaded": si ExL3 tiene el lock, cortamos acá para
-        # no matarlo con OOM.
         from . import vram_lock
-        _h = vram_lock.holder()
-        if _h is not None and _h.get("owner") not in (None, "ollama"):
-            yield {"text": "", "done": True,
-                   "error": f"GPU ocupada por {_h.get('owner')} (batch ExL3 en curso)"}
+        try:
+            from ipa.agentic.embedding_maintenance import chat_block_reason
+            maintenance_error = chat_block_reason()
+        except Exception:
+            maintenance_error = None
+        if maintenance_error:
+            yield {"text": "", "error": maintenance_error, "done": True}
             return
 
+        # Serialize provider requests in this process. The file lock extends
+        # the lease across generation so a bulk embed cannot unload Ollama in
+        # the middle of an active response. Different-process Ollama requests
+        # wait for the short current request rather than stealing its lock.
+        with _OLLAMA_REQUEST_LOCK:
+            deadline = time.monotonic() + 300
+            while not vram_lock.acquire("ollama"):
+                try:
+                    from ipa.agentic.embedding_maintenance import chat_block_reason
+                    maintenance_error = chat_block_reason()
+                except Exception:
+                    maintenance_error = None
+                if maintenance_error:
+                    yield {"text": "", "error": maintenance_error, "done": True}
+                    return
+                holder = vram_lock.holder()
+                if holder is not None and holder.get("owner") != "ollama":
+                    owner = holder.get("owner", "otro proceso")
+                    error = (
+                        "Chat temporalmente no disponible: IPA está completando una "
+                        "ingesta masiva de embeddings en la GPU."
+                        if owner == "bulk_embedding"
+                        else f"GPU ocupada por {owner}; el chat queda en espera."
+                    )
+                    yield {"text": "", "done": True, "error": error}
+                    return
+                if time.monotonic() >= deadline:
+                    yield {"text": "", "done": True,
+                           "error": "Ollama está ocupado por otro proceso."}
+                    return
+                time.sleep(0.2)
+            try:
+                yield from self._generate_chat_stream_unlocked(
+                    messages, max_new_tokens, temperature, stop_sequences)
+            finally:
+                vram_lock.release("ollama")
+
+    def _generate_chat_stream_unlocked(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
+    ):
+        """Streaming HTTP request; caller owns vram.lock for its lifetime."""
         max_tokens = max_new_tokens or self.max_output_tokens
         stops = list(stop_sequences) if stop_sequences else []
         # ChatML stop tokens (same as ExL3)

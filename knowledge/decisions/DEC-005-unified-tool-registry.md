@@ -3,13 +3,15 @@ id: DEC-005
 category: decision
 status: accepted
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-23
 author: agent
 components: [agent_core, dashboard]
 tags: [tools, system-tools, registry, tool-catalog, bounded-loop, chat]
 related: [DEC-002, DEC-004]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agent/system_tools.py", "tests/test_system_tools.py"]
+affects: ["src/ipa/agent/system_tools.py", "src/ipa/agent/agent_tools.py", "src/ipa/mcp/**"]
 ---
 
 # DEC-005 — Registry unificado de tools del agente

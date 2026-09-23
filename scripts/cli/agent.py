@@ -147,6 +147,10 @@ def cmd_research(args: argparse.Namespace) -> int:
 
         try:
             print(f"[research] investigando: {args.query}")
+            # DEC-003b: la ingesta aterriza en el staging de research; la
+            # curación T1 decide qué entra a main (IPA_RESEARCH_STAGING=0
+            # restaura el comportamiento directo).
+            from ipa.agent.system_tools import _research_ingest_corpus
             call, result, research = execute_research(
                 args.query, ctx,
                 session_id=sid, episode_id=ep.episode_id,
@@ -155,6 +159,8 @@ def cmd_research(args: argparse.Namespace) -> int:
                 max_age_days=args.max_age_days,
                 judge=judge,
                 landing_dir=args.landing,
+                sub_queries=args.sub_queries,
+                staging_corpus_dir=_research_ingest_corpus(),
             )
 
             print(f"\nstatus: {result.status}")
@@ -208,7 +214,13 @@ def main() -> int:
                           help="lenient: date as judge signal; strict: hard age cutoff")
     research.add_argument("--max-age-days", type=int, default=365,
                           help="age cutoff (hard reject only in strict mode)")
-    research.add_argument("--landing", default="Landing/web")
+    research.add_argument(
+        "--landing", default=None,
+        help="Dir de trabajo del scrape (default: outputs/agent/research/<run_id>/ — "
+             "nunca el Landing/web compartido con el pipeline; PM-004)")
+    research.add_argument("--sub-queries", nargs="*", default=None, metavar="Q",
+                          help="facetas extra del tema — cada una corre su propia "
+                               "búsqueda y ensancha el pool (máx 8)")
     research.add_argument("--role", default="general", choices=["general", "tutor"])
 
     args = parser.parse_args()

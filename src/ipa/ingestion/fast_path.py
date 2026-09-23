@@ -229,6 +229,30 @@ class FastPathRunner:
         else:
             chunks = chunk_document(doc, self.chunk_size, self.chunk_overlap)
         self.landing.set_stage(ref.artifact_id, "chunking", "success")
+        if not chunks:
+            # Parse succeeded but produced no usable text (scanned PDF whose
+            # OCR returned nothing, empty/whitespace files). Store nothing —
+            # an empty document would only reach curation to be rejected
+            # anyway — and mark the artifact `no_text` so the sweep deletes
+            # the file instead of it lingering as "indexed" forever.
+            self.landing.set_status(ref.artifact_id, "no_text")
+            self.landing.commit()
+            if self.trace:
+                self.trace.emit(make_event(
+                    ref.artifact_id, "pipeline", "no_text",
+                    latency_ms=(time.monotonic() - t_stage) * 1000,
+                    metadata={"document_id": doc.document_id, "pages": doc.pages},
+                ))
+            return FastPathResult(
+                artifact_id=ref.artifact_id,
+                mime_type=mime_type,
+                parser_id=parser_id,
+                document_id=doc.document_id,
+                pages=doc.pages,
+                chunks_created=0,
+                first_queryable=self.index.is_queryable(),
+                elapsed_seconds=time.monotonic() - start,
+            )
         self.landing.set_status(ref.artifact_id, "chunked")
         if self.trace:
             chunk_hashes = [_hash_text(c.text) for c in chunks[:10]]
@@ -329,11 +353,11 @@ class FastPathRunner:
                         digest.update(block)
                 artifact_id = f"sha256:{digest.hexdigest()}"
                 status = self.landing.get_status(artifact_id)
-                if status == "indexed":
+                if status in ("indexed", "no_text"):
                     skipped += 1
                     if progress and (skipped % 50 == 0 or skipped == 1):
                         safe_name = path.name[:60].encode("ascii", "replace").decode("ascii")
-                        print(f"[{i:>5}/{total}] SKIP {safe_name:<60} (already indexed, {skipped} skipped)", flush=True)
+                        print(f"[{i:>5}/{total}] SKIP {safe_name:<60} ({status}, {skipped} skipped)", flush=True)
                     continue
             result = self.ingest(path)
             results.append(result)

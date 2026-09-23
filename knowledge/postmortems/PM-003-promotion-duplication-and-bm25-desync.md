@@ -3,13 +3,15 @@ id: PM-003
 category: postmortem
 status: accepted
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-23
 author: human
 components: [vector_index, agentic_runtime, ingestion]
 tags: [lancedb, duplicates, promotion, idempotency, bm25, sync]
-related: [PM-001, PAT-001, DEC-003, EXP-006]
+related: [PM-001, PAT-001, DEC-003, EXP-006, PM-005]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agentic/promotion_executor.py", "tests/test_promotion_executor.py"]
+affects: ["src/ipa/agentic/promotion_executor.py", "src/ipa/indexes/bm25_index.py"]
 ---
 
 # PM-003 — Duplicación de vectores LanceDB y desincronización BM25 durante promoción

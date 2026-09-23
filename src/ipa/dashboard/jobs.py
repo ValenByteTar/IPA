@@ -7,21 +7,31 @@ globals().update({name: value for name, value in vars(_server).items() if not na
 
 def _find_running_processes(pattern: str) -> list[int]:
     """Find python processes whose command line matches a pattern."""
+    if os.name == "nt":
+        # wmic fue removido de Windows 11 — consultar vía CIM.
+        ps_cmd = (
+            "Get-CimInstance Win32_Process -Filter "
+            "\"Name='python.exe' OR Name='pythonw.exe'\" "
+            "| ForEach-Object { \"{0}`t{1}\" -f $_.ProcessId, $_.CommandLine }"
+        )
+        cmd = ["powershell", "-NoProfile", "-Command", ps_cmd]
+    else:
+        cmd = ["ps", "-eo", "pid=,args="]
     try:
         result = subprocess.run(
-            ["wmic", "process", "where", "Name='python.exe' or Name='pythonw.exe'", "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0,
+            cmd,
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         pids = []
         for line in result.stdout.strip().splitlines():
-            if pattern in line:
-                parts = line.split(",")
-                if len(parts) >= 2:
-                    try:
-                        pids.append(int(parts[-1]))
-                    except ValueError:
-                        continue
+            if pattern not in line:
+                continue
+            token = line.split("\t", 1)[0] if os.name == "nt" else line.split(None, 1)[0]
+            try:
+                pids.append(int(token))
+            except ValueError:
+                continue
         return pids
     except Exception:
         return []

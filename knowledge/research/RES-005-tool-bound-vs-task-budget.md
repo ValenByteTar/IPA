@@ -1,15 +1,17 @@
 ---
 id: RES-005
 category: research
-status: proposed
+status: accepted
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-23
 author: human
-components: [agent_core, dashboard_api, system_tools, research_executor]
+components: [agent_core, dashboard, system_tools, research_executor]
 tags: [agentic-loop, autonomy, safety, budget, llm-constraints]
 related: [DEC-005, RES-002, RES-006]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agent/task_planner.py", "tests/test_cognitive_layer.py", "src/ipa/dashboard/api.py"]
+affects: ["src/ipa/dashboard/api.py", "src/ipa/agent/task_planner.py"]
 ---
 
 # RES-005 — Bound por turno vs budget por tarea
@@ -91,3 +93,21 @@ Aunque cambiáramos `MAX_TOOL_ROUNDS = 20`:
 - Falta definir el contrato de `Task` con `budget`, `state`, `subtasks`, `resume_point`.
 - Falta decidir si el planner es determinístico (reglas) o usa el LLM en modo "plan-only" (una sola generación, sin tools).
 - Falta benchmark de degradación del 9B a partir de qué round el modelo pierde el hilo (medir quality vs round count).
+
+## Addendum 2026-09-23 — gaps 1-3 cerrados por DEC-006
+
+- **Planner + task queue implementados**: `src/ipa/agent/task_planner.py`
+  (`TaskStore`/`Planner`/`TaskExecutor`, store `outputs/agent/task_store.db`),
+  budget 6 sub-tasks × 3 tools, resumible vía `current_subtask`.
+- **Contrato de la task**: el store persiste `tasks`/`subtasks`/
+  `subtask_results`; el bound de 3 tools/turno del chat interactivo queda
+  intacto — la unidad de bound pasó a "por tarea con budget", que es
+  exactamente el takeaway 2 de este research.
+- **Planner**: 1 generación LLM (plan JSON) con fallback determinístico a
+  plantilla; el LLM nunca ejecuta tools (PAT-004). Queda como "plan-only",
+  no como planner determinístico puro.
+- **Gap 4 sigue abierto**: no hay medición quality-vs-round del 9B. Deuda de
+  evaluación, no de arquitectura.
+
+Estado: promovido a `accepted` — su conclusión (cambiar la unidad de bound,
+no subirla) está implementada y en producción.

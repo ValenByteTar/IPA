@@ -3,13 +3,14 @@ id: EXP-006
 category: experiment
 status: accepted
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-23
 author: human
 components: [agentic_runtime, document_store, reporter, ingestion]
 tags: [promotion, provenance, idle-enrichment, decoupling, reporter-independent]
 related: [DEC-003, PAT-001, PAT-005, EXP-003, PM-001]
 supersedes: null
 superseded_by: null
+affects: ["src/ipa/reporter/**", "src/ipa/agentic/promotion_executor.py"]
 ---
 
 # EXP-006 — Promoción independiente del Reporter

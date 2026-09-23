@@ -3,13 +3,15 @@ id: PM-001
 category: postmortem
 status: accepted
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-23
 author: human
 components: [lexical_index, vector_index, ingestion, idempotency]
 tags: [duplicates, restart, reprocessing, tantivy, lancedb]
 related: [PAT-001, PAT-002]
 supersedes: null
 superseded_by: null
+evidence: ["src/ipa/agentic/index_audit.py", "tests/test_index_audit.py"]
+affects: ["src/ipa/indexes/**", "src/ipa/agentic/index_audit.py"]
 ---
 
 # PM-001 — Riesgo de duplicación de índices durante reprocessing

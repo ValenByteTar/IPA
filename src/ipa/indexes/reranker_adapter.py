@@ -111,10 +111,13 @@ def physical_free_vram_mb() -> float | None:
     """
     try:
         import subprocess
+        no_window = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+                     if os.name == "nt" else 0)
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
+            creationflags=no_window,
         )
         used, total = (
             float(x) for x in out.stdout.strip().splitlines()[0].split(",")
