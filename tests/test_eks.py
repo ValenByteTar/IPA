@@ -484,3 +484,82 @@ def test_liveness_scan_skips_runtime_trees(tmp_path: Path):
     assert "src/a.py" in files
     assert not any(item.startswith("outputs/") for item in files)
     assert not any(item.startswith("Archive/") for item in files)
+
+
+# --- one evidence rule (validate / report / rot warning) ------------------
+
+def _accepted_with_body(tmp_path: Path, body: str) -> EKSRepository:
+    content = (VALID_DECISION
+               .replace("A deterministic context boundary for development.", body)
+               .replace("created: 2026-09-05", "created: 2026-09-23")
+               .replace("updated: 2026-09-05", "updated: 2026-09-23"))
+    return _repo(tmp_path, content)
+
+
+def test_gate_rejects_runtime_agent_state_as_evidence(tmp_path: Path):
+    """`outputs/agent/**` is on-demand runtime state, not evidence. Before the
+    rule was unified the gate accepted it (only `.lock` was skipped) while the
+    rot warning already ignored it — two verdicts on one fact."""
+    (tmp_path / "outputs" / "agent").mkdir(parents=True)
+    (tmp_path / "outputs" / "agent" / "staging.json").write_text("{}", encoding="utf-8")
+    repo = _accepted_with_body(tmp_path, "Ver `outputs/agent/staging.json`.")
+    report = repo.validate()
+    assert not report.valid
+    assert any("no verifiable evidence" in error for error in report.errors)
+    assert not any("cited artifact missing" in warning for warning in report.warnings)
+
+
+def test_report_has_evidence_uses_the_same_rule(tmp_path: Path):
+    (tmp_path / "outputs" / "agent").mkdir(parents=True)
+    (tmp_path / "outputs" / "agent" / "staging.json").write_text("{}", encoding="utf-8")
+    root = tmp_path / "knowledge"
+    (root / "decisions").mkdir(parents=True)
+    (root / "decisions" / "DEC-001.md").write_text(
+        VALID_DECISION.replace("status: accepted", "status: draft")
+        .replace("A deterministic context boundary for development.",
+                 "Ver `outputs/agent/staging.json`."),
+        encoding="utf-8")
+    items = EKSRepository(root).report()["open_items"]
+    assert [item["has_evidence"] for item in items] == [False]
+
+
+def test_evidence_must_be_a_file_not_a_directory(tmp_path: Path):
+    (tmp_path / "outputs" / "experiments" / "E0").mkdir(parents=True)
+    repo = _accepted_with_body(tmp_path, "Ver `outputs/experiments/E0/`.")
+    assert not repo.validate().valid
+    assert not any("cited artifact missing" in warning
+                   for warning in repo.validate().warnings)
+
+
+def test_prose_and_intentional_non_paths_are_not_citations(tmp_path: Path):
+    """`docs/s` is a rate unit ("0.69 docs/s") and `docs/adr/` is a documented
+    non-existent path (DEC-008) — neither is a citation."""
+    repo = _accepted_with_body(
+        tmp_path,
+        "Corrió a 0.69 docs/s. No hay `docs/adr/` para decisiones propias.")
+    assert not any("cited artifact missing" in warning
+                   for warning in repo.validate().warnings)
+    assert not repo.record_has_evidence(repo.records()[0])
+
+
+def test_dead_docs_citation_is_reported(tmp_path: Path):
+    """The rot check used to scan only `outputs/`; `docs/` citations were
+    never verified. Legacy record → warning, not error."""
+    repo = _repo(tmp_path, VALID_DECISION.replace(
+        "A deterministic context boundary for development.",
+        "Ver `docs/TOOL_DECISION_FRAMEWORK.md`."))
+    report = repo.validate()
+    assert report.valid
+    assert any("docs/TOOL_DECISION_FRAMEWORK.md" in warning
+               for warning in report.warnings)
+
+
+def test_historical_line_is_neither_evidence_nor_rot(tmp_path: Path):
+    (tmp_path / "outputs" / "experiments" / "E0").mkdir(parents=True)
+    (tmp_path / "outputs" / "experiments" / "E0" / "report.json").write_text(
+        "{}", encoding="utf-8")
+    repo = _accepted_with_body(
+        tmp_path, "Artefacto histórico (`outputs/experiments/E0/report.json`).")
+    record = repo.records()[0]
+    assert repo._body_evidence_citations(record) == []
+    assert repo._missing_artifact_links(record) == []

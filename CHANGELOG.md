@@ -2,6 +2,32 @@
 
 Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 
+## Unreleased — 2026-09-23 (regla única de evidencia en EKS)
+
+- **Una sola regla para "¿este record tiene evidencia?"**. Estaba implementada
+  **tres veces** con escapes distintos: `validate()` (gate de promoción) y
+  `report()` solo salteaban `.lock`, mientras `_missing_artifact_links()`
+  también salteaba `outputs/agent/**` y las citas declaradas históricas — dos
+  veredictos sobre el mismo hecho. Ahora hay un helper
+  (`_body_evidence_citations`) + una regla pública (`record_has_evidence`) que
+  consumen los tres.
+- **El chequeo de rot nunca miraba `docs/`** (solo `outputs/`). Al unificar
+  aparecieron 9 citas: 6 eran ruido de prosa (`docs/s` y `docs/chunks` son
+  *unidades de tasa* — "0.69 docs/s" — y `docs/adr` es un path inexistente a
+  propósito, DEC-008). Se exige que la cita sea un **archivo** (extensión),
+  no un directorio ni una tasa.
+- Consecuencia del ajuste: 3 records citaban **directorios** como evidencia
+  (DEC-004, EXP-006, PM-002) — ahora llevan `evidence:` explícito a archivos
+  reales. Quedan 3 warnings verdaderos, todos citas a docs que **nunca
+  existieron en este repo** (git no tiene registro de
+  `docs/IPA_SYSTEM_OVERVIEW.md`, `docs/TOOL_DECISION_FRAMEWORK.md`,
+  `docs/06-llm-benchmark-summary.md`; el último vive en el repo externo
+  `small-model-deliberation`).
+- Tests: 6 nuevos en `tests/test_eks.py` — el gate y el reporte comparten la
+  regla, `outputs/agent/**` no es evidencia, un directorio no es evidencia,
+  prosa/tasa no es cita, cita muerta en `docs/` sí se reporta, y una línea
+  histórica no es ni evidencia ni rot. Suite: 1152 passed, 1 skipped.
+
 ## Unreleased — 2026-09-23 (research progress + fixes)
 
 - **Progreso granular de research**: `execute_research(on_progress=...)`
@@ -136,6 +162,18 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   `tests/test_eks.py` (5: concurrencia de acquire, grupos/alias de
   componentes, hot zones por solape, skip del liveness). Suite: 1146 passed,
   1 skipped.
+- **Skills portadas desde Windsurf**: `self-review`, `refactoring` y
+  `rag-component-development` viven ahora en `.devin/skills/`, reescritas con
+  el protocolo real (gate de evidencia, `eks_governing`, scaffold vía
+  `eks_new.py`, fronteras de `boundaries.md` + PAT-001/003/004/008 y
+  PM-001/003). Las 6 skills globales de `~/.codeium/windsurf/skills/` se
+  movieron a `skills-backup-20260923/` (fuera del árbol de descubrimiento,
+  con README de restauración): no se portaron `engineering-context-builder`
+  (duplicada por `eks-engineering-brief`), `documentation` (superada por
+  `experiment-logging`) ni `adr-compilance-review` (cubierta por
+  `adr-proposal` + `eks_governing`). Las 3 portadas también quedaron fuera de
+  servicio como globales, para no reintroducir la colisión de nombres.
+  `~/.codeium/windsurf/memories/global_rules.md` intacto.
 
 ## Unreleased — 2026-09-23 (research GPU embed escalation)
 

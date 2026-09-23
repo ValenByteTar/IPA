@@ -231,7 +231,7 @@ a second domain runtime: state lives in the core (`outputs/agent/*`).
 
 ## Tests
 
-`.venv/Scripts/python.exe -m pytest -v` — currently **1146 passed, 1 skipped**
+`.venv/Scripts/python.exe -m pytest -v` — currently **1152 passed, 1 skipped**
 (network test; run it with `--run-network-tests`). `tests/conftest.py` sets
 `IPA_RERANK=0` for the whole suite so the cross-encoder never loads from the
 default. Test files are named after the capability they cover; use

@@ -11,6 +11,7 @@ related: [BM-001, BM-002, BM-003, BM-004, BM-005, EXP-001, EXP-002, RES-001]
 supersedes: null
 superseded_by: null
 affects: ["src/ipa/storage/**", "src/ipa/ingestion/provenance.py"]
+evidence: ["src/ipa/ingestion/provenance.py", "tests/test_ingest_metadata.py"]
 ---
 
 # PM-002 — Pérdida de artefactos crudos de benchmarks históricos (E0-E11)

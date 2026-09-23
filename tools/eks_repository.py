@@ -22,8 +22,8 @@ PREFIX_TO_CATEGORY = {prefix: category for category, (_, prefix) in CATEGORIES.i
 ID_RE = re.compile(r"^(DEC|EXP|BM|PM|PAT|RES)-\d{3,}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
-ARTIFACT_RE = re.compile(r"\boutputs/[\w.\-/]+")
-DOCS_RE = re.compile(r"\bdocs/[\w.\-/]+")
+ARTIFACT_RE = re.compile(r"\boutputs/[\w.\-/]+\.[A-Za-z0-9]{1,6}\b")
+DOCS_RE = re.compile(r"\bdocs/[\w.\-/]+\.[A-Za-z0-9]{1,6}\b")
 
 # Governance rules graduated by creation date: records authored from this
 # day on must meet the promotion gate (evidence) and declare author_model
@@ -46,6 +46,14 @@ _LIVENESS_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",
                        ".pytest_cache", ".mypy_cache", ".ruff_cache",
                        "outputs", "Archive", "Transit", "models",
                        "local_archive", "build", "dist", "exllamav3-dev"}
+
+# Single eligibility rule for "which body citation can count as evidence"
+# (EKSRepository._body_evidence_citations). Runtime leases and on-demand agent
+# state are not evidence, and a citation the record itself declares historical
+# is not a live claim.
+_EVIDENCE_SKIP_PREFIXES = ("outputs/agent/",)
+_HISTORICAL_MARKERS = ("histórico", "historico", "histórica", "historica",
+                       "ya no existe", "ya no existen", "no disponible")
 
 
 def glob_match(path: str, pattern: str) -> bool:
@@ -271,33 +279,52 @@ class EKSRepository:
                    for group, members in groups.items()
                    if wanted in {str(member).casefold() for member in members})
 
-    def _missing_artifact_links(self, record: EKSRecord) -> list[str]:
-        """`outputs/...` paths cited in the body that no longer exist.
+    def _body_evidence_citations(self, record: EKSRecord) -> list[str]:
+        """Body citations eligible to count as evidence.
 
-        Existence is checked against the repository parent (project root when
-        root=knowledge/). Warnings only: PM-002 showed evidence rot is real,
-        but generated output is not committed and CI must not fail on it.
+        The single eligibility rule shared by the promotion gate (`validate`),
+        the hygiene report (`report`) and the artifact-rot warning
+        (`_missing_artifact_links`). Three kinds of citation are excluded:
+        runtime leases (`.lock`), on-demand agent state under `outputs/agent/`
+        (staging corpora, review queues — created and dropped at runtime) and
+        citations on a line that already declares the artifact historical (the
+        BM/EXP records referencing PM-002). Callers apply their own existence
+        check.
+        """
+        citations: list[str] = []
+        for line in record.body.splitlines():
+            if any(marker in line.casefold() for marker in _HISTORICAL_MARKERS):
+                continue
+            for match in [*ARTIFACT_RE.findall(line), *DOCS_RE.findall(line)]:
+                if match.endswith(".lock") or match.startswith(_EVIDENCE_SKIP_PREFIXES):
+                    continue
+                citations.append(match)
+        return citations
 
-        Three kinds of citation are not evidence rot and are skipped:
-        runtime leases (`.lock`), runtime state under `outputs/agent/`
-        (staging corpora, review queues — created on demand), and citations
-        on a line that already declares the artifact historical (the BM/EXP
-        records that reference PM-002). Everything else still warns.
+    def record_has_evidence(self, record: EKSRecord) -> bool:
+        """Does this record have verifiable evidence on disk?
+
+        The explicit `evidence:` field first, then an eligible body citation
+        (see `_body_evidence_citations`) that resolves to an existing path.
         """
         base = self.root.parent
-        historical_markers = ("histórico", "historico", "histórica", "historica",
-                              "ya no existe", "ya no existen", "no disponible")
-        missing = []
-        for line in record.body.splitlines():
-            if any(marker in line.casefold() for marker in historical_markers):
-                continue
-            for match in ARTIFACT_RE.findall(line):
-                if match.endswith(".lock") or match.startswith("outputs/agent/"):
-                    continue  # runtime-transient: lease or on-demand agent state
-                candidate = (base / match).resolve()
-                if not candidate.exists():
-                    missing.append(match)
-        return missing
+        declared = record.metadata.get("evidence")
+        if isinstance(declared, list) and any(
+                isinstance(entry, str) and (base / entry).resolve().exists()
+                for entry in declared):
+            return True
+        return any((base / citation).resolve().exists()
+                   for citation in self._body_evidence_citations(record))
+
+    def _missing_artifact_links(self, record: EKSRecord) -> list[str]:
+        """Eligible body citations that no longer exist on disk.
+
+        Warnings only: PM-002 showed evidence rot is real, but generated output
+        is not committed and CI must not fail on it.
+        """
+        base = self.root.parent
+        return [citation for citation in self._body_evidence_citations(record)
+                if not (base / citation).resolve().exists()]
 
     def _repo_files(self) -> list[str]:
         """Repo-relative posix paths, used for `affects` glob liveness."""
@@ -502,12 +529,9 @@ class EKSRepository:
                             message = f"{record.relative_path}: evidence path missing on disk: {entry}"
                             (errors if is_new else warnings).append(message)
             if not evidence_ok:
-                # Body citations to existing artifacts/docs also satisfy the
-                # promotion gate — evidence is the explicit form.
-                for match in [*ARTIFACT_RE.findall(record.body), *DOCS_RE.findall(record.body)]:
-                    if not match.endswith(".lock") and (base / match).resolve().exists():
-                        evidence_ok = True
-                        break
+                # One shared rule: eligible body citations to existing
+                # artifacts/docs also satisfy the promotion gate.
+                evidence_ok = self.record_has_evidence(record)
             if metadata.get("status") == "accepted" and not evidence_ok:
                 if is_new:
                     errors.append(
@@ -698,22 +722,11 @@ class EKSRepository:
                     return None
             return None
 
-        base = self.root.parent
-
-        def _has_evidence(record: EKSRecord) -> bool:
-            evidence = record.metadata.get("evidence")
-            if isinstance(evidence, list) and any(
-                    isinstance(e, str) and (base / e).resolve().exists() for e in evidence):
-                return True
-            return any(
-                not m.endswith(".lock") and (base / m).resolve().exists()
-                for m in [*ARTIFACT_RE.findall(record.body), *DOCS_RE.findall(record.body)])
-
         open_items = [
             {"id": r.record_id, "title": r.title,
              "status": r.metadata.get("status"),
              "age_days": _age(r.metadata.get("created")),
-             "has_evidence": _has_evidence(r)}
+             "has_evidence": self.record_has_evidence(r)}
             for r in records
             if r.metadata.get("status") in {"draft", "proposed"}
         ]

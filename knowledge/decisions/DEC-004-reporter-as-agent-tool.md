@@ -11,6 +11,7 @@ related: [DEC-003, EXP-003, EXP-006, PAT-001, PAT-003]
 supersedes: null
 superseded_by: null
 affects: ["src/ipa/reporter/**", "src/ipa/agent/compile_report_executor.py"]
+evidence: ["src/ipa/agent/compile_report_executor.py", "tests/test_compile_report.py"]
 ---
 
 # DEC-004 — Reporter como tool del agente (compile_report)
