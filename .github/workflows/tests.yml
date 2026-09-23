@@ -22,21 +22,23 @@ jobs:
       - name: Run tests
         run: |
           set +e
-          python -m pytest -q --tb=line > /tmp/pytest.log 2>&1
+          # -p no:warnings: el warnings summary tiene ~cientos de lineas de
+          # deprecaciones (torch/easyocr) y tapa los FAILED reales en el tail.
+          python -m pytest -q --tb=line -p no:warnings > /tmp/pytest.log 2>&1
           status=$?
           echo "--- pytest exit=$status ---"
-          tail -80 /tmp/pytest.log
+          tail -60 /tmp/pytest.log
           # El log de Actions no es legible sin autenticarse, pero las
           # anotaciones de check-run y el step summary SI son publicos:
           # publicamos el tail ahi para poder diagnosticar sin credenciales.
           {
             echo '### pytest tail'
             echo '```text'
-            tail -80 /tmp/pytest.log
+            tail -60 /tmp/pytest.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$status" -ne 0 ]; then
-            summary=$(tail -60 /tmp/pytest.log | sed 's/%/%25/g; s/\r//g' \
+            summary=$(tail -55 /tmp/pytest.log | sed 's/%/%25/g; s/\r//g' \
                       | awk 'NR > 1 { printf "%%0A" } { printf "%s", $0 }')
             echo "::error title=pytest failures::$summary"
           fi
