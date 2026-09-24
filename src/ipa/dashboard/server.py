@@ -112,13 +112,19 @@ DEEP_DIVE_PROVIDER = None
 
 # Singleton embedding adapter for auto-retrieval (CPU, preloaded at startup).
 _EMBED_ADAPTER = None
+_EMBED_ADAPTER_LOCK = threading.Lock()
 
 def get_embedding_adapter():
     """Lazy singleton for BGE-M3 on CPU — avoids reloading per request."""
     global _EMBED_ADAPTER
     if _EMBED_ADAPTER is None:
-        from ipa.indexes.embedding_adapter import EmbeddingAdapter
-        _EMBED_ADAPTER = EmbeddingAdapter(device="cpu", show_progress=False)
+        # Sin el lock, dos threads (warmup + primer request) creaban dos
+        # adapters → dos BGE-M3 en memoria y dos from_pretrained racing
+        # (PM-007).
+        with _EMBED_ADAPTER_LOCK:
+            if _EMBED_ADAPTER is None:
+                from ipa.indexes.embedding_adapter import EmbeddingAdapter
+                _EMBED_ADAPTER = EmbeddingAdapter(device="cpu", show_progress=False)
     return _EMBED_ADAPTER
 
 _CLEANING_LOCK = threading.Lock()

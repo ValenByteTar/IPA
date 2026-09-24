@@ -257,15 +257,21 @@ class RerankerAdapter:
     def _ensure_model(self) -> None:
         if self._model is not None:
             return
-        from FlagEmbedding import FlagReranker
-        self._device_resolved = self._resolve_device()
-        print(f"[rerank] cross-encoder loading on {self._device_resolved}", flush=True)
-        fp16 = self.use_fp16 and self._device_resolved == "cuda"
-        self._model = FlagReranker(
-            self.model_name,
-            use_fp16=fp16,
-            device=self._device_resolved,
-        )
+        # Bajo MODEL_LOAD_LOCK: from_pretrained parchea register_parameter
+        # globalmente; una carga concurrente deja params en 'meta' (PM-007).
+        from ipa.model_load_lock import MODEL_LOAD_LOCK
+        with MODEL_LOAD_LOCK:
+            if self._model is not None:
+                return
+            from FlagEmbedding import FlagReranker
+            self._device_resolved = self._resolve_device()
+            print(f"[rerank] cross-encoder loading on {self._device_resolved}", flush=True)
+            fp16 = self.use_fp16 and self._device_resolved == "cuda"
+            self._model = FlagReranker(
+                self.model_name,
+                use_fp16=fp16,
+                device=self._device_resolved,
+            )
 
     def rerank(
         self,

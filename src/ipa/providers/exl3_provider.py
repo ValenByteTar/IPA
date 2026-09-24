@@ -455,7 +455,14 @@ class ExL3Provider:
                 f"VRAM ocupada por {h.get('owner', '?')} (pid {h.get('pid', '?')}); "
                 "esperá a que termine o limpiá outputs/agent/vram.lock")
         try:
-            return self._load_locked()
+            # MODEL_LOAD_LOCK se toma DESPUÉS del vram.lock (orden fijo:
+            # archivo → thread) — nunca al revés, así no hay espera
+            # circular. Model.from_config construye nn.Modules; un
+            # from_pretrained concurrente en otro thread los dejaría en
+            # 'meta' (PM-007).
+            from ipa.model_load_lock import MODEL_LOAD_LOCK
+            with MODEL_LOAD_LOCK:
+                return self._load_locked()
         except Exception:
             # No filtrar el lock si la carga falla (OOM, VRAM ocupada por el
             # dashboard, etc.): el próximo intento debe poder tomarlo.

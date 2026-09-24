@@ -167,38 +167,59 @@ class EmbeddingAdapter:
         """Lazy-load the model on first use."""
         if self._model is not None:
             return
-        from FlagEmbedding import BGEM3FlagModel
-        self._device_resolved = self._resolve_device()
-        self.batch_size = self._resolve_batch()
-        # FP16 only helps on GPU; on CPU it's slower.
-        fp16 = self.use_fp16 and self._device_resolved == "cuda"
-        # Skip the hub round-trip ("Fetching N files") when the snapshot is
-        # already in the local HF cache — pero HF_HUB_OFFLINE se acota a este
-        # load: dejarlo seteado fuga al resto del proceso y rompe otros
-        # consumidores de HF que sí necesitan red (bug real en CI: docling
-        # no podía bajar sus modelos tras un test que cargaba BGE-M3).
-        cached = False
-        try:
-            from huggingface_hub import try_to_load_from_cache
-            cached = isinstance(
-                try_to_load_from_cache(self.model_name, "config.json"), str)
-        except Exception:
-            pass
-        prev_offline = os.environ.get("HF_HUB_OFFLINE")
-        if cached and prev_offline is None:
-            os.environ["HF_HUB_OFFLINE"] = "1"
-        try:
-            # BUG FIX: BGEM3FlagModel (M3Embedder) accepts `devices` (plural),
-            # not `device`. The singular `device` was swallowed by **kwargs and
-            # silently ignored, so device="cpu" still ran on cuda:0.
-            self._model = BGEM3FlagModel(
-                self.model_name,
-                use_fp16=fp16,
-                devices=[self._device_resolved] if self._device_resolved else None,
-            )
-        finally:
+        # La construcción va bajo el lock global de cargas: accelerate
+        # parchea nn.Module.register_parameter globalmente durante
+        # from_pretrained y una carga concurrente deja params en 'meta'
+        # (PM-007). El double-check adentro del lock evita construir dos
+        # modelos cuando dos threads llegan juntos.
+        from ipa.model_load_lock import MODEL_LOAD_LOCK
+        with MODEL_LOAD_LOCK:
+            if self._model is not None:
+                return
+            from FlagEmbedding import BGEM3FlagModel
+            self._device_resolved = self._resolve_device()
+            self.batch_size = self._resolve_batch()
+            # FP16 only helps on GPU; on CPU it's slower.
+            fp16 = self.use_fp16 and self._device_resolved == "cuda"
+            # Skip the hub round-trip ("Fetching N files") when the snapshot is
+            # already in the local HF cache — pero HF_HUB_OFFLINE se acota a este
+            # load: dejarlo seteado fuga al resto del proceso y rompe otros
+            # consumidores de HF que sí necesitan red (bug real en CI: docling
+            # no podía bajar sus modelos tras un test que cargaba BGE-M3).
+            cached = False
+            try:
+                from huggingface_hub import try_to_load_from_cache
+                cached = isinstance(
+                    try_to_load_from_cache(self.model_name, "config.json"), str)
+            except Exception:
+                pass
+            prev_offline = os.environ.get("HF_HUB_OFFLINE")
             if cached and prev_offline is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
+                os.environ["HF_HUB_OFFLINE"] = "1"
+            try:
+                # BUG FIX: BGEM3FlagModel (M3Embedder) accepts `devices` (plural),
+                # not `device`. The singular `device` was swallowed by **kwargs and
+                # silently ignored, so device="cpu" still ran on cuda:0.
+                self._model = BGEM3FlagModel(
+                    self.model_name,
+                    use_fp16=fp16,
+                    devices=[self._device_resolved] if self._device_resolved else None,
+                )
+            finally:
+                if cached and prev_offline is None:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+            # Tripwire: si pese al lock quedaron params en 'meta' (un loader
+            # ajeno al contrato corrió concurrente), fallar acá de una vez en
+            # vez de corromper cada query con "Cannot copy out of meta tensor".
+            _inner = getattr(self._model, "model", None)
+            if _inner is not None and any(
+                p.is_meta for p in _inner.parameters()
+            ):
+                self._model = None
+                raise RuntimeError(
+                    "BGE-M3 quedó con parámetros en device 'meta' — race de "
+                    "carga concurrente ajena al lock (PM-007); reintentar"
+                )
         self._dim = DEFAULT_DIM
 
     @property

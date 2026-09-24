@@ -1677,7 +1677,11 @@ async function sendAgentMessage(event){
             };
             if(data.stage==='found'&&data.sources){lastSources=data.sources}
             if(data.stage==='empty'){
-              contentEl.innerHTML=`<span class="tool-activity">${esc(stageLabels.empty)}</span>`+
+              // auto=true: el backend ya le ordenó al modelo disparar
+              // research_topic — se anuncia como automático y el botón queda
+              // como escape hatch si el modelo no emite la tool.
+              const autoNote=data.auto?' — investigando en la web automáticamente…':'';
+              contentEl.innerHTML=`<span class="tool-activity">${esc(stageLabels.empty+autoNote)}</span>`+
                 `<button class="research-btn" data-q="${esc(data.query||'')}" onclick="sendAgentText('investigá '+this.dataset.q)">🔎 Investigar en la web</button>`;
             }else{
               contentEl.innerHTML=`<span class="tool-activity">${esc(stageLabels[data.stage]||data.stage)}</span>`;

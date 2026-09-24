@@ -2,6 +2,27 @@
 
 Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 
+## Unreleased — 2026-09-24 (PM-007: race de cargas de modelo + SSE honesto)
+
+- **`MODEL_LOAD_LOCK`** (`src/ipa/model_load_lock.py`, nuevo): RLock global
+  que serializa toda construcción pesada de modelos in-process. Motivo:
+  `transformers`/`accelerate` parchean `nn.Module.register_parameter` a
+  nivel clase durante `from_pretrained` — un loader concurrente deja params
+  en device `meta` para siempre ("Cannot copy out of meta tensor"). El
+  dashboard los cargaba en warmups paralelos y el retrieval quedaba roto
+  todo el uptime. Cubiertos: `BGEM3FlagModel`, `FlagReranker`,
+  `easyocr.Reader`, `_load_locked()` de ExL3 (orden: vram.lock →
+  MODEL_LOAD_LOCK). Singletons con double-check + tripwire meta que falla
+  fuerte en vez de dejar un adapter corrupto.
+- **SSE honesto en retrieval**: `api.py` ya no emite `empty` tras
+  `error`/`timeout` (decía "no hay datos" cuando la búsqueda ni corrió);
+  el ctx volátil informa el fallo técnico. El `empty` genuino lleva
+  `auto: true` cuando el auto-research va a disparar → la UI anuncia
+  "investigando en la web automáticamente…" (botón queda como fallback).
+- Tests: `tests/test_model_load_lock.py` (5 casos: ctor bajo lock,
+  single-construction bajo contención, tripwire meta, reranker, OCR).
+- Postmortem completo: `knowledge/postmortems/PM-007`.
+
 ## Unreleased — 2026-09-23 (regla única de evidencia en EKS)
 
 - **Una sola regla para "¿este record tiene evidencia?"**. Estaba implementada

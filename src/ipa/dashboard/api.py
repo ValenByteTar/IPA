@@ -1667,6 +1667,7 @@ class Handler(BaseHTTPRequestHandler):
                 # restaura el comportamiento anterior (solo ofrece).
                 _auto_research = os.environ.get("IPA_AUTO_RESEARCH", "1") != "0"
                 _auto_hits: list[dict[str, Any]] = []
+                _retrieval_failed = False
                 # Cache de respuestas (opt-in IPA_RESPONSE_CACHE=1, default OFF):
                 # repetir la MISMA pregunta en la MISMA sesión (doble envío,
                 # retry tras timeout) re-emite la respuesta sin retrieval ni
@@ -1868,8 +1869,10 @@ class Handler(BaseHTTPRequestHandler):
                             _auto_hits = _RETRIEVAL_POOL.submit(_do_retrieval).result(timeout=_retrieval_timeout)
                             _RETRIEVAL_CACHE.put(_rkey, _auto_hits)
                     except _cf.TimeoutError:
+                        _retrieval_failed = True
                         self._sse_write({"type": "retrieval", "stage": "timeout"})
                     except Exception as exc:
+                        _retrieval_failed = True
                         self._sse_write({"type": "retrieval", "stage": "error", "error": str(exc)[:100]})
                     if _auto_hits:
                         _sources = [
@@ -1916,8 +1919,30 @@ class Handler(BaseHTTPRequestHandler):
                                 "en esta misma respuesta — la búsqueda web corre en "
                                 "background y avisa sola al terminar."
                             )
+                    elif _retrieval_failed:
+                        # error/timeout ya emitió su stage — mandar 'empty'
+                        # encima diría "buscamos y no había nada", que es
+                        # mentira: la búsqueda no corrió (PM-007: meta-tensor
+                        # enmascarado como corpus vacío durante todo un
+                        # uptime del dashboard).
+                        _volatile_ctx.append(
+                            "\n\nLa búsqueda en el corpus falló con un error "
+                            "técnico — NO significa que no haya datos. "
+                            "Decíselo honestamente al usuario y ofrecé "
+                            "reintentar la consulta o lanzar una investigación "
+                            "web con [TOOL:research_topic]{...}."
+                        )
                     else:
-                        self._sse_write({"type": "retrieval", "stage": "empty", "query": message})
+                        self._sse_write({
+                            "type": "retrieval", "stage": "empty",
+                            "query": message,
+                            # auto=True: el ctx de abajo le ordena al modelo
+                            # emitir research_topic — la UI lo anuncia como
+                            # búsqueda automática en vez de un botón suelto.
+                            "auto": bool(
+                                _is_order or (_auto_research and _msg_kind == "knowledge")
+                            ),
+                        })
                         if _is_order:
                             _volatile_ctx.append(
                                 "\n\nEl corpus NO devolvió resultados y el usuario dio una "

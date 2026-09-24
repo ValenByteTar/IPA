@@ -189,14 +189,21 @@ class OCRAdapter:
         """Load EasyOCR reader (lazy)."""
         if self._reader is not None:
             return
-        import easyocr
-        kwargs = {
-            "lang_list": self.languages,
-            "gpu": self.gpu,
-        }
-        if self.model_storage_directory:
-            kwargs["model_storage_directory"] = self.model_storage_directory
-        self._reader = easyocr.Reader(**kwargs)
+        # Bajo MODEL_LOAD_LOCK: easyocr.Reader construye nn.Modules; si
+        # corre concurrente con un from_pretrained (register_parameter
+        # parcheado globalmente) quedan params en 'meta' (PM-007).
+        from ipa.model_load_lock import MODEL_LOAD_LOCK
+        with MODEL_LOAD_LOCK:
+            if self._reader is not None:
+                return
+            import easyocr
+            kwargs = {
+                "lang_list": self.languages,
+                "gpu": self.gpu,
+            }
+            if self.model_storage_directory:
+                kwargs["model_storage_directory"] = self.model_storage_directory
+            self._reader = easyocr.Reader(**kwargs)
 
     def extract_text(self, image_path: str | Path) -> OCRResult:
         """Extract text from a single image.
