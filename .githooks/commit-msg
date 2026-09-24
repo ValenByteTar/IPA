@@ -1,0 +1,14 @@
+#!/bin/sh
+# commit-msg guard (2026-09-24): reject commits that attribute work to Devin.
+# Rule: .devin/rules/git-commit-hygiene.md — user prohibition, no exceptions.
+# $1 = path to the commit message file. Non-zero exit aborts the commit.
+if grep -qiE 'generated with .devin|co-authored-by: .devin|devin-ai-integration' "$1"; then
+    echo "" >&2
+    echo "commit-msg: COMMIT RECHAZADO" >&2
+    echo "  El mensaje atribuye trabajo a Devin (linea 'Generated with' o" >&2
+    echo "  'Co-Authored-By: Devin'). Prohibicion absoluta del usuario." >&2
+    echo "  Regla: .devin/rules/git-commit-hygiene.md" >&2
+    echo "  Elimina esas lineas y commitea de nuevo. No uses --no-verify." >&2
+    exit 1
+fi
+exit 0

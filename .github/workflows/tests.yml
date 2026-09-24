@@ -12,9 +12,18 @@ jobs:
         python-version: ["3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history: the attribution check scans every commit
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: No Devin attribution in commit messages
+        run: |
+          if git log --format=%B | grep -qiE 'generated with .devin|co-authored-by: .devin|devin-ai-integration'; then
+            echo "::error::Devin attribution found in commit messages (rule: .devin/rules/git-commit-hygiene.md)"
+            git log --format='%h %s' --grep='devin' -i
+            exit 1
+          fi
       - name: Install development profile
         run: python -m pip install -e ".[dev,retrieval,parsers,chunkers,web,mcp]"
       - name: Validate EKS

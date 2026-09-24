@@ -207,6 +207,9 @@ a second domain runtime: state lives in the core (`outputs/agent/*`).
   and tell the user. On close, record what the session learned via
   `eks_new` (draft) and pass it as `--eks-draft` to `permit.py close`.
 - Tests must validate real behavior, not just file existence.
+- Commits carry NO Devin attribution (no `Generated with Devin`, no
+  `Co-Authored-By: Devin`) — absolute user prohibition, enforced by
+  `.githooks/commit-msg` + CI. Rule: `.devin/rules/git-commit-hygiene.md`.
 
 ## Cleanup rules (DO NOT violate)
 
