@@ -71,7 +71,18 @@ let retryTimer=null;
 const processLabels={'scraper':'Scraper','pipeline':'Fast Path','lancedb':'LanceDB','rechunk':'Pipeline completo'};
 
 function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2800)}
-async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const data=await r.json();if(!r.ok||data.error)throw Error(data.error||`HTTP ${r.status}`);return data}
+async function api(url,opts={}){
+  const r=await fetch(url,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});
+  // Si el server devuelve HTML (send_error de BaseHTTPRequestHandler — p.ej.
+  // durante un restart del dashboard), r.json() tira un SyntaxError crudo
+  // ("Unexpected token '<'") que no le dice nada al usuario. Traducirlo.
+  if(!(r.headers.get('content-type')||'').includes('json')){
+    throw Error(`El servidor respondió sin JSON (HTTP ${r.status}) — puede estar reiniciando, reintentá en unos segundos`);
+  }
+  const data=await r.json();
+  if(!r.ok||data.error)throw Error(data.error||`HTTP ${r.status}`);
+  return data;
+}
 function format(n){return n==null?'—':Number(n).toLocaleString('es-AR')}
 function statusClass(s){return ['done','complete','available','healthy','indexed','published','approved'].includes(String(s).toLowerCase())?'ok':['error','failed','dead','rejected'].includes(String(s).toLowerCase())?'bad':'warning'}
 function fmtDate(s){if(!s)return '—';try{const d=new Date(s);return d.toLocaleString('es-AR',{dateStyle:'medium',timeStyle:'short'})}catch{return esc(String(s))}}
