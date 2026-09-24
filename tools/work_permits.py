@@ -141,7 +141,11 @@ class PermitStore:
         while handle is None:
             try:
                 handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
+                # Windows: bajo contención (8+ threads/processos), open con
+                # O_EXCL sobre el lock existente puede levantar
+                # PermissionError (Errno 13) en vez de FileExistsError —
+                # mismo significado acá: otro holder lo tiene.
                 try:
                     if time.time() - lock.stat().st_mtime > ACQUIRE_LOCK_STALE_S:
                         lock.unlink(missing_ok=True)

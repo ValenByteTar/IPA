@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 
 def test_ipa_public_package_facade_resolves_core_types():
     import ipa
 
-    assert ipa.__version__ == "0.1.0"
+    # La facade debe reportar la versión declarada en pyproject — comparar
+    # contra el valor real y no un literal, para que el bump no rompa el test.
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert ipa.__version__ == declared
     assert ipa.FastPathRunner.__name__ == "FastPathRunner"
     assert ipa.DocumentStore.__name__ == "DocumentStore"
 
