@@ -17,12 +17,12 @@ sources
   -> lexical index
   -> optional embeddings/vector index
   -> optional enrichment
-  -> Reporter / MCP / future Agent Runtime / Tutor
+  -> Reporter / Agent Runtime / Tutor
 ```
 
 ## Current status
 
-**v0.1.0 — first stable milestone.** IPA is a functional local-first personal
+**v0.2.1.** IPA is a functional local-first personal
 agent platform: contract-first Hybrid RAG, a shared agent core (CLI + dashboard),
 a Tutor role with human approval gates, bounded web research, an idle cognitive
 layer, and an idle scheduler with an explicit resource model. It is intentionally
@@ -121,23 +121,11 @@ configs/       reproducible configuration profiles
 data/sample/   small synthetic fixtures
 tests/         contract, unit, integration and capability tests
 scripts/       thin CLI, benchmark, validation and operations entrypoints
-tools/         development-only tools, including EKS MCP
+tools/         development-only tools, including EKS MCP and work permits
 knowledge/     EKS engineering memory (dev-time only)
 docs/          architecture, policies, plans and operations
 web/           local dashboard assets
-```
-
-```text
-src/ipa/       public Python package and bounded contexts
-contracts/     authoritative JSON Schemas and contract vocabulary
-configs/       reproducible configuration profiles
-data/sample/   small synthetic fixtures
-tests/         contract, unit, integration and capability tests
-scripts/       thin CLI, benchmark, validation and operations entrypoints
-tools/         development-only tools, including EKS MCP
-knowledge/     EKS engineering memory (dev-time only)
-docs/          architecture, policies, plans and operations
-web/           local dashboard assets
+.devin/        agent session config: hooks (permit guard), rules, skills, SearXNG compose
 ```
 
 Local corpus, models, indexes, databases, caches, and generated reports are not
@@ -174,6 +162,17 @@ The Engineering Knowledge System under `knowledge/` stores decisions, experiment
 benchmarks, patterns, postmortems, and research produced while evolving IPA. It
 is not the runtime Knowledge System and it is not used to answer corpus queries.
 The `ipa-eks` MCP server is read-only and dev-time.
+
+Records are validated (`scripts/validation/validate_eks.py`), carry lifecycle
+metadata (`supersedes`/`superseded_by`, evidence paths, author model) and can
+declare `affects` globs — the files they govern — so `eks_governing` surfaces
+the decisions that apply to a path before it is edited.
+
+Parallel agent sessions coordinate through dev-time work permits
+(`scripts/cli/permit.py`, PAT-009): a session acquires an exclusive scope,
+receives the governing EKS records as precautions, and a pre-edit hook blocks
+foreign sessions from editing inside it. Permit state is ephemeral
+(`outputs/devin/permits/`, not committed).
 
 Before a significant change, build engineering context. After a reproducible
 experiment, record the result in EKS. Architectural decisions remain subject to

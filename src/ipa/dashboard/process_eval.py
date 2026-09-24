@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .process_runner import JobRunner
+from .. import __version__
 from .process_specs import JobSpec
 from .process_state import (
     STATUS_DONE,
@@ -376,7 +377,7 @@ def run_eval(output_path: str | Path | None = None) -> dict[str, Any]:
         "experiment_id": "E8",
         "candidate_id": "ipa.dashboard.process_runner.JobRunner + process_specs.JobSpec + process_state",
         "capability": "queue_workflow",
-        "adapter_version": "ipa 0.1.0",
+        "adapter_version": f"ipa {__version__}",
         "tool_version": f"python {platform.python_version()}",
         "hardware": {
             "cpu": platform.processor() or platform.machine(),

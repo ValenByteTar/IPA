@@ -2,7 +2,10 @@
 
 Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 
-## Unreleased — 2026-09-24 (PM-007: race de cargas de modelo + SSE honesto)
+## v0.2.1 — 2026-09-24
+
+### PM-007: race de cargas de modelo + SSE honesto
+
 
 - **`MODEL_LOAD_LOCK`** (`src/ipa/model_load_lock.py`, nuevo): RLock global
   que serializa toda construcción pesada de modelos in-process. Motivo:
@@ -23,7 +26,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   single-construction bajo contención, tripwire meta, reranker, OCR).
 - Postmortem completo: `knowledge/postmortems/PM-007`.
 
-## Unreleased — 2026-09-23 (regla única de evidencia en EKS)
+### regla única de evidencia en EKS
+
 
 - **Una sola regla para "¿este record tiene evidencia?"**. Estaba implementada
   **tres veces** con escapes distintos: `validate()` (gate de promoción) y
@@ -49,7 +53,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   prosa/tasa no es cita, cita muerta en `docs/` sí se reporta, y una línea
   histórica no es ni evidencia ni rot. Suite: 1152 passed, 1 skipped.
 
-## Unreleased — 2026-09-23 (research progress + fixes)
+### research progress + fixes
+
 
 - **Progreso granular de research**: `execute_research(on_progress=...)`
   emite `(phase, detail)` en cada transición — search → judge → scrape
@@ -76,7 +81,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   `test_save_article_manifest_uses_basenames_only` (regresión del fix de
   paths absolutos en el manifiesto de documentos linkeados).
 
-## Unreleased — 2026-09-23 (research → staging → promoción, DEC-003b)
+### research → staging → promoción, DEC-003b
+
 
 - **La research ya no escribe directo al corpus principal**: los documentos
   aceptados por el juez aterrizan en `outputs/agent/research_staging/`
@@ -105,7 +111,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   seed→`user_provided`, búsqueda→`agent_research`, drain residual lanzado,
   política `user_provided` (auto + gate de duplicados).
 
-## Unreleased — 2026-09-23 (EKS governance + work permits)
+### EKS governance + work permits
+
 
 - **EKS `affects` file-scoping**: nuevo campo opcional de frontmatter —
   globs repo-relativos que un record gobierna. `eks_governing(paths)`
@@ -136,7 +143,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - `tests/test_eks.py`: 27 tests — matcher de globs, governing, gate de
   evidencia, ciclo de vida de permisos.
 
-## Unreleased — 2026-09-23 (EKS governance hardening, v0.2.0)
+### EKS governance hardening
+
 
 - **`affects` backfill**: 35 records sin `affects` (todas las DEC/PAT/PM/
   BM/EXP/RES fundacionales) ahora declaran los globs que gobiernan, así el
@@ -196,7 +204,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   servicio como globales, para no reintroducir la colisión de nombres.
   `~/.codeium/windsurf/memories/global_rules.md` intacto.
 
-## Unreleased — 2026-09-23 (research GPU embed escalation)
+### research GPU embed escalation
+
 
 - `_embed_new_chunks` (research_executor) escala al lote GPU exclusivo cuando
   el backlog de la corrida ≥ `IPA_EMBED_GPU_MIN_BACKLOG` (512): clama el job
@@ -212,7 +221,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: 2 nuevos en `test_research_executor.py` (escalada sobre umbral,
   no-escalada bajo umbral con job sin clamar).
 
-## Unreleased — 2026-09-23 (LanceDB column projection)
+### LanceDB column projection
+
 
 - `table_chunk_id_list(table)` + `LanceDBIndex.chunk_ids()` en
   `lancedb_index.py`: lectura proyectada `search().select(["chunk_id"])`
@@ -228,7 +238,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - `document_embeddings`/`_compute_centroids`/copia de vectores en
   promotion quedan con `to_arrow()`: esos SÍ necesitan las columnas.
 
-## Unreleased — 2026-09-23 (get_document tool)
+### get_document tool
+
 
 - Nueva system tool `get_document` (`system_tools.py`): abre un documento
   por `doc_id` (de hits de `search_corpus` o de la cola de promoción) y
@@ -249,9 +260,10 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: 5 nuevos en `test_system_tools.py` (registro completo, doc en
   staging, tombstoned, no encontrado, arg faltante).
 
-## Unreleased — 2026-09-23 (index audit idle task)
+### index audit idle task
 
-### `index_audit` — auditoría de salud del corpus (idle T1, read-only)
+
+#### `index_audit` — auditoría de salud del corpus (idle T1, read-only)
 - Nuevo `ipa/agentic/index_audit.py`: dos capas con cadencias distintas.
   - **Lógica** (barata, cada `IPA_AUDIT_LOGICAL_SECONDS`=900s): consume las
     señales Tier 0 persistidas — docs vacíos vivos (`char_count=0`;
@@ -282,9 +294,10 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - `tests/test_index_audit.py` (11 tests): capas, detección de drift real,
   marker-only rows, merge de capas en el JSON.
 
-## Unreleased — 2026-09-23 (Tier 0 signals + idle T1/T2 optimization)
+### Tier 0 signals + idle T1/T2 optimization
 
-### Señales de ingesta Tier 0 (nuevo `ipa/ingestion/ingest_metadata.py`)
+
+#### Señales de ingesta Tier 0 (nuevo `ipa/ingestion/ingest_metadata.py`)
 - **`document_metadata`** (tabla derivada nueva en DocumentStore):
   `normalized_hash` (formato `sha256:` de `reporter_curation`), `title`,
   `published_at`, `char_count`, `extra_json` (dup flags, novelty hints).
@@ -304,7 +317,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   gate de dos factores DEC-003 se conserva (Jaccard ≥0.85 contra el texto
   del doc más cercano, fetcheado solo para ese caso).
 
-### Tier 1/2: filter-first, gate "corpus changed", zona gris
+#### Tier 1/2: filter-first, gate "corpus changed", zona gris
 - **`build_document_dicts(doc_ids=…)`** filtra ids antes de fetchear textos;
   `LanceDBIndex.document_embeddings(doc_ids)` acota el read con WHERE.
   Fin del scan O(corpus) por ciclo idle.
@@ -326,7 +339,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   el filtro de período y `sync_doc_metadata` dejan de hardcodear/usar solo
   `stored_at`.
 
-### enrich_chunks canónico + índice léxico sincronizado
+#### enrich_chunks canónico + índice léxico sincronizado
 - `chunks.text` ya NO se muta: la representación enriquecida
   (`[Summary]`/`[Questions]` + canónico) vive en
   `metadata.enrichment.enriched_text` y la resuelve `enriched_text()`
@@ -339,7 +352,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   embede `enriched_text()` → cualquier camino de indexación usa la misma
   representación derivada.
 
-### Fixes
+#### Fixes
 - `curate_documents`: la comparación URL-duplicado usaba `content_hash`
   (`sha256(text)[:32]`, sin normalizar) contra `normalized_hash`
   (`sha256:<hex>`) → nunca matcheaba. Ahora ambos lados usan el formato
@@ -356,9 +369,10 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - **DEC-010** (`knowledge/decisions/`): contrato formal de orquestación
   Tier 0/1/2 — condiciones de activación, leases y exclusión documentadas.
 
-## Unreleased — 2026-09-23 (bulk embedding, FP8 experiment design, PM-004)
+### bulk embedding, FP8 experiment design, PM-004
 
-### Bulk GPU embeddings: maintenance mode
+
+#### Bulk GPU embeddings: maintenance mode
 - **Threshold automático 512** (`IPA_EMBED_GPU_MIN_BACKLOG`): con >=512 chunks
   pendientes, toma un lease exclusivo de VRAM y mantiene BGE-M3 en la RTX 4050
   FP16 hasta que LanceDB alcanza al DocumentStore. Debajo no se toma ese lease;
@@ -402,7 +416,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   incidente y el
   microbenchmark pareado: PM-004.
 
-### Tier 0: lease de ingesta + cierre del pipeline huérfano
+#### Tier 0: lease de ingesta + cierre del pipeline huérfano
 - **`ipa/agentic/tier0.py`**: lease cross-process `outputs/agent/tier0.lock`
   (formato `pid|owner|ts`, heartbeat cada `IPA_TIER0_HEARTBEAT`=15s, TTL
   `IPA_TIER0_LOCK_TTL`=300s, staleness por `pid_alive`). `run_fast_path.py`
@@ -433,7 +447,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: `test_tier0.py` (claim/release/steal/heartbeat), `test_scraper_done
   _sentinel.py` (done-file en éxito y fallo, orphan check, parseo CIM).
 
-### Diseño experimental BGE-M3 FP8 (no implementado)
+#### Diseño experimental BGE-M3 FP8 (no implementado)
 - Añadido `EXP-009` como propuesta para FP8 E4M3/NVIDIA scaling en Ada SM89.
   FlagEmbedding/EmbeddingAdapter no ofrece un switch FP8; FP16 GPU sigue siendo
   el default. No se cambió código/configuración ni se ejecutó prueba o benchmark.
@@ -441,7 +455,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   no fijados por código, `--cpu-only`/`IPA_EMBED_GPU_BULK=0` no pinnean CPU y hay
   callers alternativos que sobrescriben el batch.
 
-### Promoción: preflight de cobertura vectorial (PM-004)
+#### Promoción: preflight de cobertura vectorial (PM-004)
 - **La purga ya no corre sin vectores verificados**: `promote_documents_to_main`
   comprueba que cada chunk vivo del source tenga vector en main LanceDB antes
   de purgar el staging. Si falta alguno, la promoción se **difiere** (source
@@ -453,7 +467,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: `tests/test_promotion_executor.py` — defer sin vectores, cobertura
   completa, retry tras backfill (cola end-to-end), opt-out y main ilegible.
 
-### Promoción: la purga del staging ya no deja desync silencioso
+#### Promoción: la purga del staging ya no deja desync silencioso
 - **Causa**: el paso BM25 de `purge_promoted_from_source` solo logueaba un
   `database is locked` y continuaba — una ingesta fast-path concurrente dejó
   18.035 filas FTS vivas para docs ya purgados del DocumentStore (corregido
@@ -468,7 +482,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: lock real de escritura sobre `bm25_index.db` → defer + pending +
   reconciliación completa al liberar; camino feliz sin pasos incompletos.
 
-### Ingesta: status `no_text` para artefactos sin texto extraíble
+#### Ingesta: status `no_text` para artefactos sin texto extraíble
 - **Causa**: un parse exitoso con 0 chunks (PDF solo-imagen cuyo OCR no
   produjo nada, archivo vacío) igual terminaba `indexed` y guardaba un
   documento de texto vacío que la curación rechazaba después — el artefacto
@@ -482,7 +496,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Tests: no_text no entra al store ni se reprocesa; sweep lo borra en
   Landing y en Transit.
 
-### Curación: gate de novelty ya no rechaza por embedding solo (falsos positivos)
+#### Curación: gate de novelty ya no rechaza por embedding solo (falsos positivos)
 - **Causa raíz**: `novelty < 0.05` se calculaba como `1 − max_cosine` del vector
   de documento contra todo el histórico. Un único vector por doc queda dominado
   por el boilerplate del sitio: alertas CISA semanales distintas (CVEs y fechas
@@ -509,7 +523,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   duplicado verdadero con `duplicate_of`, conservación cuando el match es
   inverificable, y fallback léxico intacto.
 
-### Dashboard: recuperación del corpus Reporter activo
+#### Dashboard: recuperación del corpus Reporter activo
 - **Puntero durable**: `run_full_pipeline` persiste el output activo en
   `outputs/web_dashboard/active_reporter_output.json` (escritura atómica); el
   dashboard lo recupera tras reinicio del watchdog. Antes `_ACTIVE_REPORTER_OUTPUT`
@@ -521,7 +535,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 - Test de regresión: restart simulado, puntero stale y newest-empty-vs-populated.
   `tests/test_web_dashboard.py`: 33 passed.
 
-### Research: aislamiento, budgets y prioridad de trabajos pesados
+#### Research: aislamiento, budgets y prioridad de trabajos pesados
 - **Dir de trabajo por corrida** (`_research_run_dir`): `research_topic` scrapea
   a `outputs/agent/research/<stamp>-<slug>/` en vez del `Landing/web`
   compartido, e ingesta **solo ese dir**. Mismo cambio en los otros tres
@@ -556,7 +570,7 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   `tests/test_research_executor.py`, drain con lock y cesión en
   `tests/test_fast_path.py`. Evidencia: `PM-004`.
 
-### Research: barrido temático por facetas (`sub_queries`)
+#### Research: barrido temático por facetas (`sub_queries`)
 - **`research_topic` acepta `sub_queries`** (máx 8, escritas por el agente):
   cada faceta corre su propia `search_web` y sus resultados entran al pool
   deduplicado por URL. Prefilter, juicio de snippets y juicio de contenido
@@ -578,7 +592,8 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   `test_sub_query_search_failure_does_not_fail_run` en
   `tests/test_research_executor.py`.
 
-## Unreleased — 2026-09-19 (post-v0.1.2)
+### post-v0.1.2
+
 
 - **fix(ci)**: `FlagEmbedding`, `langchain-text-splitters` y `tiktoken`
   declarados en extras (`retrieval` + nuevo `chunkers`); `HF_HUB_OFFLINE`
@@ -593,6 +608,80 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   un roadmap de X", "quiero aprender Y") corren por el state machine del
   Tutor aunque lleguen con `role=general` — la investigación ahí es un
   contrato real con gate humano. `tutor_intent()` en `tutor_chat.py`.
+
+### 2026-09-18 (cambios de la era v0.1.2, registrados tarde)
+
+#### Retrieval
+- **Rerank stage-2 ON por defecto** (`IPA_RERANK=0` para desactivar; acepta
+  `false`/`no`/`off`). Eval E10-rerank: recall@1 0.465→0.670 (+20.5pp),
+  MRR +0.141, nDCG@10 +0.117; ~+0.65s GPU / ~+0.7s CPU. Ver `EXP-007`.
+- **Gate de VRAM corregido**: medía con `torch.cuda.mem_get_info()`, que en
+  Windows/WDDM sobreestima la VRAM libre (reportó ~5 GB con 1.6 GB físicos
+  libres) → el reranker cargaba en GPU con el LLM cargado. Ahora usa
+  `nvidia-smi` (`physical_free_vram_mb()`) con fallback.
+- `run_retrieval_eval.py` respeta `IPA_RERANK_DEVICE`.
+- **Reranker fijado a CPU** en esta máquina: `IPA_RERANK_DEVICE=cpu` en el
+  launcher (`start_ipa_dashboard.ps1`) y como env de usuario. `auto` podía
+  cargar el singleton en CUDA mientras el LLM estaba descargado y dejarlo
+  residente compitiendo por VRAM al volver el chat; el costo CPU medido es
+  ~+0.7 s/query (EXP-007), marginal frente al riesgo de OOM en 6 GB (EXP-008).
+
+#### Tutor
+- **Scaffold absorbente** (`_shape_units`): propuestas imperfectas del LLM ya no
+  producen dead-ends — descarta concept_ids desconocidos, deduplica, completa al
+  mínimo (3) y trunca a 7; el prompt dejó de invitar a reutilizar concept_ids
+  (contradecía el contrato). Fallos residuales → mensaje amigable (la excepción
+  va al log) + nota de transparencia si el corpus no menciona el tema.
+- **Foco de roadmap cross-sesión**: click en la card (o activar un roadmap)
+  apunta la sesión y persiste el foco (`tutor_focus`); sesiones nuevas/idle lo
+  adoptan; rechazar lo limpia. Chip "📍 tema · unidad N/M" en el chat.
+- **Tag de roadmap en resúmenes de sesión** (`[roadmap:<id> · tema · unidad N/M]`)
+  → recuperable cross-sesión vía `recall_memory`.
+- **Lecciones ~2x más largas**: la identidad base escopa "1-5 oraciones" al chat
+  general y da excepción al rol tutor; `TUTOR_POLICY` pide explicaciones ricas;
+  `max_new_tokens` de lección 768→1536. Medido: ~90→184 palabras.
+- Gate del chat: aprobar un roadmap mostraba "Rechazado" (contrato
+  frontend/backend: `decide_roadmap` devuelve `active`, no `approved`).
+- Diagnóstico sin leak de policy ("Comenzá con un diagnóstico…" ya no se muestra
+  al alumno) y sin doble punto; encabezado único en el debate.
+
+#### Agente / UI
+- **Perilla "Idle T1/T2"** en el sidebar: apaga el enriquecimiento idle completo
+  (gate en `_idle()`; aborta pasadas Tier 2 en vuelo). Persistida en
+  `idle_enabled.json`; endpoints `GET /api/idle/status`, `POST /api/idle/toggle`.
+- **Quote-reply en el chat**: seleccionar texto inserta un puntero compacto
+  `[cita: «primeras 3 palabras…»]` en el input (no copia el pasaje completo):
+  marca qué sección del chat mirar. El snippet es literal, así que el agente
+  lo resuelve con `recall_conversation(query=…)` (skill `responder_a_cita`).
+- MCP server: corregido el import (insertaba `src/ipa` en `sys.path` y el
+  paquete local `ipa/mcp` sombreaba el SDK `mcp` — el módulo no importaba) y
+  `RerankCandidate(id=…)` (campo real: `chunk_id`; el TypeError se tragaba y el
+  rerank no se aplicaba). Suite MCP nueva. Docs de tools sincronizadas.
+
+#### Research: dedup real + URLs explícitas
+- **Dedup para TODOS los llamados** (antes solo safety-net): si una query
+  igual o muy parecida ya se investigó dentro de la ventana (10 min), la tool
+  no relanza — devuelve el material ya ingerido y pide `search_corpus` /
+  `compile_report`. El match exacto no alcanzaba: el modelo reformula la query
+  entre turnos ("IA big techs" → "IA tres grandes tecnológicas"). Nuevo
+  `find_recent_research` (igualdad normalizada **o** contención de tokens
+  ≥ 0.6, stopwords fuera). `force=true` fuerza una corrida nueva.
+- **URLs explícitas = seeds**: una URL en la query (o pegada por el usuario en
+  su mensaje — la tool la reinyecta, porque el modelo la descarta al
+  parafrasear) se scrapea **directo**, salteando el snippet stage (no hay
+  snippet que juzgar) pero pasando por scrape → calidad → juicio → ingesta.
+  El remanente textual va a la búsqueda complementaria; query solo-URL deriva
+  la búsqueda del slug. Con seeds, un fallo del backend de búsqueda ya no
+  invalida la corrida (se registra el error y se procesan las fuentes).
+- **Identidad**: principio explícito de no relanzar una investigación ya hecha
+  ante un "dame lo que investigaste" (skill `investigar_web` actualizado).
+
+#### Infra / calidad
+- Deprecaciones de LanceDB resueltas (`list_tables()`, `create_index(config=FTS())`);
+  warnings de la suite 78 → 18 (los restantes son de terceros).
+- `tests/conftest.py`: `IPA_RERANK=0` autouse (suite hermética, sin cargar el
+  cross-encoder por el default).
+- 881 tests, 1 skipped (red).
 
 ## v0.1.2 — 2026-09-19
 
@@ -731,80 +820,6 @@ Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
   congelaba la UI de Windows (383 MiB libres). Los caches de proceso se limpian
   entre tests (un test recibía un hit viejo de `list_promotions`).
   Suite: **962 passed, 1 skipped** en ~6:00.
-
-## Unreleased — 2026-09-18
-
-### Retrieval
-- **Rerank stage-2 ON por defecto** (`IPA_RERANK=0` para desactivar; acepta
-  `false`/`no`/`off`). Eval E10-rerank: recall@1 0.465→0.670 (+20.5pp),
-  MRR +0.141, nDCG@10 +0.117; ~+0.65s GPU / ~+0.7s CPU. Ver `EXP-007`.
-- **Gate de VRAM corregido**: medía con `torch.cuda.mem_get_info()`, que en
-  Windows/WDDM sobreestima la VRAM libre (reportó ~5 GB con 1.6 GB físicos
-  libres) → el reranker cargaba en GPU con el LLM cargado. Ahora usa
-  `nvidia-smi` (`physical_free_vram_mb()`) con fallback.
-- `run_retrieval_eval.py` respeta `IPA_RERANK_DEVICE`.
-- **Reranker fijado a CPU** en esta máquina: `IPA_RERANK_DEVICE=cpu` en el
-  launcher (`start_ipa_dashboard.ps1`) y como env de usuario. `auto` podía
-  cargar el singleton en CUDA mientras el LLM estaba descargado y dejarlo
-  residente compitiendo por VRAM al volver el chat; el costo CPU medido es
-  ~+0.7 s/query (EXP-007), marginal frente al riesgo de OOM en 6 GB (EXP-008).
-
-### Tutor
-- **Scaffold absorbente** (`_shape_units`): propuestas imperfectas del LLM ya no
-  producen dead-ends — descarta concept_ids desconocidos, deduplica, completa al
-  mínimo (3) y trunca a 7; el prompt dejó de invitar a reutilizar concept_ids
-  (contradecía el contrato). Fallos residuales → mensaje amigable (la excepción
-  va al log) + nota de transparencia si el corpus no menciona el tema.
-- **Foco de roadmap cross-sesión**: click en la card (o activar un roadmap)
-  apunta la sesión y persiste el foco (`tutor_focus`); sesiones nuevas/idle lo
-  adoptan; rechazar lo limpia. Chip "📍 tema · unidad N/M" en el chat.
-- **Tag de roadmap en resúmenes de sesión** (`[roadmap:<id> · tema · unidad N/M]`)
-  → recuperable cross-sesión vía `recall_memory`.
-- **Lecciones ~2x más largas**: la identidad base escopa "1-5 oraciones" al chat
-  general y da excepción al rol tutor; `TUTOR_POLICY` pide explicaciones ricas;
-  `max_new_tokens` de lección 768→1536. Medido: ~90→184 palabras.
-- Gate del chat: aprobar un roadmap mostraba "Rechazado" (contrato
-  frontend/backend: `decide_roadmap` devuelve `active`, no `approved`).
-- Diagnóstico sin leak de policy ("Comenzá con un diagnóstico…" ya no se muestra
-  al alumno) y sin doble punto; encabezado único en el debate.
-
-### Agente / UI
-- **Perilla "Idle T1/T2"** en el sidebar: apaga el enriquecimiento idle completo
-  (gate en `_idle()`; aborta pasadas Tier 2 en vuelo). Persistida en
-  `idle_enabled.json`; endpoints `GET /api/idle/status`, `POST /api/idle/toggle`.
-- **Quote-reply en el chat**: seleccionar texto inserta un puntero compacto
-  `[cita: «primeras 3 palabras…»]` en el input (no copia el pasaje completo):
-  marca qué sección del chat mirar. El snippet es literal, así que el agente
-  lo resuelve con `recall_conversation(query=…)` (skill `responder_a_cita`).
-- MCP server: corregido el import (insertaba `src/ipa` en `sys.path` y el
-  paquete local `ipa/mcp` sombreaba el SDK `mcp` — el módulo no importaba) y
-  `RerankCandidate(id=…)` (campo real: `chunk_id`; el TypeError se tragaba y el
-  rerank no se aplicaba). Suite MCP nueva. Docs de tools sincronizadas.
-
-### Research: dedup real + URLs explícitas
-- **Dedup para TODOS los llamados** (antes solo safety-net): si una query
-  igual o muy parecida ya se investigó dentro de la ventana (10 min), la tool
-  no relanza — devuelve el material ya ingerido y pide `search_corpus` /
-  `compile_report`. El match exacto no alcanzaba: el modelo reformula la query
-  entre turnos ("IA big techs" → "IA tres grandes tecnológicas"). Nuevo
-  `find_recent_research` (igualdad normalizada **o** contención de tokens
-  ≥ 0.6, stopwords fuera). `force=true` fuerza una corrida nueva.
-- **URLs explícitas = seeds**: una URL en la query (o pegada por el usuario en
-  su mensaje — la tool la reinyecta, porque el modelo la descarta al
-  parafrasear) se scrapea **directo**, salteando el snippet stage (no hay
-  snippet que juzgar) pero pasando por scrape → calidad → juicio → ingesta.
-  El remanente textual va a la búsqueda complementaria; query solo-URL deriva
-  la búsqueda del slug. Con seeds, un fallo del backend de búsqueda ya no
-  invalida la corrida (se registra el error y se procesan las fuentes).
-- **Identidad**: principio explícito de no relanzar una investigación ya hecha
-  ante un "dame lo que investigaste" (skill `investigar_web` actualizado).
-
-### Infra / calidad
-- Deprecaciones de LanceDB resueltas (`list_tables()`, `create_index(config=FTS())`);
-  warnings de la suite 78 → 18 (los restantes son de terceros).
-- `tests/conftest.py`: `IPA_RERANK=0` autouse (suite hermética, sin cargar el
-  cross-encoder por el default).
-- 881 tests, 1 skipped (red).
 
 ## v0.1.0 — 2026-09-16
 
