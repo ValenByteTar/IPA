@@ -177,6 +177,70 @@ _ADVANCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Depth navigation (dimensión Y): deterministic — the scaffold owns position.
+_DEPTH_DOWN_RE = re.compile(
+    r"\b(profundiz[aá]|m[aá]s\s+(detalle|profundidad|fondo)|deep\s+dive|"
+    r"entr[aá]\s+m[aá]s|dame\s+(m[aá]s|el\s+detalle)|expand[ií]\s+(esto|la\s+unidad))\b",
+    re.IGNORECASE,
+)
+_DEPTH_UP_RE = re.compile(
+    r"\b(volvamos|simplific[aá]|menos\s+detalle|muy\s+(profundo|detallado)|"
+    r"sub[aá]\s+un\s+nivel|vista\s+general|resum[ií]\s+(la\s+)?(unidad|vista))\b",
+    re.IGNORECASE,
+)
+
+_DEPTH_LABELS = ("overview", "material nuclear", "claims enriquecidos", "vecindario del cluster")
+
+
+def roadmap_state_snapshot(store: Any) -> dict[str, Any] | None:
+    """Estado determinístico del roadmap enfocado (SELECT, nunca LLM).
+
+    Devuelve None si no hay foco. Estructura: goal, roadmap, posición
+    (unidad/profundidad), próxima unidad y progreso por unidad.
+    """
+    focus_id = store.get_focus()
+    if not focus_id:
+        return None
+    roadmap = store.get_roadmap(focus_id)
+    if roadmap is None:
+        return None
+    goal = store.get_goal(roadmap.goal_id)
+    position = store.get_position(roadmap.roadmap_id)
+    statuses = store.unit_statuses(roadmap.roadmap_id)
+    # Posición persistida por unit_id → se resuelve a orden para mostrar.
+    cur_unit = next(
+        (u for u in roadmap.units if u.unit_id == position["unit_id"]),
+        roadmap.units[0] if roadmap.units else None)
+    current = cur_unit.order if cur_unit else 1
+    nxt = next((u.order for u in roadmap.units if u.order > current
+                and statuses.get(u.unit_id) != "done"), None)
+    by_order = {u.unit_id: u.order for u in roadmap.units}
+    return {
+        "roadmap_id": roadmap.roadmap_id,
+        "goal_title": goal.title if goal else roadmap.goal_id,
+        "status": roadmap.status.value,
+        "n_units": len(roadmap.units),
+        "unit_order": current,
+        "depth_level": position["depth_level"],
+        "next_unit_order": nxt,
+        "done_units": sorted(by_order[u] for u, s in statuses.items()
+                             if s == "done" and u in by_order),
+    }
+
+
+def roadmap_state_text(snapshot: dict[str, Any]) -> str:
+    """Línea compacta determinística para inyectar en el system prompt."""
+    depth = _DEPTH_LABELS[snapshot["depth_level"]] if 0 <= snapshot["depth_level"] < 4 else "?"
+    nxt = (f", próxima unidad {snapshot['next_unit_order']}"
+           if snapshot.get("next_unit_order") else ", última unidad")
+    return (
+        f"Roadmap activo: «{snapshot['goal_title']}» — "
+        f"unidad {snapshot['unit_order']}/{snapshot['n_units']} "
+        f"(profundidad L{snapshot['depth_level']}: {depth}){nxt}. "
+        "Si el usuario pregunta por su aprendizaje, usá este estado real; "
+        "no lo inventes."
+    )
+
 
 def _slug(text: str) -> str:
     """topic text → stable topic/goal slug."""
@@ -496,8 +560,12 @@ class TutorChatDriver:
 
     def _ensure_progress(self, store: Any, roadmap_id: str) -> None:
         """Seed unit 1 as 'current' when a roadmap activates."""
-        if not store.unit_statuses(roadmap_id):
-            store.set_unit_status(roadmap_id, 1, "current")
+        if store.unit_statuses(roadmap_id):
+            return
+        roadmap = store.get_roadmap(roadmap_id)
+        if roadmap and roadmap.units:
+            first = min(roadmap.units, key=lambda u: u.order)
+            store.set_unit_status(roadmap_id, first.unit_id, "current")
 
     def _advance_unit(self, store: Any, roadmap_id: str) -> dict[str, int] | None:
         """Mark the current unit done and the next one current."""
@@ -505,36 +573,39 @@ class TutorChatDriver:
         if roadmap is None or not roadmap.units:
             return None
         statuses = store.unit_statuses(roadmap_id)
-        orders = [u.order for u in roadmap.units]
-        current = next(
-            (o for o in sorted(orders) if statuses.get(o) == "current"),
-            next((o for o in sorted(orders) if statuses.get(o) != "done"), None),
+        ordered = sorted(roadmap.units, key=lambda u: u.order)
+        cur = next(
+            (u for u in ordered if statuses.get(u.unit_id) == "current"),
+            next((u for u in ordered if statuses.get(u.unit_id) != "done"), None),
         )
-        if current is None:
+        if cur is None:
             return None
-        store.set_unit_status(roadmap_id, current, "done")
-        nxt = next((o for o in sorted(orders) if o > current), None)
+        store.set_unit_status(roadmap_id, cur.unit_id, "done")
+        nxt = next((u for u in ordered if u.order > cur.order), None)
         if nxt is not None:
-            store.set_unit_status(roadmap_id, nxt, "current")
-            return {"done": current, "current": nxt}
-        return {"done": current, "current": 0}
+            store.set_unit_status(roadmap_id, nxt.unit_id, "current")
+            return {"done": cur.order, "current": nxt.order}
+        return {"done": cur.order, "current": 0}
 
-    def _progress_note(self, store: Any, roadmap_id: str) -> str | None:
+    def _progress_note(self, store: Any, roadmap_id: str,
+                       position: dict[str, int] | None = None) -> str | None:
         """Unit progress rendered for the lesson system prompt — so the
         tutor knows what was already taught and doesn't repeat it."""
         roadmap = store.get_roadmap(roadmap_id)
         if roadmap is None or not roadmap.units:
             return None
         statuses = store.unit_statuses(roadmap_id)
-        done = [u.order for u in roadmap.units if statuses.get(u.order) == "done"]
+        done = [u.order for u in roadmap.units if statuses.get(u.unit_id) == "done"]
         current = next(
-            (u.order for u in roadmap.units if statuses.get(u.order) == "current"),
+            (u.order for u in roadmap.units if statuses.get(u.unit_id) == "current"),
             None,
         )
         total = len(roadmap.units)
         if current is None and not done:
             return None
-        parts = [f"Progreso del roadmap: unidad {current or '—'} de {total} en curso"]
+        depth = (position or {}).get("depth_level", 0)
+        parts = [f"Progreso del roadmap: unidad {current or '—'} de {total} en curso, "
+                 f"profundidad L{depth} ({_DEPTH_LABELS[depth] if 0 <= depth < 4 else '?'})"]
         if done:
             parts.append(f"ya enseñadas: {', '.join(str(o) for o in sorted(done))}")
         return (
@@ -571,8 +642,8 @@ class TutorChatDriver:
                 [{"role": "user", "content": prompt}], max_new_tokens=160, temperature=0.0,
             )
             text = str(getattr(res, "text", "") or "").strip()
-            if text:
-                store.save_unit_summary(roadmap_id, unit_order, text)
+            if text and unit is not None:
+                store.save_unit_summary(roadmap_id, unit.unit_id, text)
         except Exception:
             pass
 
@@ -585,6 +656,7 @@ class TutorChatDriver:
         *,
         retrieve: Any | None = None,
         on_token: Any | None = None,
+        expand: Any | None = None,
     ) -> dict[str, Any]:
         """Advance the tutor state machine. Returns:
         {"reply": str, "roadmap_proposal": {...}|None, "research_proposal": {...}|None}
@@ -766,9 +838,65 @@ class TutorChatDriver:
             # ── Lesson mode (active roadmap) ────────────────────────────
             if st.phase == "active" and st.topic_id:
                 progress_note = None
+                position = None
                 if st.roadmap_id:
                     self._ensure_progress(store, st.roadmap_id)
-                    progress_note = self._progress_note(store, st.roadmap_id)
+                    position = store.get_position(st.roadmap_id)
+                    progress_note = self._progress_note(store, st.roadmap_id, position=position)
+                # Navegación de profundidad (dimensión Y): determinística.
+                # "profundizá" baja un nivel y expande evidencia real del
+                # corpus; "volvamos/simplificá" sube. El LLM no decide.
+                extra_context = None
+                if st.roadmap_id and position is not None:
+                    roadmap = store.get_roadmap(st.roadmap_id)
+                    current_unit = next(
+                        (u for u in (roadmap.units if roadmap else [])
+                         if u.unit_id == position["unit_id"]), None) or (
+                        min(roadmap.units, key=lambda u: u.order)
+                        if roadmap and roadmap.units else None)
+                    if current_unit is not None and _DEPTH_DOWN_RE.search(message):
+                        new_depth = min(3, position["depth_level"] + 1)
+                        expansion = None
+                        if callable(expand) and new_depth != position["depth_level"]:
+                            try:
+                                expansion = expand(st.roadmap_id, current_unit, new_depth)
+                            except Exception as exc:
+                                out["reply"] = (
+                                    f"No pude expandir a L{new_depth}: {str(exc)[:160]}")
+                                self._record(core, session_id, message, out["reply"])
+                                return out
+                        if expansion is not None:
+                            store.set_position(st.roadmap_id, current_unit.unit_id, new_depth)
+                            material = (expansion.summary or "")[:3000]
+                            extra_context = (
+                                f"\n\nMATERIAL DE PROFUNDIDAD L{new_depth} "
+                                f"({_DEPTH_LABELS[new_depth]}) — evidencia real del corpus "
+                                f"para la unidad {current_unit.order}. Enseñá SOLO con esto:\n"
+                                + material)
+                            position = store.get_position(st.roadmap_id)
+                            progress_note = self._progress_note(store, st.roadmap_id, position=position)
+                        elif new_depth == position["depth_level"]:
+                            out["reply"] = (
+                                f"Ya estás en el nivel máximo (L3: {_DEPTH_LABELS[3]}) "
+                                f"de la unidad {current_unit.order}. Decime 'siguiente unidad' para avanzar.")
+                            self._record(core, session_id, message, out["reply"])
+                            return out
+                        else:
+                            # sin generador de expansiones configurado: cambio de
+                            # nivel igualmente determinístico, sin material nuevo
+                            store.set_position(st.roadmap_id, current_unit.unit_id, new_depth)
+                            position = store.get_position(st.roadmap_id)
+                            progress_note = self._progress_note(store, st.roadmap_id, position=position)
+                    elif current_unit is not None and _DEPTH_UP_RE.search(message):
+                        new_depth = max(0, position["depth_level"] - 1)
+                        store.set_position(st.roadmap_id, current_unit.unit_id, new_depth)
+                        position = store.get_position(st.roadmap_id)
+                        progress_note = self._progress_note(store, st.roadmap_id, position=position)
+                        out["reply"] = (
+                            f"Bajamos a L{new_depth} ({_DEPTH_LABELS[new_depth]}) en la "
+                            f"unidad {current_unit.order}. Seguimos desde ahí.")
+                        self._record(core, session_id, message, out["reply"])
+                        return out
                 from ipa.agent.provider_wiring import (
                     build_responder, build_streaming_responder,
                 )
@@ -788,7 +916,7 @@ class TutorChatDriver:
                     ) if provider is not None else None
                 result = session.lesson(
                     st.topic_id, message, responder=responder,
-                    progress_note=progress_note,
+                    progress_note=progress_note, extra_context=extra_context,
                 )
                 out["reply"] = result["reply"]
                 # Advance intent: "siguiente", "ya entendí", "avancemos"…
@@ -1161,8 +1289,10 @@ class TutorChatDriver:
 
     def _focus_info(self, store: Any, st: Any, rm: Any) -> dict[str, Any]:
         statuses = store.unit_statuses(rm.roadmap_id)
-        current = next(
-            (o for o in sorted(statuses) if statuses.get(o) == "current"), None)
+        order_of = {u.unit_id: u.order for u in rm.units}
+        current_uid = next(
+            (u for u in statuses if statuses[u] == "current"), None)
+        current = order_of.get(current_uid)
         done = sum(1 for v in statuses.values() if v == "done")
         return {
             "roadmap_id": rm.roadmap_id,

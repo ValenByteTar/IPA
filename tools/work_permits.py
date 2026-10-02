@@ -16,10 +16,11 @@ import os
 import re
 import sys
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Iterable
+from typing import Any
 
 try:
     from .eks_repository import EKSRepository, HOT_ZONE_THRESHOLD, glob_match, scopes_overlap
@@ -38,9 +39,58 @@ ACQUIRE_LOCK_TIMEOUT_S = 5.0
 
 _ID_RE = re.compile(r"^PW-\d{8}-\d{2,}$")
 
+# Liveness of the session process that took the permit (the agent CLI/shell
+# is the parent of the `permit.py acquire` invocation). Same pattern as the
+# runtime vram_lock (PAT-007): a permit whose holder process died is stale
+# even if its heartbeat is fresh — the reaper that kills ghost permits.
+_PID_ALIVE_CACHE: dict[int, tuple[float, bool]] = {}
+_PID_ALIVE_TTL_S = 2.0
+
+
+def pid_alive(pid: int | None) -> bool:
+    """True si el proceso existe (liveness cacheado para polling barato)."""
+    if pid is None or pid <= 0:
+        return True  # sin pid conocido (permits viejos): solo rige el TTL
+    cached = _PID_ALIVE_CACHE.get(pid)
+    if cached is not None and time.time() - cached[0] < _PID_ALIVE_TTL_S:
+        return cached[1]
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                alive = ctypes.get_last_error() == 5  # access denied = existe
+            else:
+                exit_code = wintypes.DWORD()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                kernel32.CloseHandle(handle)
+                alive = bool(ok and exit_code.value == 259)  # STILL_ACTIVE
+        except Exception:
+            alive = True  # ante fallo de sonda, el TTL manda (no mata de más)
+    else:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+    _PID_ALIVE_CACHE[pid] = (time.time(), alive)
+    return alive
+
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _parse_ts(value: str) -> float:
@@ -65,12 +115,20 @@ class Permit:
     closed_at: str | None = None
     close_notes: str | None = None
     eks_draft: str | None = None
+    pid: int | None = None  # proceso holder (reaper de permits fantasma)
 
     def alive(self, now: float | None = None) -> bool:
         if self.status != "active":
             return False
-        now = time.time() if now is None else now
-        return now - _parse_ts(self.heartbeat or self.issued_at) <= self.ttl_s
+        if not pid_alive(self.pid):
+            return False
+        if self.pid is None:
+            # Permits viejos sin pid: solo rige el TTL (comportamiento previo).
+            now = time.time() if now is None else now
+            return now - _parse_ts(self.heartbeat or self.issued_at) <= self.ttl_s
+        # Holder vivo: el lease sigue (un batch nocturno >ttl no expira en
+        # vuelo); el hook renueva el heartbeat y SessionEnd cierra al final.
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
@@ -84,7 +142,7 @@ class PermitStore:
         self.repo = eks_repo
 
     @classmethod
-    def default(cls, project_root: Path) -> "PermitStore":
+    def default(cls, project_root: Path) -> PermitStore:
         root = Path(project_root)
         return cls(root / "outputs" / "devin" / "permits",
                    EKSRepository(root / "knowledge"))
@@ -105,7 +163,7 @@ class PermitStore:
         return [p for p in self.all() if p.alive(now)]
 
     def _next_id(self) -> str:
-        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        day = datetime.now(UTC).strftime("%Y%m%d")
         seq = 1
         for permit in self.all():
             match = re.match(rf"PW-{day}-(\d+)", permit.permit_id)
@@ -154,10 +212,11 @@ class PermitStore:
                     pass
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"permit store busy: {lock.name} held for more than {timeout_s:g}s")
+                        f"permit store busy: {lock.name} held for more than {timeout_s:g}s"
+                    ) from None
                 time.sleep(0.05)
         try:
-            os.write(handle, f"{os.getpid()} {_utcnow()}".encode("utf-8"))
+            os.write(handle, f"{os.getpid()} {_utcnow()}".encode())
             yield
         finally:
             os.close(handle)
@@ -186,7 +245,11 @@ class PermitStore:
                 return None, {
                     "issued": False,
                     "conflicts": [p.to_dict() for p in conflicts],
-                    "reason": "scope overlaps an active exclusive permit",
+                    "reason": ("scope overlaps an active exclusive permit — si tu "
+                               "edición es acotada, adquirí el permit con scope a "
+                               "nivel de archivo (p. ej. --scope "
+                               "'src/ipa/agentic/promotion_executor.py') o coordiná "
+                               "el handoff con la sesión holder"),
                 }
 
             precautions: list[str] = []
@@ -198,6 +261,7 @@ class PermitStore:
                 permit_id=self._next_id(), session=session.strip(), type=type,
                 scope=scope, task=task.strip(), precautions=precautions,
                 issued_at=stamp, heartbeat=stamp, ttl_s=ttl_s, status="active",
+                pid=os.getppid(),
             )
             self._save(permit)
         return permit, {

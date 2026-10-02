@@ -2,89 +2,435 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://res023-lab/contracts/roadmap.schema.json",
   "title": "Roadmap",
-  "description": "Versioned 3-7 unit learning roadmap that requires explicit human approval before activation.",
+  "description": "Versioned learning roadmap. A mutable draft (workbench state, 0-50 units, may be ungrounded) freezes into a 3-7 unit grounded spine that requires explicit human approval before activation.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["roadmap_id", "goal_id", "version", "status", "units", "assumptions", "uncertainties", "change_reason", "previous_roadmap_id", "created_at", "approval", "generation", "field_origins"],
-  "properties": {
-    "roadmap_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
-    "goal_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "user" },
-    "version": { "type": "integer", "minimum": 1, "x-field-origin": "system" },
-    "status": { "type": "string", "enum": ["proposed", "approved", "active", "completed", "superseded", "rejected"], "x-field-origin": "system" },
-    "units": {
-      "type": "array",
-      "minItems": 3,
-      "maxItems": 7,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["unit_id", "order", "concept_id", "reason", "estimated_effort_minutes", "source_refs", "assessment_types"],
-        "properties": {
-          "unit_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "system" },
-          "order": { "type": "integer", "minimum": 1, "x-field-origin": "system" },
-          "concept_id": { "$ref": "tutor_common.schema.json#/$defs/identifier", "x-field-origin": "source" },
-          "reason": { "type": "string", "minLength": 1, "maxLength": 1000, "x-field-origin": "generated" },
-          "estimated_effort_minutes": { "type": "integer", "minimum": 5, "maximum": 1440, "x-field-origin": "generated" },
-          "source_refs": {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": true,
-            "items": { "$ref": "tutor_common.schema.json#/$defs/sourceRef" },
-            "x-field-origin": "source"
+  "required": [
+    "roadmap_id",
+    "goal_id",
+    "version",
+    "status",
+    "units",
+    "assumptions",
+    "uncertainties",
+    "change_reason",
+    "previous_roadmap_id",
+    "created_at",
+    "approval",
+    "generation",
+    "field_origins"
+  ],
+  "$defs": {
+    "unitCore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "order",
+        "concept_id",
+        "reason",
+        "estimated_effort_minutes",
+        "source_refs",
+        "assessment_types"
+      ],
+      "properties": {
+        "unit_id": {
+          "$ref": "tutor_common.schema.json#/$defs/identifier",
+          "x-field-origin": "system"
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 1,
+          "x-field-origin": "system"
+        },
+        "concept_id": {
+          "$ref": "tutor_common.schema.json#/$defs/identifier",
+          "x-field-origin": "source"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "x-field-origin": "generated"
+        },
+        "estimated_effort_minutes": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 1440,
+          "x-field-origin": "generated"
+        },
+        "source_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "tutor_common.schema.json#/$defs/sourceRef"
           },
-          "assessment_types": {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": true,
-            "items": {
-              "type": "string",
-              "enum": ["retrieval", "explanation", "application", "critique", "transfer", "misconception_correction"]
+          "x-field-origin": "source"
+        },
+        "assessment_types": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "retrieval",
+              "explanation",
+              "application",
+              "critique",
+              "transfer",
+              "misconception_correction"
+            ]
+          },
+          "x-field-origin": "generated"
+        },
+        "stage_id": {
+          "anyOf": [
+            {
+              "$ref": "tutor_common.schema.json#/$defs/identifier"
             },
-            "x-field-origin": "generated"
+            {
+              "type": "null"
+            }
+          ],
+          "x-field-origin": "user_or_generated"
+        },
+        "field_origins": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "tutor_common.schema.json#/$defs/fieldOrigin"
+              },
+              "x-field-origin": "system"
+            }
+          ],
+          "x-field-origin": "system"
+        }
+      }
+    },
+    "frozenUnit": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/unitCore"
+        },
+        {
+          "properties": {
+            "source_refs": {
+              "minItems": 1
+            },
+            "assessment_types": {
+              "minItems": 1
+            }
           }
         }
+      ]
+    }
+  },
+  "properties": {
+    "roadmap_id": {
+      "$ref": "tutor_common.schema.json#/$defs/identifier",
+      "x-field-origin": "system"
+    },
+    "goal_id": {
+      "$ref": "tutor_common.schema.json#/$defs/identifier",
+      "x-field-origin": "user"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "x-field-origin": "system"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "proposed",
+        "approved",
+        "active",
+        "completed",
+        "superseded",
+        "rejected"
+      ],
+      "x-field-origin": "system"
+    },
+    "units": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unitCore"
       },
       "x-field-origin": "generated"
     },
+    "stages": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage_id",
+              "title",
+              "order"
+            ],
+            "properties": {
+              "stage_id": {
+                "$ref": "tutor_common.schema.json#/$defs/identifier",
+                "x-field-origin": "system"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-field-origin": "user_or_generated"
+              },
+              "order": {
+                "type": "integer",
+                "minimum": 1,
+                "x-field-origin": "system"
+              }
+            }
+          },
+          "x-field-origin": "user_or_generated"
+        }
+      ],
+      "x-field-origin": "user_or_generated"
+    },
+    "validation": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run_at",
+            "findings"
+          ],
+          "properties": {
+            "run_at": {
+              "$ref": "tutor_common.schema.json#/$defs/timestamp"
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "severity",
+                  "message"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "severity": {
+                    "type": "string",
+                    "enum": [
+                      "info",
+                      "warning",
+                      "error"
+                    ]
+                  },
+                  "unit_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "tutor_common.schema.json#/$defs/identifier"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "x-field-origin": "system"
+    },
     "assumptions": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      },
       "x-field-origin": "generated"
     },
     "uncertainties": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      },
       "x-field-origin": "generated"
     },
-    "change_reason": { "type": ["string", "null"], "maxLength": 2000, "x-field-origin": "user_or_generated" },
+    "change_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2000,
+      "x-field-origin": "user_or_generated"
+    },
     "previous_roadmap_id": {
-      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/identifier" }, { "type": "null" }],
+      "anyOf": [
+        {
+          "$ref": "tutor_common.schema.json#/$defs/identifier"
+        },
+        {
+          "type": "null"
+        }
+      ],
       "x-field-origin": "system"
     },
-    "created_at": { "$ref": "tutor_common.schema.json#/$defs/timestamp", "x-field-origin": "system" },
+    "created_at": {
+      "$ref": "tutor_common.schema.json#/$defs/timestamp",
+      "x-field-origin": "system"
+    },
     "approval": {
-      "anyOf": [{ "$ref": "tutor_common.schema.json#/$defs/humanApproval" }, { "type": "null" }],
+      "anyOf": [
+        {
+          "$ref": "tutor_common.schema.json#/$defs/humanApproval"
+        },
+        {
+          "type": "null"
+        }
+      ],
       "x-field-origin": "user"
     },
-    "generation": { "$ref": "tutor_common.schema.json#/$defs/generationProvenance", "x-field-origin": "system" },
+    "generation": {
+      "$ref": "tutor_common.schema.json#/$defs/generationProvenance",
+      "x-field-origin": "system"
+    },
     "field_origins": {
       "type": "object",
-      "additionalProperties": { "$ref": "tutor_common.schema.json#/$defs/fieldOrigin" },
-      "required": ["goal_id", "units", "assumptions", "uncertainties", "change_reason"],
+      "additionalProperties": {
+        "$ref": "tutor_common.schema.json#/$defs/fieldOrigin"
+      },
+      "required": [
+        "goal_id",
+        "units",
+        "assumptions",
+        "uncertainties",
+        "change_reason"
+      ],
       "x-field-origin": "system"
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "status": { "enum": ["approved", "active", "completed", "superseded"] } }, "required": ["status"] },
-      "then": { "properties": { "approval": { "$ref": "tutor_common.schema.json#/$defs/humanApproval" } } }
-    },
-    {
-      "if": { "properties": { "version": { "minimum": 2 } }, "required": ["version"] },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "draft"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "then": {
         "properties": {
-          "previous_roadmap_id": { "$ref": "tutor_common.schema.json#/$defs/identifier" },
-          "change_reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+          "units": {
+            "maxItems": 50
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "proposed",
+              "approved",
+              "active",
+              "completed",
+              "superseded",
+              "rejected"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "units": {
+            "minItems": 3,
+            "maxItems": 7,
+            "items": {
+              "$ref": "#/$defs/frozenUnit"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "approved",
+              "active",
+              "completed",
+              "superseded"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approval": {
+            "$ref": "tutor_common.schema.json#/$defs/humanApproval"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "version": {
+            "minimum": 2
+          }
+        },
+        "required": [
+          "version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "previous_roadmap_id": {
+            "$ref": "tutor_common.schema.json#/$defs/identifier"
+          },
+          "change_reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
         }
       }
     }

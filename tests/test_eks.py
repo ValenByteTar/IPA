@@ -232,6 +232,45 @@ def test_glob_match_semantics():
     assert not glob_match("outputs/agent/deep/vram.lock", "outputs/agent/*.lock")
 
 
+def test_scopes_overlap_literals_match_exactly_not_as_root_prefix():
+    """PM-008: un literal (sin wildcard) tiene scope_prefix vacío y el
+    chequeo conservador por prefijo lo trataba como "todo el repo" — cada
+    permit con un archivo literal en su scope conflictuaba con todos los
+    demás (port del bug PM-001/PM-003/PM-004 detectado en RIAPP)."""
+    from tools.eks_repository import scopes_overlap
+    # Literal vs glob no relacionado → sin solape.
+    assert not scopes_overlap("AGENTS.md", "scripts/cli/**")
+    assert not scopes_overlap("requirements.txt", "pyproject.toml")
+    assert not scopes_overlap("requirements.txt", "data/**")
+    # Literal vs glob que sí lo matchea → solape.
+    assert scopes_overlap("AGENTS.md", "AGENTS.*")
+    assert scopes_overlap("AGENTS.md", "**")
+    assert scopes_overlap("configs/notifications.yaml", "configs/**")
+    assert scopes_overlap("docs/plans/email.md", "docs/**")
+    # Dos literales: iguales o directorio-anidado → solape; hermanos → no.
+    assert scopes_overlap("AGENTS.md", "AGENTS.md")
+    assert scopes_overlap("configs/notifications.yaml", "configs/notifications.yaml")
+    assert not scopes_overlap("configs/a.yaml", "configs/b.yaml")
+    # Literal archivo dentro de un literal directorio (trailing slash) → solape.
+    assert scopes_overlap("src/ipa/ingestion/parsers.py", "src/ipa/ingestion/")
+    assert scopes_overlap("src/ipa/ingestion/", "src/ipa/ingestion/parsers.py")
+
+
+def test_permit_literals_do_not_conflict_with_disjoint_scopes(tmp_path: Path):
+    """End-to-end en el store: un permit con AGENTS.md no debe bloquear
+    scopes disjuntos, pero un glob que cubre AGENTS.md sí conflictúa."""
+    from tools.work_permits import PermitStore
+    store = PermitStore(tmp_path / "permits")
+    permit, payload = store.acquire(
+        "s1", ["AGENTS.md", "pyproject.toml", ".devin/**"], "gobernanza")
+    assert payload["issued"]
+    _denied_permit, denied = store.acquire(
+        "s2", ["scripts/cli/**", "docs/plans/email.md"], "otro trabajo")
+    assert denied["issued"] is True, denied
+    _blocked, blocked = store.acquire("s3", ["AGENTS.md"], "toca AGENTS.md")
+    assert blocked["issued"] is False and blocked["conflicts"]
+
+
 def test_governing_matches_affects_and_includes_closed(tmp_path: Path):
     root = tmp_path / "knowledge"
     (root / "decisions").mkdir(parents=True)
@@ -359,8 +398,13 @@ def test_permit_lifecycle_and_conflict(tmp_path: Path):
     assert not store.check_path("src/ipa/x.py", session="s1")["blocked"]
     assert not store.check_path("docs/x.md", session="s2")["blocked"]
     assert store.check_path("docs/x.md", session="s1")["blocked"]
-    # Expiry: TTL in the past kills only that permit; the other stays live.
-    permit.ttl_s = -1
+    # Expiry: a dead holder process kills only that permit (reaper por pid);
+    # the other stays live. Un holder vivo sobrevive al TTL (batch nocturno).
+    import subprocess
+
+    proc = subprocess.Popen(["cmd", "/c", "exit"])
+    proc.wait()
+    permit.pid = proc.pid
     store._save(permit)
     assert [p.permit_id for p in store.active()] == [other.permit_id]
     store.close_session("s1")  # idempotent on expired

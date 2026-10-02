@@ -24,6 +24,7 @@
     "lexical_index",
     "mcp",
     "memory",
+    "notifications",
     "observability",
     "operations",
     "orchestration",

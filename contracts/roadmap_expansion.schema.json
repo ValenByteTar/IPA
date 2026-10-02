@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://res023-lab/contracts/roadmap_expansion.schema.json",
+  "title": "RoadmapExpansion",
+  "description": "One depth level (0=overview, 1=core chunks, 2=enriched claims, 3=cluster neighborhood) of evidence under a roadmap unit. Deterministic retrieval artifact (PAT-004 EvidenceSet pattern); the LLM renders it, never decides it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "expansion_id",
+    "roadmap_id",
+    "unit_id",
+    "depth_level",
+    "title",
+    "evidence_refs",
+    "created_at",
+    "generation",
+    "field_origins"
+  ],
+  "properties": {
+    "expansion_id": {
+      "$ref": "tutor_common.schema.json#/$defs/identifier",
+      "x-field-origin": "system"
+    },
+    "roadmap_id": {
+      "$ref": "tutor_common.schema.json#/$defs/identifier",
+      "x-field-origin": "system"
+    },
+    "unit_id": {
+      "$ref": "tutor_common.schema.json#/$defs/identifier",
+      "x-field-origin": "system"
+    },
+    "depth_level": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "x-field-origin": "system"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "x-field-origin": "source_or_generated"
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4000,
+      "x-field-origin": "generated"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "tutor_common.schema.json#/$defs/sourceRef"
+      },
+      "x-field-origin": "source"
+    },
+    "coverage": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "cluster_id",
+        "docs_total",
+        "docs_covered"
+      ],
+      "properties": {
+        "cluster_id": {
+          "anyOf": [
+            {
+              "$ref": "tutor_common.schema.json#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "docs_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "docs_covered": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "x-field-origin": "system"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "generated",
+        "stale",
+        "superseded"
+      ],
+      "x-field-origin": "system"
+    },
+    "created_at": {
+      "$ref": "tutor_common.schema.json#/$defs/timestamp",
+      "x-field-origin": "system"
+    },
+    "generation": {
+      "$ref": "tutor_common.schema.json#/$defs/generationProvenance",
+      "x-field-origin": "system"
+    },
+    "field_origins": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "tutor_common.schema.json#/$defs/fieldOrigin"
+      },
+      "required": [
+        "title",
+        "evidence_refs"
+      ],
+      "x-field-origin": "system"
+    }
+  }
+}

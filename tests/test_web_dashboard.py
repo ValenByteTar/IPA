@@ -439,9 +439,9 @@ def _seed_tutor_store(tmp_path):
         },
     )
     store.save_roadmap(rm)
-    store.set_unit_status("roadmap:demo1", 1, "done")
-    store.set_unit_status("roadmap:demo1", 2, "current")
-    store.set_unit_status("roadmap:demo1", 3, "pending")
+    store.set_unit_status("roadmap:demo1", "roadmap_unit:u1", "done")
+    store.set_unit_status("roadmap:demo1", "roadmap_unit:u2", "current")
+    store.set_unit_status("roadmap:demo1", "roadmap_unit:u3", "pending")
     store.set_focus("roadmap:demo1")
     return store, rm, goal
 

@@ -200,10 +200,31 @@ def _research() -> dict:
     }
 
 
+def _expansion() -> dict:
+    return {
+        "expansion_id": "expansion:001",
+        "roadmap_id": "roadmap:hybrid-rag-v1",
+        "unit_id": "unit:1",
+        "depth_level": 1,
+        "title": "Chunks nucleares del concepto",
+        "summary": "Material central del documento fuente.",
+        "evidence_refs": [_source("chunk:unit-1-core")],
+        "coverage": {"cluster_id": "cluster:hybrid-rag", "docs_total": 12, "docs_covered": 4},
+        "status": "generated",
+        "created_at": NOW,
+        "generation": _generation(),
+        "field_origins": {
+            "title": "generated",
+            "evidence_refs": "source",
+        },
+    }
+
+
 VALID_RECORDS = {
     "LearningGoal": _goal,
     "Concept": _concept,
     "Roadmap": _roadmap,
+    "RoadmapExpansion": _expansion,
     "AssessmentResult": _assessment,
     "ResearchRequest": _research,
 }

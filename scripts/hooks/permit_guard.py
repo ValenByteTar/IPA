@@ -29,11 +29,40 @@ from work_permits import PermitStore  # noqa: E402
 
 WRITE_TOOLS = {"edit", "write", "apply_patch", "notebook_edit"}
 
+# Zonas blandas: el riesgo real de conflicto es de código. En docs/ y
+# knowledge/ un exclusive ajeno advierte pero no bloquea (el STOP solo
+# donde importa) — lección de PM-009 en el port desde RIAPP.
+SOFT_ZONE_PREFIXES = ("docs/", "knowledge/")
+
 SEEN_MAX_AGE_S = 7 * 24 * 3600
 
 
+def _heartbeat_mine(store: PermitStore, session: str) -> None:
+    """Renueva el lease de los permits de ESTA sesión en cada tool call.
+
+    Mismo patrón que vram_lock.renew (PAT-007): mientras la sesión trabaja,
+    su permit no caduca (un batch nocturno >ttl ya no expira en vuelo);
+    cuando la sesión muere, deja de latir y pid_alive/TTL lo matan solos.
+    """
+    if not session:
+        return
+    for permit in store.active():
+        if permit.session == session:
+            store.heartbeat(permit.permit_id)
+
+
 def _emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False))
+    # Windows cp1252 no codifica →/— de los títulos EKS: forzar UTF-8 en
+    # stdout (bug real: la inyección de records moría en UnicodeEncodeError
+    # y el hook salía 1 — el .seen se escribía pero la UI nunca veía el
+    # additionalContext).
+    out = json.dumps(payload, ensure_ascii=False)
+    try:
+        sys.stdout.buffer.write(out.encode("utf-8"))
+        sys.stdout.buffer.write(b"\n")
+        sys.stdout.buffer.flush()
+    except AttributeError:
+        print(out)
 
 
 def _rel(path: str) -> str:
@@ -116,13 +145,29 @@ def on_pre_tool_use(data: dict) -> int:
     rel = _rel(path)
     store = PermitStore.default(PROJECT_ROOT)
 
+    _heartbeat_mine(store, session)
+
     check = store.check_path(rel, session=session)
     if check["blocked"]:
         owners = ", ".join(f"{p['permit_id']} ({p['session']})" for p in check["permits"])
+        if rel.startswith(SOFT_ZONE_PREFIXES):
+            _emit({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": (
+                        f"Aviso: '{rel}' está bajo un permit exclusivo ajeno "
+                        f"({owners}) — zona blanda (docs/knowledge): podés "
+                        "editar, pero coordiná para no pisar trabajo en curso."),
+                },
+            })
+            return 0
         _emit({
             "decision": "block",
             "reason": (f"'{rel}' is under an active exclusive work permit held by "
-                       f"{owners}. Coordinate with the user or pick a different scope."),
+                       f"{owners}. Coordinate with the user or pick a different scope. "
+                       "Si tu edición es acotada, adquirí el permit con scope a "
+                       "nivel de archivo (p. ej. --scope "
+                       "'src/ipa/agentic/promotion_executor.py')."),
         })
         return 0
 
@@ -151,7 +196,15 @@ def on_pre_tool_use(data: dict) -> int:
 
 def on_session_start(data: dict) -> int:
     store = PermitStore.default(PROJECT_ROOT)
+    session = data.get("session_id")
     lines: list[str] = []
+    if session:
+        # El guard matchea edits contra ESTE id. Adquirir con una etiqueta
+        # de rol ("A", "V1") en su lugar hace que tu propio permit te
+        # bloquee — mismo hallazgo que PM-002 en RIAPP.
+        lines.append(
+            f"Your Devin session_id: {session} — pass it as --session in "
+            "permit.py acquire so the guard recognizes your own edits.")
 
     active = store.active()
     if active:
@@ -252,15 +305,18 @@ def on_post_compaction(data: dict) -> int:
         return 0
     store = PermitStore.default(PROJECT_ROOT)
     mine = [p for p in store.active() if p.session == session]
-    if not mine:
-        return 0
-    lines = "\n".join(
-        f"  {p.permit_id} [{p.type}] scope={p.scope} task={p.task!r}" for p in mine)
+    lines = [
+        f"Reminder after compaction — your Devin session_id: {session} "
+        "(use it as --session in permit.py acquire).",
+    ]
+    if mine:
+        lines.append("Your active work permits:")
+        lines.extend(
+            f"  {p.permit_id} [{p.type}] scope={p.scope} task={p.task!r}" for p in mine)
     _emit({
         "hookSpecificOutput": {
             "hookEventName": "PostCompaction",
-            "additionalContext": (
-                "Reminder after compaction — your active work permits:\n" + lines),
+            "additionalContext": "\n".join(lines),
         },
     })
     return 0

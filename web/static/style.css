@@ -380,3 +380,35 @@ select.rm-status option{background:var(--surface2);color:var(--text);text-transf
 .dd-chip .dd-label{font-size:11px;color:var(--accent);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
 .dd-chip .dd-close{background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:0 2px;line-height:1}
 .dd-chip .dd-close:hover{color:var(--danger)}
+
+/* ── Estación de montaje de Roadmaps (workbench v2) ─────────────────── */
+.rmp-wb-actions{display:flex;gap:6px;align-items:center}
+.rmp-wb-findings{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+.wb-finding{font-size:11px;padding:4px 8px;border-radius:6px;border:1px solid #1a2030;background:#0d1017}
+.wb-f-err{border-color:#5c2626;color:#ff9d9d}
+.wb-f-warn{border-color:#5c4d26;color:#ffd88a}
+.wb-f-info{color:var(--muted)}
+.rmp-wb-units .rm-step{padding-right:4px}
+.wb-ops{display:flex;gap:2px;margin-left:auto;flex:0 0 auto;opacity:.75}
+.rm-step:hover .wb-ops{opacity:1}
+.wb-ungrounded{color:#ffd88a;font-size:10px;font-weight:700}
+.rmp-wb-add{display:flex;gap:6px;margin-top:10px;align-items:center}
+.rmp-wb-add input{background:#0d1017;border:1px solid #1a2030;border-radius:6px;color:var(--text);font-size:12px;padding:5px 8px}
+.rmp-wb-add input:focus{outline:none;border-color:var(--accent)}
+.wb-picker{position:relative}
+.wb-doc-results{position:absolute;top:100%;left:0;z-index:20;width:340px;max-height:240px;overflow-y:auto;background:#0d1017;border:1px solid #1a2030;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.wb-doc{padding:7px 10px;cursor:pointer;border-bottom:1px solid #141a26}
+.wb-doc:hover{background:#141a26}
+.wb-doc-title{font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-doc-meta{font-size:10px;color:var(--muted)}
+.rmp-depth-grid{overflow-x:auto}
+.wb-grid{border-collapse:collapse;width:100%;font-size:11px}
+.wb-grid th{color:var(--muted);font-weight:600;padding:4px 8px;text-align:center;border-bottom:1px solid #1a2030;white-space:nowrap}
+.wb-grid td{padding:5px 8px;text-align:center;border-bottom:1px solid #131824}
+.wb-unit{text-align:left;font-weight:600;white-space:nowrap}
+.wb-cell{color:var(--muted)}
+.wb-cell.has{color:var(--accent);cursor:help}
+.wb-cell.stale{color:var(--warning);cursor:help}
+.wb-current{background:rgba(88,166,255,.06)}
+.wb-current .wb-unit{color:var(--accent)}
+.wb-expand{width:36px}

@@ -100,12 +100,33 @@ def scope_prefix(glob: str) -> str:
     return glob.rsplit("/", 1)[0] + "/" if "/" in glob else ""
 
 
+def _is_literal(glob: str) -> bool:
+    """A glob with no wildcards names an exact path (file or directory)."""
+    return not any(char in glob for char in "*?[")
+
+
 def scopes_overlap(first: str, second: str) -> bool:
     """Conservative glob-vs-glob overlap via literal prefixes.
 
     `src/ipa/**` overlaps `src/ipa/agentic/promotion*`; `src/**` does not
     overlap `docs/**`. May over-report on exotic patterns — safe direction.
+
+    Literals (no wildcard) are matched exactly, not via prefix: a literal
+    like `AGENTS.md` or `requirements.txt` has an empty `scope_prefix`,
+    and the prefix check would treat it as "the whole repo" — a false
+    positive that made every permit conflict with every other one
+    (PM-008).
     """
+    first_literal, second_literal = _is_literal(first), _is_literal(second)
+    if first_literal and second_literal:
+        # Normalize trailing slashes so a literal directory ("dir/") contains
+        # its files ("dir/file.py") under the same prefix rule.
+        fa, fb = first.rstrip("/"), second.rstrip("/")
+        return fa == fb or fa.startswith(fb + "/") or fb.startswith(fa + "/")
+    if first_literal:
+        return glob_match(first, second)
+    if second_literal:
+        return glob_match(second, first)
     a, b = scope_prefix(first), scope_prefix(second)
     return a.startswith(b) or b.startswith(a)
 
@@ -209,7 +230,7 @@ class EKSRepository:
 
     def records(self) -> list[EKSRecord]:
         records: list[EKSRecord] = []
-        for category, (directory, _) in CATEGORIES.items():
+        for directory, _ in CATEGORIES.values():
             folder = self.root / directory
             if not folder.exists():
                 continue

@@ -2317,6 +2317,17 @@ def main() -> None:
                 if _watch_state != RESEARCH_WATCH.get("last_logged"):
                     RESEARCH_WATCH["last_logged"] = _watch_state
                     print(f"[research-watch] status={rstatus} session_id={session_id} notified={notified} busy={CHAT_BUSY['flag']}", flush=True)
+                # --- IPA Push (DEC-011): aviso al móvil, independiente del
+                # chat y de session_id (research por CLI también avisa).
+                # Best-effort: un fallo de push NUNCA rompe el watcher.
+                try:
+                    if rstatus in ("done", "failed") and not progress.get("push_notified"):
+                        from ipa.notifications import notify_research
+                        if notify_research(progress):
+                            progress["push_notified"] = True
+                            progress_path.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+                except Exception as push_exc:
+                    print(f"[research-watch] push error: {push_exc}", flush=True)
                 if rstatus in ("done", "failed") and session_id and not notified and not CHAT_BUSY["flag"]:
                     r = progress.get("result") or {}
                     if rstatus == "done":
@@ -2359,6 +2370,20 @@ def main() -> None:
     _pipeline_watch_thread = _threading.Thread(target=_pipeline_watch_worker, daemon=True)
 
     _pipeline_watch_thread.start()
+
+    # IPA Push (DEC-011): servicio de notificaciones al móvil (long-poll mTLS).
+    # Best-effort: si falla (puerto ocupado, material TLS), el dashboard sigue
+    # sin push y los avisos quedan encolados en outputs/notifications/push.db.
+    try:
+        from ipa.notifications.service import start_service_thread
+        _push_service = start_service_thread()
+        if _push_service is not None:
+            print(
+                f"[push] servicio activo en https://{_push_service.bind_ip}:{_push_service.port}",
+                flush=True,
+            )
+    except Exception as _push_exc:
+        print(f"[push] servicio no disponible: {_push_exc}", flush=True)
 
     # Research review worker: re-lectura LLM de docs scrapeados que el
     # research executor rechazó (quality/date/judge). Corre cuando el

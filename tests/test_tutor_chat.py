@@ -701,23 +701,30 @@ def _activate_roadmap(env, session="s1"):
     return core, store, driver, rid
 
 
+def _uids(store, rid):
+    """unit_ids en orden de spine."""
+    return [u.unit_id for u in sorted(
+        store.get_roadmap(rid).units, key=lambda u: u.order)]
+
+
 def test_activation_seeds_first_unit_current(env):
     core, store, driver, rid = _activate_roadmap(env)
-    assert store.unit_statuses(rid) == {1: "current"}
+    assert store.unit_statuses(rid) == {_uids(store, rid)[0]: "current"}
 
 
 def test_advance_intent_moves_current_unit(env):
     core, store, driver, rid = _activate_roadmap(env)
     out = driver.handle(core, "s1", "ya entendí, siguiente unidad", FakeProvider())
     statuses = store.unit_statuses(rid)
-    assert statuses[1] == "done" and statuses[2] == "current"
+    uids = _uids(store, rid)
+    assert statuses[uids[0]] == "done" and statuses[uids[1]] == "current"
     assert "unidad 2" in out["reply"].lower()
 
 
 def test_normal_lesson_does_not_advance(env):
     core, store, driver, rid = _activate_roadmap(env)
     driver.handle(core, "s1", "explicame embeddings", FakeProvider())
-    assert store.unit_statuses(rid) == {1: "current"}
+    assert store.unit_statuses(rid) == {_uids(store, rid)[0]: "current"}
 
 
 def test_advancing_last_unit_completes_roadmap_progress(env):
@@ -725,7 +732,8 @@ def test_advancing_last_unit_completes_roadmap_progress(env):
     driver.handle(core, "s1", "siguiente unidad", FakeProvider())
     out = driver.handle(core, "s1", "siguiente unidad", FakeProvider())
     statuses = store.unit_statuses(rid)
-    assert statuses[2] == "done" and statuses[3] == "current"
+    uids = _uids(store, rid)
+    assert statuses[uids[1]] == "done" and statuses[uids[2]] == "current"
     out = driver.handle(core, "s1", "avancemos", FakeProvider())
     statuses = store.unit_statuses(rid)
     assert all(s == "done" for s in statuses.values())
@@ -753,7 +761,7 @@ def test_advance_generates_unit_summary(env):
     driver.handle(core, "s1", "ya entendí, siguiente unidad", provider)
     summaries = store.list_unit_summaries(rid)
     assert len(summaries) == 1
-    assert summaries[0]["unit_order"] == 1
+    assert summaries[0]["unit_id"] == _uids(store, rid)[0]
     assert "token" in summaries[0]["summary"]
     # El resumen llega al índice de memoria (indexer sync).
     from ipa.agent.memory_store import MemoryIndexer, MemoryStore

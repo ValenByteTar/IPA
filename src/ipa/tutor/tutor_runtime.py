@@ -27,6 +27,7 @@ from ipa.agent.agent_core import AgentCore
 from ipa.tutor.tutor_contracts import (
     AssessmentType,
     EvidenceType,
+    ExpansionDepth,
     GenerationProvenance,
     HumanApproval,
     HumanApprovalDecision,
@@ -150,17 +151,17 @@ class TutorStore:
             );
             CREATE TABLE IF NOT EXISTS unit_progress (
                 roadmap_id TEXT NOT NULL,
-                unit_order INTEGER NOT NULL,
+                unit_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (roadmap_id, unit_order)
+                PRIMARY KEY (roadmap_id, unit_id)
             );
             CREATE TABLE IF NOT EXISTS unit_summaries (
                 roadmap_id TEXT NOT NULL,
-                unit_order INTEGER NOT NULL,
+                unit_id TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                PRIMARY KEY (roadmap_id, unit_order)
+                PRIMARY KEY (roadmap_id, unit_id)
             );
             CREATE TABLE IF NOT EXISTS tutor_focus (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -180,6 +181,23 @@ class TutorStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS roadmap_position (
+                roadmap_id TEXT PRIMARY KEY,
+                unit_id TEXT NOT NULL,
+                depth_level INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS roadmap_expansions (
+                expansion_id TEXT PRIMARY KEY,
+                roadmap_id TEXT NOT NULL,
+                unit_id TEXT NOT NULL,
+                depth_level INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_expansions_unit
+                ON roadmap_expansions (roadmap_id, unit_id, depth_level);
         """)
         # Migración aditiva: flag operativo de archivado. No es un estado del
         # contrato (RoadmapStatus no cambia) — solo saca el roadmap de las
@@ -190,6 +208,67 @@ class TutorStore:
                 "ALTER TABLE roadmaps ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
             )
         self._conn.commit()
+        self._migrate_unit_keying()
+
+    def _migrate_unit_keying(self) -> None:
+        """unit_order → unit_id (DEC-012): el orden es presentación; la
+        identidad de la unidad es unit_id. Las filas viejas se remapean via
+        el payload del roadmap; las que no resuelven se descartan (eran
+        huérfanas de hecho — apuntaban a unidades ya inexistentes).
+        """
+        progress_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(unit_progress)")
+        }
+        if "unit_order" not in progress_cols:
+            return
+        order_map: dict[str, dict[int, str]] = {}
+        for rid, payload in self._conn.execute(
+                "SELECT roadmap_id, payload_json FROM roadmaps").fetchall():
+            try:
+                units = json.loads(payload).get("units") or []
+                order_map[rid] = {
+                    int(u["order"]): str(u["unit_id"]) for u in units
+                }
+            except (ValueError, KeyError):
+                order_map[rid] = {}
+        for table, key_col, extra in (
+            ("unit_progress", "unit_order", "status, updated_at"),
+            ("unit_summaries", "unit_order", "summary, created_at"),
+        ):
+            self._conn.execute(f"""CREATE TABLE {table}__uid (
+                roadmap_id TEXT NOT NULL, unit_id TEXT NOT NULL,
+                {extra.split(', ')[0]} TEXT NOT NULL,
+                {extra.split(', ')[1]} TEXT NOT NULL,
+                PRIMARY KEY (roadmap_id, unit_id))""")
+            col_a, col_b = extra.split(', ')
+            for rid, order, a, b in self._conn.execute(
+                    f"SELECT roadmap_id, {key_col}, {col_a}, {col_b} FROM {table}"
+            ).fetchall():
+                uid = order_map.get(rid, {}).get(int(order))
+                if uid:
+                    self._conn.execute(
+                        f"INSERT OR REPLACE INTO {table}__uid VALUES (?, ?, ?, ?)",
+                        (rid, uid, a, b))
+            self._conn.execute(f"DROP TABLE {table}")
+            self._conn.execute(f"ALTER TABLE {table}__uid RENAME TO {table}")
+        pos_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(roadmap_position)")
+        }
+        if "unit_order" in pos_cols:
+            self._conn.execute("""CREATE TABLE roadmap_position__uid (
+                roadmap_id TEXT PRIMARY KEY, unit_id TEXT NOT NULL,
+                depth_level INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)""")
+            for rid, order, depth, ts in self._conn.execute(
+                    "SELECT roadmap_id, unit_order, depth_level, updated_at "
+                    "FROM roadmap_position").fetchall():
+                uid = order_map.get(rid, {}).get(int(order))
+                if uid:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO roadmap_position__uid VALUES (?, ?, ?, ?)",
+                        (rid, uid, depth, ts))
+            self._conn.execute("DROP TABLE roadmap_position")
+            self._conn.execute(
+                "ALTER TABLE roadmap_position__uid RENAME TO roadmap_position")
         self._conn.commit()
 
     def close(self) -> None:
@@ -278,6 +357,17 @@ class TutorStore:
         if approval:
             approval["decision"] = HumanApprovalDecision(approval["decision"])
             data["approval"] = HumanApproval(**approval)
+        stages = data.get("stages")
+        if stages:
+            from ipa.tutor.tutor_contracts import RoadmapStage
+            data["stages"] = [RoadmapStage(**s) for s in stages]
+        validation = data.get("validation")
+        if validation:
+            from ipa.tutor.tutor_contracts import RoadmapValidation, ValidationFinding
+            data["validation"] = RoadmapValidation(
+                run_at=validation["run_at"],
+                findings=[ValidationFinding(**f) for f in validation.get("findings", [])],
+            )
         return Roadmap(**data)
 
     def get_roadmap(self, roadmap_id: str) -> Any | None:
@@ -361,47 +451,187 @@ class TutorStore:
 
     # -- unit progress (operational, additive — the Roadmap stays immutable) --
 
-    def set_unit_status(self, roadmap_id: str, unit_order: int, status: str) -> None:
-        """Track per-unit progress: 'pending' | 'current' | 'done'."""
+    def set_unit_status(self, roadmap_id: str, unit_id: str, status: str) -> None:
+        """Track per-unit progress: 'pending' | 'current' | 'done'.
+
+        Keyed by unit_id (no por orden): reordenar la spine no rebalancea
+        el progreso; copiar unidades a un draft v+1 conserva el unit_id.
+        """
         self._conn.execute(
-            "INSERT INTO unit_progress (roadmap_id, unit_order, status, updated_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (roadmap_id, unit_order) "
+            "INSERT INTO unit_progress (roadmap_id, unit_id, status, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (roadmap_id, unit_id) "
             "DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
-            (roadmap_id, unit_order, status, _now()),
+            (roadmap_id, str(unit_id), status, _now()),
         )
         self._conn.commit()
 
-    def unit_statuses(self, roadmap_id: str) -> dict[int, str]:
+    def unit_statuses(self, roadmap_id: str) -> dict[str, str]:
         rows = self._conn.execute(
-            "SELECT unit_order, status FROM unit_progress WHERE roadmap_id = ?",
+            "SELECT unit_id, status FROM unit_progress WHERE roadmap_id = ?",
             (roadmap_id,),
         ).fetchall()
-        return {int(order): status for order, status in rows}
+        return {str(unit_id): status for unit_id, status in rows}
 
-    def save_unit_summary(self, roadmap_id: str, unit_order: int, summary: str) -> None:
+    def save_unit_summary(self, roadmap_id: str, unit_id: str, summary: str) -> None:
         """Per-unit lesson summary (pedagogical granularity for memory recall)."""
         self._conn.execute(
-            "INSERT INTO unit_summaries (roadmap_id, unit_order, summary, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (roadmap_id, unit_order) "
+            "INSERT INTO unit_summaries (roadmap_id, unit_id, summary, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (roadmap_id, unit_id) "
             "DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at",
-            (roadmap_id, unit_order, summary[:2000], _now()),
+            (roadmap_id, str(unit_id), summary[:2000], _now()),
         )
         self._conn.commit()
 
     def list_unit_summaries(self, roadmap_id: str | None = None) -> list[dict[str, Any]]:
         if roadmap_id:
             rows = self._conn.execute(
-                "SELECT roadmap_id, unit_order, summary FROM unit_summaries WHERE roadmap_id = ?",
+                "SELECT roadmap_id, unit_id, summary FROM unit_summaries WHERE roadmap_id = ?",
                 (roadmap_id,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT roadmap_id, unit_order, summary FROM unit_summaries"
+                "SELECT roadmap_id, unit_id, summary FROM unit_summaries"
             ).fetchall()
         return [
-            {"roadmap_id": r, "unit_order": int(o), "summary": s}
-            for r, o, s in rows
+            {"roadmap_id": r, "unit_id": str(u), "summary": s}
+            for r, u, s in rows
         ]
+
+    # -- navegación determinística: posición (unidad, profundidad) ------------
+
+    def get_position(self, roadmap_id: str) -> dict[str, Any]:
+        """Posición actual del alumno: {'unit_id': id|None, 'depth_level': D}.
+
+        Determinística (SELECT, nunca LLM). unit_id=None → sin posición
+        persistida todavía; el caller la resuelve a la primera unidad.
+        """
+        row = self._conn.execute(
+            "SELECT unit_id, depth_level FROM roadmap_position WHERE roadmap_id = ?",
+            (roadmap_id,),
+        ).fetchone()
+        return {"unit_id": row[0], "depth_level": int(row[1])} if row else {
+            "unit_id": None, "depth_level": 0,
+        }
+
+    def set_position(self, roadmap_id: str, unit_id: str, depth_level: int) -> None:
+        if not 0 <= depth_level <= 3:
+            raise ValueError("depth_level must be 0-3")
+        self._conn.execute(
+            "INSERT INTO roadmap_position (roadmap_id, unit_id, depth_level, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (roadmap_id) DO UPDATE SET "
+            "unit_id = excluded.unit_id, depth_level = excluded.depth_level, "
+            "updated_at = excluded.updated_at",
+            (roadmap_id, str(unit_id), depth_level, _now()),
+        )
+        self._conn.commit()
+
+    def inherit_progress(self, from_roadmap_id: str, to_roadmap_id: str,
+                         surviving_unit_ids: set[str]) -> int:
+        """Copia progreso + posición + summaries de la versión anterior a la
+        nueva para las unidades que sobrevivieron (mismo unit_id — las copias
+        de draft lo preservan). Devuelve cuántas unidades heredaron estado."""
+        rows = self._conn.execute(
+            "SELECT unit_id, status, updated_at FROM unit_progress WHERE roadmap_id = ?",
+            (from_roadmap_id,),
+        ).fetchall()
+        inherited = 0
+        for unit_id, status, ts in rows:
+            if unit_id in surviving_unit_ids:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO unit_progress "
+                    "(roadmap_id, unit_id, status, updated_at) VALUES (?, ?, ?, ?)",
+                    (to_roadmap_id, unit_id, status, ts))
+                inherited += 1
+        rows = self._conn.execute(
+            "SELECT unit_id, summary, created_at FROM unit_summaries WHERE roadmap_id = ?",
+            (from_roadmap_id,),
+        ).fetchall()
+        for unit_id, summary, ts in rows:
+            if unit_id in surviving_unit_ids:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO unit_summaries "
+                    "(roadmap_id, unit_id, summary, created_at) VALUES (?, ?, ?, ?)",
+                    (to_roadmap_id, unit_id, summary, ts))
+        pos = self.get_position(from_roadmap_id)
+        if pos["unit_id"] in surviving_unit_ids:
+            self.set_position(to_roadmap_id, pos["unit_id"], pos["depth_level"])
+        # Las expansiones L0-L3 también heredan: la evidencia sigue siendo
+        # válida para la unidad que sobrevivió (mismo unit_id).
+        for exp in self.list_expansions(from_roadmap_id):
+            if exp.unit_id in surviving_unit_ids:
+                from dataclasses import replace as _dc_replace
+                import hashlib as _hl
+                new_id = "expansion:" + _hl.sha256(
+                    f"{to_roadmap_id}{exp.unit_id}{int(exp.depth_level)}".encode()
+                ).hexdigest()[:12]
+                self.save_expansion(_dc_replace(
+                    exp, expansion_id=new_id, roadmap_id=to_roadmap_id))
+        self._conn.commit()
+        return inherited
+
+    def delete_expansions(self, roadmap_id: str, unit_id: str) -> int:
+        """Borra las expansiones de una unidad (remove_unit — no dejar
+        evidencia huérfana colgada de un unit_id inexistente)."""
+        cur = self._conn.execute(
+            "DELETE FROM roadmap_expansions WHERE roadmap_id = ? AND unit_id = ?",
+            (roadmap_id, unit_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def mark_expansions_stale(self, roadmap_id: str, unit_id: str) -> int:
+        """Marca stale las expansiones de una unidad cuyo concept_id cambió:
+        la evidencia describe el material viejo, no el nuevo ancla."""
+        cur = self._conn.execute(
+            "UPDATE roadmap_expansions SET status = 'stale' "
+            "WHERE roadmap_id = ? AND unit_id = ?",
+            (roadmap_id, unit_id),
+        )
+        for exp in self.list_expansions(roadmap_id, unit_id=unit_id):
+            from dataclasses import replace as _dc_replace
+            if exp.status != "stale":
+                self.save_expansion(_dc_replace(exp, status="stale"))
+        self._conn.commit()
+        return cur.rowcount
+
+    # -- expansiones de profundidad (dimensión Y, PAT-004 EvidenceSet) --------
+
+    def save_expansion(self, expansion: Any) -> None:
+        from ipa.tutor.tutor_contracts import RoadmapExpansion
+        if not isinstance(expansion, RoadmapExpansion):
+            raise TypeError("save_expansion expects a RoadmapExpansion contract instance")
+        payload = asdict(expansion)
+        payload["depth_level"] = int(expansion.depth_level)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO roadmap_expansions "
+            "(expansion_id, roadmap_id, unit_id, depth_level, status, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (expansion.expansion_id, expansion.roadmap_id, expansion.unit_id,
+             int(expansion.depth_level), expansion.status,
+             json.dumps(payload, ensure_ascii=False), expansion.created_at),
+        )
+        self._conn.commit()
+
+    def list_expansions(self, roadmap_id: str, unit_id: str | None = None) -> list[Any]:
+        from ipa.tutor.tutor_contracts import RoadmapExpansion
+        if unit_id:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM roadmap_expansions "
+                "WHERE roadmap_id = ? AND unit_id = ? ORDER BY depth_level",
+                (roadmap_id, unit_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM roadmap_expansions "
+                "WHERE roadmap_id = ? ORDER BY unit_id, depth_level",
+                (roadmap_id,),
+            ).fetchall()
+        out = []
+        for (payload,) in rows:
+            data = json.loads(payload)
+            data["depth_level"] = ExpansionDepth(data["depth_level"])
+            out.append(RoadmapExpansion(**data))
+        return out
 
     # -- foco de roadmap (cross-sesión, una sola fila) ------------------------
 
@@ -625,7 +855,8 @@ class TutorSession:
         )
 
     def build_lesson_messages(self, topic_id: str, user_message: str, *, history_limit: int = 8,
-                              progress_note: str | None = None) -> list[dict[str, str]]:
+                              progress_note: str | None = None,
+                              extra_context: str | None = None) -> list[dict[str, str]]:
         """Identity + pedagogical policy + mastery context + bounded history."""
         messages = self.core.build_messages(user_message, history_limit=history_limit)
         system = (
@@ -634,12 +865,15 @@ class TutorSession:
         )
         if progress_note:
             system += f"\n\n{progress_note}"
+        if extra_context:
+            system += extra_context
         messages[0] = {"role": "system", "content": system}
         return messages
 
     def lesson(self, topic_id: str, user_message: str, *, responder: Any | None = None,
                cluster_store: Any | None = None,
-               progress_note: str | None = None) -> dict[str, Any]:
+               progress_note: str | None = None,
+               extra_context: str | None = None) -> dict[str, Any]:
         """A lesson turn: records into the agent session with tutor policy.
 
         When a ``cluster_store`` (Fase 3) is provided, episodes are linked to
@@ -658,7 +892,8 @@ class TutorSession:
         # Submit through the core (records episodes) but with the policy payload
         session_id = self.core.ensure_session()
         messages = self.build_lesson_messages(
-            topic_id, user_message, history_limit=8, progress_note=progress_note)
+            topic_id, user_message, history_limit=8, progress_note=progress_note,
+            extra_context=extra_context)
         self.core.memory.record_episode(
             session_id, turn_role="user", content=user_message,
             identity_hash=self.core.identity.identity_hash,
@@ -899,7 +1134,9 @@ class TutorSession:
                     atypes: list[AssessmentType]) -> None:
             i = len(units) + 1
             units.append(RoadmapUnit(
-                unit_id=f"roadmap_unit:{hashlib.sha256(f'{goal_id}{concept_id}{i}'.encode()).hexdigest()[:12]}",
+                # unit_id por concepto (no por posición): una revisión que
+                # conserva el concept_id hereda el progreso de la unidad.
+                unit_id=f"roadmap_unit:{hashlib.sha256(f'{goal_id}{concept_id}'.encode()).hexdigest()[:12]}",
                 order=i,
                 concept_id=concept_id,
                 reason=reason,
@@ -1109,11 +1346,13 @@ class TutorSession:
             field_origins=roadmap.field_origins,
         )
         self.store.save_roadmap(active)
+        # v+1 hereda progreso/posición/summaries/expansiones de la versión
+        # anterior para las unidades que sobrevivieron (mismo unit_id).
+        if active.previous_roadmap_id:
+            self.store.inherit_progress(
+                active.previous_roadmap_id, active.roadmap_id,
+                {u.unit_id for u in active.units})
         return active
-
-    # ------------------------------------------------------------------
-    # LearningGoal: el "proyecto" que un roadmap sirve (persistido, gateado)
-    # ------------------------------------------------------------------
 
     def ensure_goal(
         self,

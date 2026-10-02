@@ -418,17 +418,20 @@ class MemoryIndexer:
         # sesión comprime. topic → roadmap → "Lección de {topic}, unidad N".
         try:
             goal_topics: dict[str, str] = {}
+            unit_orders: dict[str, dict[str, int]] = {}
             for rm in ts.list_roadmaps():
                 goal_topics[rm.roadmap_id] = rm.goal_id.removeprefix("goal:").replace("-", " ")
+                unit_orders[rm.roadmap_id] = {u.unit_id: u.order for u in rm.units}
             for us in ts.list_unit_summaries():
                 topic = goal_topics.get(us["roadmap_id"], "el tema")
+                order = unit_orders.get(us["roadmap_id"], {}).get(us["unit_id"], "?")
                 self.store.upsert_item(MemoryItem(
                     memory_id=_item_id(
-                        "lesson_unit", f"{us['roadmap_id']}:{us['unit_order']}"),
+                        "lesson_unit", f"{us['roadmap_id']}:{us['unit_id']}"),
                     scope="episodic", kind="lesson_unit",
-                    text=(f"Lección de {topic}, unidad {us['unit_order']}: "
+                    text=(f"Lección de {topic}, unidad {order}: "
                           f"{us['summary']}"),
-                    source_ref=f"{us['roadmap_id']}:{us['unit_order']}",
+                    source_ref=f"{us['roadmap_id']}:{us['unit_id']}",
                     confidence=None,
                 ))
                 n += 1

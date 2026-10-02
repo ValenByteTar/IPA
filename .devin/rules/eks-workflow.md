@@ -7,8 +7,18 @@ trigger: always_on
 
 - Before editing code, acquire a work permit for your scope:
   `.venv/Scripts/python.exe scripts/cli/permit.py acquire --session <id> --scope "<globs>" --task "..."`
+  `<id>` is the Devin `session_id` injected by `SessionStart` — a role
+  label makes your own permit block your edits. Prefer file-level scopes
+  over directory globs when the work allows it (fewer false conflicts).
   An exclusive-scope conflict means STOP and tell the user — never route
   around the block by editing adjacent files instead.
+- Types (the STOP lives where the real risk is code): `exclusive` for
+  code; `advisory` for docs/knowledge (warns, does not block — the hook
+  enforces it as a soft zone); `survey` for read-only exploration.
+- The hook renews the heartbeat of YOUR permits on every tool call — a
+  batch longer than the TTL no longer expires mid-flight. When the
+  session dies, `pid_alive` + TTL reap it automatically (no ghost
+  permits).
 - On finishing work, close your permits with the session's harvest:
   `permit.py close --permit PW-... --notes "..." --eks-draft <ID>` —
   invoke skill `session-closeout` for the full protocol. A permit closed

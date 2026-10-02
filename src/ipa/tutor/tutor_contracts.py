@@ -5,7 +5,7 @@ import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 
 
@@ -59,6 +59,7 @@ class ConceptStatus(StrEnum):
 
 
 class RoadmapStatus(StrEnum):
+    DRAFT = "draft"
     PROPOSED = "proposed"
     APPROVED = "approved"
     ACTIVE = "active"
@@ -261,14 +262,44 @@ class RoadmapUnit:
     estimated_effort_minutes: int
     source_refs: list[SourceRef]
     assessment_types: list[AssessmentType]
+    stage_id: str | None = None
+    field_origins: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not 5 <= self.estimated_effort_minutes <= 1440:
             raise ValueError("estimated effort must be between 5 and 1440 minutes")
-        if not self.source_refs:
-            raise ValueError("a roadmap unit requires source references")
-        if not self.assessment_types or len(set(self.assessment_types)) != len(self.assessment_types):
-            raise ValueError("assessment types must be non-empty and unique")
+        # source_refs may be empty ONLY while the roadmap is a draft (workbench
+        # unit not yet grounded); Roadmap enforces grounding for frozen states.
+        if self.assessment_types and len(set(self.assessment_types)) != len(self.assessment_types):
+            raise ValueError("assessment types must be unique when present")
+
+
+@dataclass(frozen=True)
+class RoadmapStage:
+    """Optional grouping of units (the roadmap's Z axis for large curricula)."""
+    stage_id: str
+    title: str
+    order: int
+
+
+@dataclass(frozen=True)
+class ValidationFinding:
+    """One deterministic validation result attached to a draft (pipeline P2)."""
+    code: str
+    severity: str
+    message: str
+    unit_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.severity not in {"info", "warning", "error"}:
+            raise ValueError("finding severity must be info, warning or error")
+
+
+@dataclass(frozen=True)
+class RoadmapValidation:
+    """Deterministic validation report (pipeline P2) attached to a draft."""
+    run_at: str
+    findings: list[ValidationFinding]
 
 
 @dataclass(frozen=True)
@@ -286,10 +317,25 @@ class Roadmap:
     approval: HumanApproval | None
     generation: GenerationProvenance
     field_origins: dict[str, str]
+    stages: list[RoadmapStage] | None = None
+    validation: RoadmapValidation | None = None
 
     def __post_init__(self) -> None:
-        if not 3 <= len(self.units) <= 7:
-            raise ValueError("a roadmap requires 3 to 7 units")
+        if self.status == RoadmapStatus.DRAFT:
+            # Workbench state: starts empty, grows by montage ops. The freeze
+            # (draft → proposed) is where the 3-7 grounded spine is enforced.
+            if not 0 <= len(self.units) <= 50:
+                raise ValueError("a draft roadmap allows 0 to 50 units")
+        else:
+            if not 3 <= len(self.units) <= 7:
+                raise ValueError("a frozen roadmap requires 3 to 7 units")
+            for unit in self.units:
+                if not unit.source_refs:
+                    raise ValueError(
+                        f"frozen roadmap unit {unit.unit_id} requires source references")
+                if not unit.assessment_types:
+                    raise ValueError(
+                        f"frozen roadmap unit {unit.unit_id} requires assessment types")
         orders = sorted(unit.order for unit in self.units)
         if orders != list(range(1, len(self.units) + 1)):
             raise ValueError("roadmap unit order must be contiguous starting at 1")
@@ -297,6 +343,18 @@ class Roadmap:
             raise ValueError("roadmap unit IDs must be unique")
         if len({unit.concept_id for unit in self.units}) != len(self.units):
             raise ValueError("roadmap concept IDs must be unique")
+        if self.stages:
+            stage_ids = [s.stage_id for s in self.stages]
+            if len(stage_ids) != len(set(stage_ids)):
+                raise ValueError("roadmap stage IDs must be unique")
+            stage_orders = sorted(s.order for s in self.stages)
+            if stage_orders != list(range(1, len(self.stages) + 1)):
+                raise ValueError("roadmap stage order must be contiguous starting at 1")
+            known = set(stage_ids)
+            for unit in self.units:
+                if unit.stage_id is not None and unit.stage_id not in known:
+                    raise ValueError(
+                        f"unit {unit.unit_id} references unknown stage {unit.stage_id}")
         if self.version > 1 and (
             not self.previous_roadmap_id or not self.change_reason or not self.change_reason.strip()
         ):
@@ -415,6 +473,53 @@ class ResearchRequest:
             raise ValueError("running or completed research requires a job ID")
         if self.status == ResearchStatus.COMPLETED and not self.result_source_refs:
             raise ValueError("completed research requires result source references")
+
+
+class ExpansionDepth(IntEnum):
+    """Depth levels of a roadmap unit's evidence expansion (dimensión Y)."""
+    OVERVIEW = 0
+    CORE = 1
+    CLAIMS = 2
+    NEIGHBORHOOD = 3
+
+
+@dataclass(frozen=True)
+class RoadmapExpansion:
+    """One depth level of evidence under a roadmap unit (dimensión Y).
+
+    Deterministic retrieval artifact (PAT-004 EvidenceSet pattern): the
+    scaffold expands, the LLM renders. Position (unit, depth) lives in the
+    store — the LLM never decides it.
+    """
+    expansion_id: str
+    roadmap_id: str
+    unit_id: str
+    depth_level: ExpansionDepth
+    title: str
+    evidence_refs: list[SourceRef]
+    created_at: str
+    generation: GenerationProvenance
+    field_origins: dict[str, str]
+    summary: str | None = None
+    coverage: dict[str, Any] | None = None
+    status: str = "generated"
+
+    def __post_init__(self) -> None:
+        if self.depth_level not in set(ExpansionDepth):
+            raise ValueError("depth_level must be 0-3")
+        if not self.evidence_refs:
+            raise ValueError("an expansion requires evidence references")
+        if self.status not in {"generated", "stale", "superseded"}:
+            raise ValueError("expansion status must be generated, stale or superseded")
+        if self.coverage is not None:
+            for key in ("cluster_id", "docs_total", "docs_covered"):
+                if key not in self.coverage:
+                    raise ValueError(f"coverage requires key '{key}'")
+            if self.coverage["docs_covered"] > self.coverage["docs_total"]:
+                raise ValueError("docs_covered cannot exceed docs_total")
+        _validate_origins(
+            self.field_origins, {"title", "evidence_refs"}, self.generation
+        )
 
 
 def answer_hash(answer: str) -> str:

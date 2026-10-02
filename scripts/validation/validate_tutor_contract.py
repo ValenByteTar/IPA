@@ -13,6 +13,7 @@ SCHEMAS = {
     "LearningGoal": "learning_goal.schema.json",
     "Concept": "concept.schema.json",
     "Roadmap": "roadmap.schema.json",
+    "RoadmapExpansion": "roadmap_expansion.schema.json",
     "AssessmentResult": "assessment_result.schema.json",
     "ResearchRequest": "research_request.schema.json",
 }
@@ -72,6 +73,7 @@ def integrity_errors(record_type: str, data: dict[str, Any]) -> list[str]:
 
     elif record_type == "Roadmap":
         units = data.get("units", [])
+        status = data.get("status")
         orders = [unit.get("order") for unit in units]
         if orders and sorted(orders) != list(range(1, len(orders) + 1)):
             errors.append("roadmap unit order must be unique and contiguous starting at 1")
@@ -81,12 +83,39 @@ def integrity_errors(record_type: str, data: dict[str, Any]) -> list[str]:
         concept_ids = [unit.get("concept_id") for unit in units]
         if len(concept_ids) != len(set(concept_ids)):
             errors.append("roadmap concept_id values must be unique")
+        if status == "draft":
+            if len(units) > 50:
+                errors.append("a draft roadmap allows at most 50 units")
+        else:
+            if not 3 <= len(units) <= 7:
+                errors.append("a frozen roadmap requires 3 to 7 units")
+            for index, unit in enumerate(units):
+                if not unit.get("source_refs"):
+                    errors.append(f"frozen units[{index}] requires source_refs")
+                if not unit.get("assessment_types"):
+                    errors.append(f"frozen units[{index}] requires assessment_types")
+        stages = data.get("stages") or []
+        stage_ids = [s.get("stage_id") for s in stages]
+        if len(stage_ids) != len(set(stage_ids)):
+            errors.append("roadmap stage_id values must be unique")
+        known_stages = {sid for sid in stage_ids if sid}
+        for index, unit in enumerate(units):
+            sid = unit.get("stage_id")
+            if sid and stages and sid not in known_stages:
+                errors.append(f"units[{index}] references unknown stage '{sid}'")
         if data.get("status") in {"approved", "active", "completed", "superseded"}:
             approval = data.get("approval") or {}
             if approval.get("decision") != "approved":
                 errors.append("approved roadmap states require an approved human decision")
         for index, unit in enumerate(units):
             errors.extend(_source_ref_errors(unit.get("source_refs", []), f"units[{index}].source_refs"))
+
+    elif record_type == "RoadmapExpansion":
+        if data.get("coverage"):
+            coverage = data["coverage"]
+            if coverage.get("docs_covered", 0) > coverage.get("docs_total", 0):
+                errors.append("coverage docs_covered cannot exceed docs_total")
+        errors.extend(_source_ref_errors(data.get("evidence_refs", []), "evidence_refs"))
 
     elif record_type == "AssessmentResult":
         errors.extend(_source_ref_errors(data.get("evidence", []), "evidence"))

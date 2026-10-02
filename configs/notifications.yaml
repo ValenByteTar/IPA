@@ -1,0 +1,12 @@
+# IPA Push (DEC-011) — notificaciones propias al móvil.
+# Sin secretos aquí: el material TLS vive en outputs/notifications/tls/.
+push:
+  enabled: true
+  bind_ip: auto        # resuelve la IP LAN al arranque; o fija, ej. 192.168.1.50
+  port: 8766
+  max_connections: 5
+  poll_timeout_s: 25
+  max_backlog: 50
+  retention_days: 7
+events:
+  research: true       # research.done / research.failed

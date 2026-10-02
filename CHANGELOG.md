@@ -2,6 +2,87 @@
 
 Formato: [versión] — fecha. Estilo Keep a Changelog (resumido).
 
+## v0.2.3 — 2026-10-02
+
+### EKS work permits — port de mejoras desde RIAPP (PM-008/009/010)
+
+- **Lease vivo por pid** (`tools/work_permits.py`): el permit registra el
+  pid del holder (`os.getppid()`) y `pid_alive()` lo sondea (Windows vía
+  `ctypes`, POSIX vía `os.kill(pid, 0)`). Holder vivo → el lease sobrevive
+  al TTL (un batch largo ya no caduca en vuelo); holder muerto → el permit
+  expira aunque el heartbeat sea fresco — reaper de permits fantasma.
+  Permits sin `pid` conservan semántica TTL pura.
+- **Heartbeat automático** (`scripts/hooks/permit_guard.py`): el hook
+  renueva el lease de los permits de la sesión en cada tool call.
+- **Zonas blandas**: `docs/` y `knowledge/` bajo `exclusive` ajeno avisan
+  pero no bloquean; el STOP queda solo para código. `advisory`/`survey`
+  quedan documentados con caso de uso.
+- **session_id inyectado**: `SessionStart`/`PostCompaction` anuncian el id
+  del hook para `--session` (las etiquetas de rol auto-bloqueaban).
+- **`scopes_overlap` con literales** (`tools/eks_repository.py`): match
+  exacto/contención en vez de prefijo — un literal de raíz ya no solapa
+  con todo el repo.
+- `permit.py list` anota `alive` por permit; mensajes de conflicto sugieren
+  scope a nivel de archivo.
+- Nueva regla `.devin/rules/long-download-checkpoints.md` (novedad, no
+  volumen, en adquisiciones largas — portada y adaptada del scraper WFS de
+  RIAPP al pipeline de ingesta local).
+- Tests: `test_permit_guard.py` +9, `test_eks.py` +2 (literales) y fix de
+  `test_permit_lifecycle_and_conflict` a la semántica nueva.
+
+### Estación de montaje de Roadmaps (DEC-012)
+
+- **Contrato v2** (`roadmap.schema.json`): estado `draft` mutable (0-50
+  unidades, ungrounded permitido) que se congela en spine 3-7 grounded;
+  `stages[]` opcional, `validation` adjunta, `field_origins` por unidad.
+  Nuevo `roadmap_expansion.schema.json` — dimensión de profundidad
+  L0 overview / L1 nuclear / L2 claims / L3 vecindario.
+- **`tutor_workbench.py`**: CRUD determinístico de drafts
+  (add/remove/reorder/edit_unit/set_stages), `freeze_draft` bloqueado con
+  findings de severidad error, `reopen_draft` solo proposed→draft. El gate
+  humano sigue siendo el único camino a active.
+- **Refinamiento 3-capas**: LLM genera → validación determinística → LLM
+  revisor con contexto acotado (solo hallazgos + unidades afectadas, máx 3).
+- **Navegación determinística**: posición `(unit_id, depth_level)` en
+  SQLite — "¿dónde quedé?" es un SELECT; `query_gate` gana kind `roadmap`
+  para resolverlo server-side sin tools del LLM. `tutor_expansion.py`
+  genera expansiones L0-L3 determinísticas sobre DocumentStore +
+  topic_clusters; el LLM solo renderea.
+- Keying por `unit_id` (hash de goal+concept, sin índice posicional):
+  reordenar conserva identidad; `inherit_progress` copia progreso,
+  posición, summaries y expansiones a la versión activada.
+- API del dashboard: `POST /api/tutor/roadmap/draft` (ops de montaje),
+  `/expand`, `/expansions`; workbench UI en `web/static/`.
+- Plan de email añadido: `docs/email-connectivity-plan.md` (preliminar,
+  aparcado).
+
+## v0.2.2 — 2026-09-25
+
+### IPA Push Fase 0 — notificaciones propias al móvil (DEC-011)
+
+- **Bounded context nuevo `src/ipa/notifications/`**: servicio push propio
+  (long-poll HTTPS con mTLS) — CA local + server cert (SAN = IP LAN) + cert
+  cliente `.p12` por emparejamiento. Slot único: un solo dispositivo; tomar la
+  plaza exige `notifications.py pair` en el PC (`--replace` explícito);
+  `revoke` libera y revoca. Protocolo v1 congelado: `/health`, `/poll`
+  (backlog por `last_ack_id`), `/ack`; colapso anti-spam por query; límites
+  duros (≤5 conexiones, body ≤64 KB, poll ≤60 s) y auditoría de rechazos.
+- **Hook "investigación lista"**: el watcher de research del dashboard llama
+  `notify_research()` en la transición done/failed — independiente de
+  `session_id` y `CHAT_BUSY`, best-effort (un fallo de push nunca rompe el
+  watcher). Contenido: solo metadatos del evento (DEC-002).
+- **CLI** `scripts/cli/notifications.py`: `init-ca | pair | revoke | serve |
+  send | devices | status`. Estado en `outputs/notifications/` (derivable);
+  material TLS cubierto por `outputs/*` — sin cambios en `.gitignore`.
+- Sin dependencias nuevas (certs con `cryptography`, ya transitiva en el venv;
+  servidor con stdlib `ThreadingHTTPServer` + `ssl`).
+- Gotcha Windows corregido: sin `SO_REUSEADDR` (doble-bind silencioso) — el
+  segundo bind falla ruidoso y el arranque reintenta.
+- Tests: `tests/test_notifications_*.py` (29: store, TLS, end-to-end con
+  sockets reales, hook, CLI). Suite completa: 1204 passed, 1 skipped.
+- Plan completo (Fases 0-2): `docs/plans/mobile-push-notifications.md`.
+  Fase 1 (app Android en `mobile/`) pendiente de toolchain.
+
 ## v0.2.1 — 2026-09-24
 
 ### PM-007: race de cargas de modelo + SSE honesto

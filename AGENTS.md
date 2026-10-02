@@ -120,11 +120,18 @@ Pop-Location
 .venv/Scripts/python.exe scripts/cli/eks_new.py decision --title "..." --status proposed
 
 # Work permits — sesiones paralelas (PAT-009). Un hook PreToolUse ya
-# bloquea edits bajo permiso exclusivo ajeno e inyecta los records EKS que
-# gobiernan el path; `acquire` es atómico (lockfile O_EXCL); SessionStart
-# lista permisos y reporta los cerrados sin cosecha (marcador unharvested);
-# SessionEnd cierra los de la sesión; Stop bloquea UNA vez pidiendo el
-# closeout (`stop_hook_active` guard); PostCompaction los re-inyecta.
+# bloquea edits bajo permiso exclusivo ajeno (en código; docs/ y
+# knowledge/ son zonas blandas: avisan, no bloquean) e inyecta los records
+# EKS que gobiernan el path; `acquire` es atómico (lockfile O_EXCL);
+# SessionStart lista permisos, reporta los cerrados sin cosecha
+# (marcador unharvested) e INYECTA TU session_id — usalo como --session
+# (una etiqueta de rol hace que tu propio permit te bloquee); el hook
+# renueva el heartbeat de tus permits en cada tool call, y al morir la
+# sesión pid_alive + TTL expiran el permit solos (reaper de permits
+# fantasma — un batch >ttl ya no caduca en vuelo); SessionEnd cierra los
+# de la sesión; Stop bloquea UNA vez pidiendo el closeout
+# (`stop_hook_active` guard); PostCompaction re-inyecta permisos y
+# session_id.
 .venv/Scripts/python.exe scripts/cli/permit.py acquire --session <id> \
   --scope "src/ipa/agentic/**" --task "..." --type exclusive
 .venv/Scripts/python.exe scripts/cli/permit.py check --scope "src/**"
@@ -206,6 +213,11 @@ a second domain runtime: state lives in the core (`outputs/agent/*`).
   before editing (`permit.py acquire`); an exclusive overlap means stop
   and tell the user. On close, record what the session learned via
   `eks_new` (draft) and pass it as `--eks-draft` to `permit.py close`.
+- Tipos de permit (el STOP solo donde el riesgo es de código):
+  `exclusive` para código; `advisory` para docs/knowledge (avisa, no
+  bloquea); `survey` para exploración de solo lectura. Scopes a nivel de
+  archivo cuando el trabajo lo permite (menos falsos conflictos que los
+  globs de directorio).
 - Tests must validate real behavior, not just file existence.
 - Commits carry NO Devin attribution (no `Generated with Devin`, no
   `Co-Authored-By: Devin`) — absolute user prohibition, enforced by

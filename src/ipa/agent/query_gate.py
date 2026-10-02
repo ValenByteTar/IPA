@@ -49,6 +49,19 @@ _IDENTITY = re.compile(
 )
 
 
+# Roadmap/learning-plan questions: resolved server-side from TutorStore
+# (deterministic position/progress), never via corpus retrieval — the 9B
+# no elige tools confiablemente (patrón recall_memory).
+_ROADMAP = re.compile(
+    r"\b("
+    r"roadmap|plan\s+de\s+(estudio|aprendizaje)|"
+    r"(proxima|siguiente)\s+(unidad|clase|leccion)|unidad\s+\d|"
+    r"donde\s+(quede|quedamos|estoy|iba)|en\s+que\s+(unidad|parte)\s+(quede|estoy|vamos)|"
+    r"mi\s+(aprendizaje|progreso|curso|roadmap)|como\s+voy\s+con\s+(el|mi)\s+(curso|roadmap|aprendizaje)|"
+    r"seguimos\s+con\s+(el|la)\s+(unidad|leccion|roadmap)|profundidad\b"
+    r")\b",
+)
+
 # Memory questions: about the user profile, past conversations, or the
 # agent's own memory. These resolve via recall_memory (the agentic
 # corpus), not via document-corpus retrieval.
@@ -95,6 +108,9 @@ def classify_message(message: str) -> str:
         "command"   — explicit tool/system command: tool loop handles it.
         "memory"    — question about the user/past sessions: resolve via
                       recall_memory, not the document corpus.
+        "roadmap"   — question about the learning plan/progress: resolve
+                      server-side from TutorStore (deterministic), not via
+                      corpus retrieval ni elección de tools por el LLM.
         "knowledge" — everything else: auto-retrieval runs.
     """
     norm = _normalize(message.strip())
@@ -102,6 +118,8 @@ def classify_message(message: str) -> str:
         return "identity"
     if re.match(r"^(hola|buenas|hey|hi|hello|gracias|ok|si|no|dale|bueno|chau|adios|listo)\b", norm):
         return "greeting"
+    if _ROADMAP.search(norm):
+        return "roadmap"
     if _MEMORY.search(norm):
         return "memory"
     if _COMMAND.search(norm):

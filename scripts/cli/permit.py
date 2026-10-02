@@ -1,8 +1,19 @@
 """Dev-time work permits for parallel agent sessions (Permit-to-Work).
 
+Tipos de permit (el STOP solo donde el riesgo real es de código):
+    exclusive  — bloquea ediciones ajenas en el scope (código)
+    advisory   — advierte pero permite (docs/, knowledge/)
+    survey     — exploración/lectura profunda; nunca bloquea
+
+El hook renueva el heartbeat de TUS permits en cada tool call (lease
+mientras trabajas); al morir la sesión, pid_alive + TTL los expiran
+solos (reaper de permits fantasma).
+
 Examples:
     permit.py acquire --session devin-abc --scope "src/ipa/agentic/**" \
         --task "refactor promotion" --type exclusive
+    permit.py acquire --session devin-abc --scope "docs/**" \
+        --task "draft report" --type advisory
     permit.py check --scope "src/ipa/**"
     permit.py list
     permit.py heartbeat --permit PW-20260923-01
@@ -86,7 +97,7 @@ def main() -> int:
     if args.command == "list":
         permits = store.all()
         _print_permit({
-            "permits": [p.to_dict() for p in permits],
+            "permits": [{**p.to_dict(), "alive": p.alive()} for p in permits],
             "active": [p.permit_id for p in permits if p.alive()],
         })
         return 0

@@ -1188,10 +1188,23 @@ function renderRoadmapContext(ctx){
   $('#rmp-focus-tag').style.display=ctx.is_focus?'':'none';
   const uiStatus=({approved:'accepted',active:'accepted',completed:'accepted',rejected:'rejected'})[ctx.status]||'proposed';
   const sel=$('#rmp-status-select');
-  sel.className='rm-status '+uiStatus;
-  sel.innerHTML=['proposed','accepted','rejected'].map(s=>`<option value="${s}"${s===uiStatus?' selected':''}>${s}</option>`).join('');
-  sel.onchange=()=>decideRoadmapStatus(ctx.roadmap_id,sel.value);
+  if(ctx.status==='draft'){
+    // Un draft no pasó el freeze: no es propuesta todavía y el gate humano
+    // no aplica. El select refleja el estado real y queda bloqueado.
+    sel.className='rm-status';
+    sel.innerHTML='<option value="draft" selected>draft</option>';
+    sel.disabled=true;
+    sel.onchange=null;
+  }else{
+    sel.disabled=false;
+    sel.className='rm-status '+uiStatus;
+    sel.innerHTML=['proposed','accepted','rejected'].map(s=>`<option value="${s}"${s===uiStatus?' selected':''}>${s}</option>`).join('');
+    sel.onchange=()=>decideRoadmapStatus(ctx.roadmap_id,sel.value);
+  }
   $('#rmp-archive-btn').onclick=()=>archiveTutorRoadmap(ctx.roadmap_id);
+  const editBtn=$('#rmp-edit-btn');
+  editBtn.style.display=ctx.status==='draft'?'none':'';
+  editBtn.onclick=()=>editAsDraft(ctx);
   // Por qué: racionalidad del contrato (antes invisible en la UI).
   const rat=ctx.rationale||{};
   $('#rmp-change-reason').style.display=rat.change_reason?'':'none';
@@ -1204,13 +1217,24 @@ function renderRoadmapContext(ctx){
   const pct=p.total?Math.round(100*p.done/p.total):0;
   $('#rmp-progress-fill').style.width=pct+'%';
   $('#rmp-progress-label').textContent=`${p.done}/${p.total} unidades · ${pct}%${p.current?` · en unidad ${p.current}`:''}`;
+  // La spine (AVANCE) es la superficie de edición en draft: los controles
+  // viven inline en cada unidad, no en una lista duplicada.
+  const isDraftCtx=ctx.status==='draft';
   $('#rmp-units').innerHTML=(ctx.units||[]).map(u=>{
     const mark=u.status==='done'?'✓':u.status==='current'?'▶':String(u.order);
     const t=u.concept&&u.concept.title||'Material del corpus';
+    const badge=u.grounded?'':' <span class="wb-ungrounded" title="sin ancla en el corpus">⚠ sin ancla</span>';
+    const ops=isDraftCtx?`<span class="wb-ops">
+        <button class="icon-btn tiny" title="Subir" onclick="wbMove('${ctx.roadmap_id}','${esc(u.unit_id)}',-1)">↑</button>
+        <button class="icon-btn tiny" title="Bajar" onclick="wbMove('${ctx.roadmap_id}','${esc(u.unit_id)}',1)">↓</button>
+        <button class="icon-btn tiny" title="Editar razón" onclick="wbEditReason('${ctx.roadmap_id}','${esc(u.unit_id)}')">✎</button>
+        <button class="icon-btn tiny" title="Quitar unidad" onclick="wbRemove('${ctx.roadmap_id}','${esc(u.unit_id)}')">✕</button>
+      </span>`:'';
     return `<li class="rm-step ${esc(u.status)}">
       <span class="rm-num">${mark}</span>
-      <div class="rm-body"><div class="rm-title">${esc(t)}</div>
+      <div class="rm-body"><div class="rm-title">${esc(t)}${badge}</div>
       <div class="rm-meta">${u.minutes} min · ${esc((u.assessment_types||[]).join(', '))} — ${esc(u.reason||'')}</div></div>
+      ${ops}
     </li>`;
   }).join('');
   $('#rmp-mastery').textContent=ctx.mastery?`mastery ${ctx.mastery.status}${ctx.mastery.score!=null?' · '+(ctx.mastery.score*100).toFixed(0)+'%':''} · ${ctx.mastery.attempts} intentos`:'';
@@ -1223,6 +1247,196 @@ function renderRoadmapContext(ctx){
       <div class="rmp-concept-excerpt">${esc(c.excerpt||'')}</div>
     </div>`;
   }).join('');
+  // Estación de montaje + dimensión de profundidad (v2 del contrato).
+  renderWorkbench(ctx);
+  renderDepthGrid(ctx);
+}
+
+// ── Estación de montaje: editor de draft + validación P2 + refinamiento ──
+async function wbOp(op,payload){
+  const r=await api('/api/tutor/roadmap/draft',{method:'POST',body:JSON.stringify({op,...payload})});
+  if(!r.ok)throw new Error(r.error||`op ${op} falló`);
+  return r;
+}
+
+function renderWorkbench(ctx){
+  const card=$('#rmp-workbench-card');
+  if(!card)return;
+  const isDraft=ctx.status==='draft';
+  card.style.display=isDraft?'':'none';
+  if(!isDraft)return;
+  // Hallazgos P2 (auto-corridos tras cada mutación — el montaje desencadena
+  // validación sin botón).
+  const findings=(ctx.validation&&ctx.validation.findings)||[];
+  const sevCls={error:'wb-f-err',warning:'wb-f-warn',info:'wb-f-info'};
+  $('#rmp-wb-findings').innerHTML=findings.length
+    ?findings.map(f=>`<div class="wb-finding ${sevCls[f.severity]||''}"><strong>${esc(f.code)}</strong> — ${esc(f.message)}</div>`).join('')
+    :'<div class="muted" style="font-size:12px">Sin hallazgos — la validación corre sola al editar.</div>';
+  // Picker de documentos: el usuario no conoce concept_ids — busca por
+  // título/dominio y elige; la unidad queda anclada al doc elegido.
+  const picker=$('#rmp-wb-doc-search');
+  const results=$('#rmp-wb-doc-results');
+  let pickDoc=null, deb=null;
+  picker.oninput=()=>{
+    clearTimeout(deb);pickDoc=null;
+    const q=picker.value.trim();
+    if(q.length<3){results.style.display='none';return}
+    deb=setTimeout(async()=>{
+      try{
+        const r=await api('/api/tutor/docs/search',{method:'POST',body:JSON.stringify({q})});
+        const docs=r.docs||[];
+        results.innerHTML=docs.length
+          ?docs.map((d,i)=>`<div class="wb-doc" data-i="${i}">
+              <div class="wb-doc-title">${esc(d.title||d.document_id)}</div>
+              <div class="wb-doc-meta">${esc(d.source_domain||'?')} · ${d.quality_score!=null?'q '+d.quality_score:'sin score'} · ${format(d.chars)} chars</div>
+            </div>`).join('')
+          :'<div class="muted" style="padding:6px">Sin documentos que coincidan</div>';
+        results.style.display='';
+        results._docs=docs;
+      }catch(e){results.innerHTML=`<div class="muted" style="padding:6px">${esc(e.message)}</div>`;results.style.display=''}
+    },300);
+  };
+  results.onclick=e=>{
+    const el=e.target.closest('.wb-doc');
+    if(!el||!results._docs)return;
+    pickDoc=results._docs[parseInt(el.dataset.i)];
+    picker.value=pickDoc.title||pickDoc.document_id;
+    results.style.display='none';
+    if(!$('#rmp-wb-new-reason').value.trim())
+      $('#rmp-wb-new-reason').value=`Material de ${pickDoc.source_domain||'corpus'}`;
+  };
+  $('#rmp-wb-add-btn').onclick=async()=>{
+    const reason=$('#rmp-wb-new-reason').value.trim();
+    if(!pickDoc){toast('Buscá y elegí un documento del corpus primero');return}
+    if(!reason){toast('La razón de la unidad es requerida');return}
+    try{
+      await wbOp('add_unit',{roadmap_id:ctx.roadmap_id,concept_id:pickDoc.document_id,reason,
+        minutes:parseInt($('#rmp-wb-new-minutes').value)||30,
+        source_refs:[{source_id:pickDoc.document_id,source_type:'document'}]});
+      picker.value='';$('#rmp-wb-new-reason').value='';pickDoc=null;
+      loadRoadmapContext(ctx.roadmap_id);
+    }catch(e){toast(e.message)}
+  };
+  $('#rmp-wb-validate').onclick=async()=>{
+    try{await wbOp('validate',{roadmap_id:ctx.roadmap_id});loadRoadmapContext(ctx.roadmap_id)}
+    catch(e){toast(e.message)}
+  };
+  $('#rmp-wb-refine').onclick=async()=>{
+    try{
+      const r=await wbOp('refine',{roadmap_id:ctx.roadmap_id});
+      toast(`Refinamiento P3: ${r.changes.length} unidad(es) ajustada(s)`);
+      loadRoadmapContext(ctx.roadmap_id);
+    }catch(e){toast(e.message)}
+  };
+  $('#rmp-wb-freeze').onclick=async()=>{
+    try{
+      const r=await wbOp('freeze',{roadmap_id:ctx.roadmap_id});
+      toast(`Draft congelado → ${r.status} (gate humano activo)`);
+      loadRoadmapContext(ctx.roadmap_id);
+    }catch(e){toast(e.message)}
+  };
+}
+
+async function wbRemove(rid,unitId){
+  try{await wbOp('remove_unit',{roadmap_id:rid,unit_id:unitId});loadRoadmapContext(rid)}
+  catch(e){toast(e.message)}
+}
+
+async function wbMove(rid,unitId,dir){
+  try{
+    const ctx=await api('/api/tutor/roadmap/context?roadmap_id='+encodeURIComponent(rid));
+    const ids=(ctx.units||[]).map(u=>u.unit_id);
+    const i=ids.indexOf(unitId), j=i+dir;
+    if(j<0||j>=ids.length)return;
+    [ids[i],ids[j]]=[ids[j],ids[i]];
+    await wbOp('reorder',{roadmap_id:rid,unit_ids:ids});
+    loadRoadmapContext(rid);
+  }catch(e){toast(e.message)}
+}
+
+async function wbEditReason(rid,unitId){
+  const reason=prompt('Nueva razón de la unidad:');
+  if(!reason)return;
+  try{await wbOp('edit_unit',{roadmap_id:rid,unit_id:unitId,reason});loadRoadmapContext(rid)}
+  catch(e){toast(e.message)}
+}
+
+// ── Dimensión Y: grid unidades × profundidad (L0-L3) ─────────────────────
+const DEPTH_LABELS=['L0 overview','L1 nuclear','L2 claims','L3 vecindario'];
+
+async function renderDepthGrid(ctx){
+  const card=$('#rmp-depth-card');
+  if(!card)return;
+  const show=ctx.status!=='draft'&&ctx.units.length>0;
+  card.style.display=show?'':'none';
+  if(!show)return;
+  const pos=ctx.position||{unit_order:1,depth_level:0};
+  $('#rmp-position-label').textContent=
+    `posición: unidad ${pos.unit_order} · L${pos.depth_level} (${DEPTH_LABELS[pos.depth_level]||'?'})`;
+  let exps=[];
+  try{
+    const d=await api('/api/tutor/roadmap/expansions',{method:'POST',body:JSON.stringify({roadmap_id:ctx.roadmap_id})});
+    exps=d.expansions||[];
+  }catch{}
+  const byUnit={};
+  exps.forEach(e=>{(byUnit[e.unit_id]=byUnit[e.unit_id]||{})[e.depth_level]=e});
+  const rows=(ctx.units||[]).map(u=>{
+    const cells=DEPTH_LABELS.map((lbl,d)=>{
+      const e=byUnit[u.unit_id]&&byUnit[u.unit_id][d];
+      const stale=e&&e.status==='stale';
+      const cls=e?(stale?'wb-cell stale':'wb-cell has'):'wb-cell';
+      const title=e
+        ?(stale?'STALE — evidencia del ancla anterior, re-expandí':`${esc(e.title)} — ${e.n_refs} refs${e.coverage?` · cobertura ${e.coverage.docs_covered}/${e.coverage.docs_total}`:''}`)
+        :'sin expansión';
+      return `<td class="${cls}" title="${title}">${e?(stale?'◌':'●'):'○'}</td>`;
+    }).join('');
+    const isCurrent=u.order===pos.unit_order;
+    // Próximo nivel = el más bajo faltante o stale (regenera evidencia vieja).
+    let nextDepth=0;
+    while(nextDepth<4){
+      const e=byUnit[u.unit_id]&&byUnit[u.unit_id][nextDepth];
+      if(e&&e.status!=='stale')nextDepth++;else break;
+    }
+    return `<tr class="${isCurrent?'wb-current':''}">
+      <td class="wb-unit">U${u.order}${isCurrent?' ▶':''}</td>${cells}
+      <td class="wb-expand"><button class="icon-btn tiny" title="Expandir un nivel (determinístico)" onclick="wbExpand('${ctx.roadmap_id}','${esc(u.unit_id)}',${Math.min(3,nextDepth)},this)">⤵</button></td>
+    </tr>`;
+  }).join('');
+  $('#rmp-depth-grid').innerHTML=`<table class="wb-grid"><thead><tr><th></th>${DEPTH_LABELS.map(l=>`<th>${l}</th>`).join('')}<th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Edit-as-draft: entrada a la estación de montaje desde cualquier roadmap.
+// proposed → reopen in-place; active/superseded/rejected → copia draft v+1
+// (el base queda inmutable, el gate humano sigue intacto).
+async function editAsDraft(ctx){
+  try{
+    if(ctx.status==='proposed'){
+      await wbOp('reopen',{roadmap_id:ctx.roadmap_id});
+      toast('Propuesta reabierta como borrador');
+      loadRoadmapContext(ctx.roadmap_id);
+      return;
+    }
+    const r=await wbOp('create',{goal_id:ctx.goal_id,base_roadmap_id:ctx.roadmap_id,
+      change_reason:'edición manual desde la estación de montaje'});
+    toast(`Borrador v${r.version} creado — editá y congelá para proponer`);
+    loadRoadmapsPanel();
+    selectRoadmap(r.roadmap_id,{focus:false});
+  }catch(e){toast(e.message)}
+}
+
+async function wbExpand(rid,unitId,depth,btn){
+  if(btn){btn.disabled=true;btn.textContent='⏳';}
+  toast(`Generando expansión L${depth}…`);
+  try{
+    const r=await api('/api/tutor/roadmap/expand',{method:'POST',body:JSON.stringify({
+      roadmap_id:rid,unit_id:unitId,depth:Math.max(0,Math.min(3,depth))})});
+    if(!r.ok)throw new Error(r.error||'expansión falló');
+    toast(`Expansión L${depth}: ${r.n_refs} refs de evidencia`);
+    loadRoadmapContext(rid);
+  }catch(e){
+    toast(e.message);
+    if(btn){btn.disabled=false;btn.textContent='⤵';}
+  }
 }
 
 function refreshTutorSurfaces(){

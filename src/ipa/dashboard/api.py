@@ -155,6 +155,21 @@ def _strip_emojis(text: str) -> str:
     return text
 
 
+def _validation_to_json(roadmap) -> dict:
+    """RoadmapValidation del contrato → JSON para la UI del workbench."""
+    validation = getattr(roadmap, "validation", None)
+    if validation is None:
+        return {"run_at": None, "findings": []}
+    return {
+        "run_at": validation.run_at,
+        "findings": [
+            {"code": f.code, "severity": f.severity,
+             "unit_id": f.unit_id, "message": f.message}
+            for f in validation.findings
+        ],
+    }
+
+
 def _strip_filler(text: str) -> str:
     changed = True
     while changed:
@@ -237,7 +252,7 @@ def tutor_roadmaps_payload() -> dict[str, Any]:
             # como actual sin escribir (GET no muta; el driver seedea en el
             # próximo turno de lección).
             if not statuses and rm.status in (RoadmapStatus.ACTIVE, RoadmapStatus.COMPLETED):
-                statuses = {1: "current"}
+                statuses = {rm.units[0].unit_id: "current"} if rm.units else {}
             record = store.get_topic_record(topic_id)
             mastery = None
             if record is not None:
@@ -264,7 +279,7 @@ def tutor_roadmaps_payload() -> dict[str, Any]:
                             at.value if hasattr(at, "value") else str(at)
                             for at in u.assessment_types
                         ],
-                        "status": statuses.get(u.order, "pending"),
+                        "status": statuses.get(u.unit_id, "pending"),
                     }
                     for u in rm.units
                 ],
@@ -396,7 +411,7 @@ def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
         # Roadmaps activados antes de unit_progress: unidad 1 como actual
         # (GET no muta — mismo criterio que tutor_roadmaps_payload).
         if not statuses and rm.status in (RoadmapStatus.ACTIVE, RoadmapStatus.COMPLETED):
-            statuses = {1: "current"}
+            statuses = {rm.units[0].unit_id: "current"} if rm.units else {}
         record = store.get_topic_record(rm.goal_id.removeprefix("goal:"))
         mastery = None
         if record is not None:
@@ -409,6 +424,7 @@ def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
         units = [
             {
                 "order": u.order,
+                "unit_id": u.unit_id,
                 "concept_id": u.concept_id,
                 "reason": u.reason,
                 "minutes": u.estimated_effort_minutes,
@@ -416,15 +432,27 @@ def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
                     at.value if hasattr(at, "value") else str(at)
                     for at in u.assessment_types
                 ],
-                "status": statuses.get(u.order, "pending"),
+                "grounded": bool(u.source_refs),
+                "stage_id": u.stage_id,
+                "status": statuses.get(u.unit_id, "pending"),
                 "concept": _concept(u.concept_id),
             }
             for u in rm.units
         ]
         done = sum(1 for s in statuses.values() if s == "done")
+        order_of = {u.unit_id: u.order for u in rm.units}
         current = next(
-            (o for o, s in sorted(statuses.items()) if s == "current"), None
+            (order_of[uid] for uid, s in statuses.items()
+             if s == "current" and uid in order_of), None
         )
+        position = store.get_position(rm.roadmap_id)
+        # unit_id persistido → unit_order para la UI (la posición es por id,
+        # el orden es presentación).
+        pos_order = order_of.get(position["unit_id"])
+        position = {"unit_id": position["unit_id"],
+                    "unit_order": pos_order or (rm.units[0].order if rm.units else 1),
+                    "depth_level": position["depth_level"]}
+        validation = getattr(rm, "validation", None)
         return {
             "ok": True,
             "roadmap_id": rm.roadmap_id,
@@ -442,6 +470,15 @@ def tutor_roadmap_context(roadmap_id: str) -> dict[str, Any]:
             "progress": {"done": done, "current": current, "total": len(rm.units)},
             "units": units,
             "mastery": mastery,
+            "position": position,
+            "validation": {
+                "run_at": validation.run_at if validation else None,
+                "findings": [
+                    {"code": f.code, "severity": f.severity,
+                     "unit_id": f.unit_id, "message": f.message}
+                    for f in (validation.findings if validation else [])
+                ],
+            } if validation else None,
         }
     finally:
         store.close()
@@ -1283,6 +1320,175 @@ class Handler(BaseHTTPRequestHandler):
                     }, 200)
                 except Exception as exc:
                     self.send_json({"ok": False, "error": str(exc)}, 500)
+            elif parsed.path == "/api/tutor/roadmap/draft":
+                # Estación de montaje: CRUD determinístico de drafts + P2/P3.
+                # op ∈ create|add_unit|remove_unit|reorder|edit_unit|set_stages|
+                #       validate|freeze|reopen|refine
+                try:
+                    from ipa.tutor.tutor_runtime import TutorStore
+                    from ipa.tutor.tutor_workbench import RoadmapWorkbench
+                    from ipa.tutor.tutor_contracts import SourceRef, SourceType
+                    op = str(body.get("op", ""))
+                    store = TutorStore()
+                    wb = RoadmapWorkbench(store, provider=get_deep_dive_provider())
+                    rid = str(body.get("roadmap_id", ""))
+                    if op == "create":
+                        draft = wb.create_draft(
+                            str(body["goal_id"]),
+                            base_roadmap_id=body.get("base_roadmap_id") or None,
+                            change_reason=body.get("change_reason") or None)
+                        res = {"ok": True, "roadmap_id": draft.roadmap_id,
+                               "version": draft.version}
+                    elif op == "add_unit":
+                        refs = [
+                            SourceRef(source_id=str(r["source_id"]),
+                                      source_type=SourceType(str(r.get("source_type", "chunk"))))
+                            for r in (body.get("source_refs") or [])
+                        ]
+                        roadmap = wb.add_unit(
+                            rid, concept_id=str(body["concept_id"]),
+                            reason=str(body["reason"]),
+                            estimated_effort_minutes=int(body.get("minutes", 30)),
+                            stage_id=body.get("stage_id") or None,
+                            source_refs=refs or None,
+                            assessment_types=body.get("assessment_types") or None)
+                        res = {"ok": True, "n_units": len(roadmap.units)}
+                    elif op == "remove_unit":
+                        roadmap = wb.remove_unit(rid, str(body["unit_id"]))
+                        res = {"ok": True, "n_units": len(roadmap.units)}
+                    elif op == "reorder":
+                        wb.reorder_units(rid, [str(u) for u in body["unit_ids"]])
+                        res = {"ok": True}
+                    elif op == "edit_unit":
+                        wb.edit_unit(
+                            rid, str(body["unit_id"]),
+                            reason=body.get("reason"),
+                            estimated_effort_minutes=body.get("minutes"),
+                            concept_id=body.get("concept_id"),
+                            stage_id=body.get("stage_id") or None,
+                            clear_stage=bool(body.get("clear_stage")),
+                            source_refs=[
+                                SourceRef(source_id=str(r["source_id"]),
+                                          source_type=SourceType(str(r.get("source_type", "chunk"))))
+                                for r in (body.get("source_refs") or [])
+                            ] or None)
+                        res = {"ok": True}
+                    elif op == "set_stages":
+                        wb.set_stages(rid, body.get("stages") or [])
+                        res = {"ok": True}
+                    elif op == "validate":
+                        roadmap = wb.run_validation(rid)
+                        res = {"ok": True, "validation": _validation_to_json(roadmap)}
+                    elif op == "freeze":
+                        roadmap = wb.freeze_draft(rid, change_reason=body.get("change_reason"))
+                        res = {"ok": True, "status": roadmap.status.value,
+                               "validation": _validation_to_json(roadmap)}
+                    elif op == "reopen":
+                        roadmap = wb.reopen_draft(rid)
+                        res = {"ok": True, "status": roadmap.status.value}
+                    elif op == "refine":
+                        roadmap, changes = wb.refine_with_findings(rid)
+                        res = {"ok": True, "changes": changes,
+                               "validation": _validation_to_json(roadmap)}
+                    else:
+                        res = {"ok": False, "error": f"op desconocida: {op}"}
+                    # Toda mutación del draft re-corre P2 (no-strict): el
+                    # montaje desencadena validación automáticamente.
+                    if res.get("ok") and op in (
+                            "add_unit", "remove_unit", "reorder",
+                            "edit_unit", "set_stages", "refine"):
+                        roadmap = wb.run_validation(rid)
+                        res["validation"] = _validation_to_json(roadmap)
+                    store.close()
+                    self.send_json(res, 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 400)
+            elif parsed.path == "/api/tutor/roadmap/expand":
+                # B4: genera (determinístico) y persiste la expansión L0-L3
+                # de una unidad. El LLM solo la renderea después.
+                try:
+                    from ipa.tutor.tutor_runtime import TutorStore
+                    from ipa.tutor.tutor_expansion import ExpansionGenerator
+                    from ipa.agent.system_tools import _main_corpus_dir
+                    rid = str(body["roadmap_id"])
+                    unit_id = str(body["unit_id"])
+                    depth = int(body["depth"])
+                    store = TutorStore()
+                    roadmap = store.get_roadmap(rid)
+                    if roadmap is None:
+                        raise ValueError(f"unknown roadmap: {rid}")
+                    unit = next((u for u in roadmap.units if u.unit_id == unit_id), None)
+                    if unit is None:
+                        raise ValueError(f"unknown unit: {unit_id}")
+                    corpus = _main_corpus_dir()
+                    if not corpus:
+                        raise ValueError("corpus main no disponible")
+                    gen = ExpansionGenerator(
+                        corpus, Path(ROOT) / "outputs" / "agent" / "topic_clusters.db")
+                    try:
+                        expansion = gen.generate(rid, unit, depth)
+                    finally:
+                        gen.close()
+                    store.save_expansion(expansion)
+                    store.close()
+                    self.send_json({
+                        "ok": True,
+                        "expansion_id": expansion.expansion_id,
+                        "title": expansion.title,
+                        "summary": expansion.summary,
+                        "n_refs": len(expansion.evidence_refs),
+                        "coverage": expansion.coverage,
+                    }, 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 400)
+            elif parsed.path == "/api/tutor/roadmap/expansions":
+                try:
+                    from ipa.tutor.tutor_runtime import TutorStore
+                    store = TutorStore()
+                    rows = store.list_expansions(
+                        str(body.get("roadmap_id", "")),
+                        unit_id=body.get("unit_id") or None)
+                    store.close()
+                    self.send_json({"ok": True, "expansions": [
+                        {"expansion_id": e.expansion_id, "unit_id": e.unit_id,
+                         "depth_level": int(e.depth_level), "title": e.title,
+                         "summary": (e.summary or "")[:600],
+                         "n_refs": len(e.evidence_refs),
+                         "coverage": e.coverage, "status": e.status}
+                        for e in rows]}, 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+            elif parsed.path == "/api/tutor/docs/search":
+                # Picker del workbench: búsqueda rápida de documentos del
+                # corpus principal por título / dominio / id (SQL, sin
+                # embeddings — es para montar unidades, no retrieval).
+                try:
+                    from ipa.agent.system_tools import _main_corpus_dir
+                    q = str(body.get("q", "")).strip()
+                    corpus = _main_corpus_dir()
+                    if not corpus or not (corpus / "document_store.db").exists():
+                        raise ValueError("corpus main no disponible")
+                    docs = []
+                    if q:
+                        with sqlite3.connect(str(corpus / "document_store.db")) as conn:
+                            like = f"%{q}%"
+                            rows = conn.execute(
+                                "SELECT m.document_id, m.title, s.source_domain, "
+                                "s.source_url, s.quality_score, m.char_count "
+                                "FROM document_metadata m "
+                                "LEFT JOIN document_sources s USING(document_id) "
+                                "WHERE m.title LIKE ? OR s.source_domain LIKE ? "
+                                "OR m.document_id LIKE ? "
+                                "ORDER BY s.quality_score DESC, m.char_count DESC "
+                                "LIMIT 20",
+                                (like, like, like)).fetchall()
+                            docs = [{"document_id": r[0], "title": r[1] or "",
+                                     "source_domain": r[2], "source_url": r[3],
+                                     "quality_score": r[4], "chars": r[5]}
+                                    for r in rows]
+                    self.send_json({"ok": True, "docs": docs}, 200)
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
             elif parsed.path == "/api/process/stop":
                 # Stop all running pipeline processes (scraper, fast path, reporter)
                 # NEVER touches the main corpus
@@ -1547,9 +1753,25 @@ class Handler(BaseHTTPRequestHandler):
                             _streamed["n"] += len(_t)
                             self._sse_write({"type": "token", "text": _t})
 
+                        # Expansión de profundidad (dimensión Y): determinística,
+                        # sobre el corpus main. El driver la invoca al bajar nivel.
+                        def _tutor_expand(roadmap_id, unit, depth):
+                            from ipa.tutor.tutor_expansion import ExpansionGenerator
+                            _corpus = _main_corpus_dir()
+                            if not _corpus:
+                                raise ValueError("corpus main no disponible")
+                            gen = ExpansionGenerator(
+                                _corpus,
+                                Path(ROOT) / "outputs" / "agent" / "topic_clusters.db")
+                            try:
+                                return gen.generate(roadmap_id, unit, depth)
+                            finally:
+                                gen.close()
+
                         result = get_tutor_driver().handle(
                             core, core.session_id, message, provider,
                             retrieve=_tutor_retrieve, on_token=_on_token,
+                            expand=_tutor_expand,
                         )
                         reply = result.get("reply", "")
                         reply = _strip_filler(_strip_emojis(_clean_model_output(reply)))
@@ -1589,6 +1811,22 @@ class Handler(BaseHTTPRequestHandler):
                 # [system estable + historia append-only] se reutilice entre
                 # turnos en el KV del runner de Ollama (longest-prefix reuse).
                 _volatile_ctx: list[str] = []
+                # C1 — acceso implícito al roadmap: si hay roadmap enfocado,
+                # una línea compacta determinística entra al prompt SIEMPRE
+                # (el agente sabe que existe sin que el usuario lo mencione).
+                try:
+                    from ipa.tutor.tutor_chat import roadmap_state_snapshot, roadmap_state_text
+                    from ipa.tutor.tutor_runtime import TutorStore as _TStore
+                    _tstore = _TStore()
+                    try:
+                        _snap = roadmap_state_snapshot(_tstore)
+                        if _snap:
+                            _volatile_ctx.append(
+                                "\n\n" + roadmap_state_text(_snap))
+                    finally:
+                        _tstore.close()
+                except Exception:
+                    pass
                 # Progressive tool unlocking: el agente empieza con 7 tools
                 # base y desbloquea más a medida que las usa. Esto reduce la
                 # carga cognitiva del 9B (7 tools vs 17 en el catálogo).
@@ -1752,6 +1990,39 @@ class Handler(BaseHTTPRequestHandler):
                                 "\n\nEl corpus del reporte no devolvió evidencia para "
                                 "esta consulta. Decilo y ofrecé ampliar la búsqueda."
                             )
+                elif _msg_kind == "roadmap":
+                    # C2 — estado del roadmap resuelto server-side (SELECT
+                    # determinístico sobre TutorStore): posición, profundidad,
+                    # próxima unidad. El 9B no elige tools ni decide estado.
+                    self._sse_write({"type": "retrieval", "stage": "start", "query": message})
+                    try:
+                        from ipa.tutor.tutor_chat import roadmap_state_snapshot
+                        from ipa.tutor.tutor_runtime import TutorStore as _TStore
+                        _tstore = _TStore()
+                        try:
+                            _snap = roadmap_state_snapshot(_tstore)
+                        finally:
+                            _tstore.close()
+                        if _snap:
+                            from ipa.tutor.tutor_chat import roadmap_state_text
+                            _volatile_ctx.append(
+                                "\n\nESTADO REAL DEL ROADMAP (determinístico, de la DB):\n"
+                                + json.dumps(_snap, ensure_ascii=False)
+                                + "\n\n" + roadmap_state_text(_snap)
+                                + "\nRespondé la pregunta del usuario con ESTE estado. "
+                                "Si pregunta '¿dónde quedé?', resumí posición y próxima unidad.")
+                            self._sse_write({
+                                "type": "retrieval", "stage": "found", "count": 1,
+                                "sources": [{"n": 1, "document_id": _snap["roadmap_id"],
+                                             "source_domain": "tutor/roadmap"}],
+                            })
+                        else:
+                            _volatile_ctx.append(
+                                "\n\nEl usuario pregunta por su roadmap pero no hay ninguno "
+                                "enfocado. Decilo y ofrecé crear uno (pedile un tema de aprendizaje).")
+                            self._sse_write({"type": "retrieval", "stage": "empty", "query": message})
+                    except Exception as exc:
+                        self._sse_write({"type": "retrieval", "stage": "error", "error": str(exc)[:100]})
                 elif _msg_kind == "memory":
                     # Memoria agéntica: la pregunta es sobre el usuario o
                     # sesiones pasadas → recall_memory resuelve sobre el

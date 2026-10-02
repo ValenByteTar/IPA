@@ -101,6 +101,7 @@
                 <div class="rmp-head-side">
                   <span id="rmp-focus-tag" class="rmp-focus-tag" style="display:none">📍 chat enfocado</span>
                   <select id="rmp-status-select" class="rm-status" title="Estado del roadmap (gate humano)"></select>
+                  <button class="icon-btn tiny" id="rmp-edit-btn" title="Editar como borrador en la estación de montaje">✏️</button>
                   <button class="icon-btn tiny" id="rmp-archive-btn" title="Archivar roadmap">📦</button>
                 </div>
               </header>
@@ -127,6 +128,32 @@
                 <div class="rmp-progress-bar"><div id="rmp-progress-fill"></div></div>
                 <ol id="rmp-units" class="rmp-units"></ol>
                 <div id="rmp-mastery" class="rm-mastery"></div>
+              </article>
+              <article class="card rmp-section" id="rmp-workbench-card" style="display:none">
+                <div class="card-head">
+                  <div><span class="eyebrow">ESTACIÓN DE MONTAJE</span><h3>Borrador editable</h3></div>
+                  <div class="rmp-wb-actions">
+                    <button class="icon-btn tiny" id="rmp-wb-refine" title="Refinamiento 3-capas (P1→P2→P3)">✨ Refinar</button>
+                    <button class="icon-btn tiny" id="rmp-wb-validate" title="Validación determinística (P2)">🔍 Validar</button>
+                    <button class="icon-btn tiny" id="rmp-wb-freeze" title="Congelar draft → propuesta (gate humano)">🧊 Congelar</button>
+                  </div>
+                </div>
+                <div id="rmp-wb-findings" class="rmp-wb-findings"></div>
+                <p class="muted" style="font-size:12px;margin:4px 0">Editá las unidades directamente en AVANCE (↑↓✎✕). Agregá material del corpus buscando por título o dominio:</p>
+                <div class="rmp-wb-add">
+                  <div class="wb-picker">
+                    <input id="rmp-wb-doc-search" placeholder="Buscar documento del corpus…" style="width:230px" autocomplete="off">
+                    <div id="rmp-wb-doc-results" class="wb-doc-results" style="display:none"></div>
+                  </div>
+                  <input id="rmp-wb-new-reason" placeholder="Por qué esta unidad" style="flex:1">
+                  <input id="rmp-wb-new-minutes" type="number" value="30" min="5" max="1440" style="width:70px" title="minutos">
+                  <button class="icon-btn tiny" id="rmp-wb-add-btn" title="Agregar unidad">＋</button>
+                </div>
+              </article>
+              <article class="card rmp-section" id="rmp-depth-card" style="display:none">
+                <div class="card-head"><div><span class="eyebrow">PROFUNDIDAD</span><h3>Dimensión Y — evidencia por nivel</h3></div>
+                  <span id="rmp-position-label" class="muted"></span></div>
+                <div id="rmp-depth-grid" class="rmp-depth-grid"></div>
               </article>
               <details class="card rmp-section rmp-concepts-card">
                 <summary><span class="eyebrow">CONCEPTOS</span><span class="rmp-concepts-summary">Material fuente de las unidades</span></summary>
@@ -191,7 +218,7 @@
 
   <dialog id="viewer"><div class="viewer-head"><strong id="viewer-title"></strong><button onclick="viewer.close()">Cerrar</button></div><div id="viewer-body" class="viewer-body"></div></dialog>
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=11"></script>
+  <script src="/static/app.js?v=15"></script>
   <script>
     setInterval(() => { if (currentProcess && document.getElementById('process-detail')?.dataset.visible === 'true') loadProcessDetail(currentProcess); }, 2000);
   </script>

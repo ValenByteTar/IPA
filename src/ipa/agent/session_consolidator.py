@@ -131,9 +131,10 @@ class SessionConsolidator:
                 if rm is None:
                     return ""
                 statuses = store.unit_statuses(rid)
-                current = next(
-                    (o for o in sorted(statuses) if statuses.get(o) == "current"),
-                    None)
+                order_of = {u.unit_id: u.order for u in rm.units}
+                cur_uid = next(
+                    (u for u in statuses if statuses[u] == "current"), None)
+                current = order_of.get(cur_uid)
                 topic = rm.goal_id.removeprefix("goal:").replace("-", " ")
                 return (f"[roadmap:{rid} · tema: {topic} · "
                         f"unidad {current or 1}/{len(rm.units)} · {rm.status.value}]")

@@ -3,11 +3,11 @@ id: PAT-009
 category: pattern
 status: accepted
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-10-02
 author: agent
 components: [eks, operations, agentic_runtime]
 tags: [work-permit, ptw, lease, parallel-sessions, coordination]
-related: [PAT-007, DEC-010, RES-003]
+related: [PAT-007, DEC-010, RES-003, PM-008, PM-009, PM-010]
 supersedes: null
 superseded_by: null
 affects: [outputs/devin/permits/**, tools/work_permits.py, scripts/cli/permit.py, .devin/hooks.v1.json, scripts/hooks/permit_guard.py]
@@ -100,3 +100,27 @@ Enmienda los bullets de *Solución* que describen el enforcement y el cierre:
 - Cobertura: `tests/test_permit_guard.py` (15 tests) cubre bloqueo,
   inyección una-vez-por-sesión, marcador unharvested, Stop-once y poda;
   `tests/test_eks.py` agrega concurrencia de `acquire` (8 sesiones → 1 gana).
+
+## Addendum 2026-10-02 — lease vivo y flexibilización (port desde RIAPP)
+
+El port a RIAPP (5 agentes en paralelo) estresó el patrón y volvió con
+tres correcciones que ya están aplicadas acá (PM-008, PM-009, PM-010):
+
+- **Lease vivo**: el permit guarda el `pid` del holder; `pid_alive` lo
+  sondea. Holder vivo → el lease sigue aunque supere el TTL (un batch
+  nocturno ya no caduca en vuelo); holder muerto → el permit expira aunque
+  el heartbeat sea fresco (reaper de permits fantasma). Permits sin `pid`
+  (pre-port): TTL puro, backward compat.
+- **Heartbeat automático**: el hook renueva el lease de los permits de la
+  sesión en cada tool call — el heartbeat manual queda como respaldo.
+- **Zonas blandas**: `docs/` y `knowledge/` bajo `exclusive` ajeno avisan
+  pero no bloquean — el STOP vive solo donde el riesgo real es código.
+  Esto activa los modos `advisory`/`survey` que estaban muertos por desuso.
+- **session_id inyectado**: `SessionStart` y `PostCompaction` anuncian el
+  session_id del hook — es el valor correcto de `--session` (etiquetas de
+  rol auto-bloqueaban al holder).
+- **Literales exactos**: `scopes_overlap` matchea literales por igualdad/
+  contención real, no por prefijo — un archivo de raíz ya no solapa con
+  todo el repo.
+- **Granularidad**: scopes a nivel de archivo recomendados; el mensaje de
+  bloqueo lo sugiere y `permit list` anota `alive` por permit.

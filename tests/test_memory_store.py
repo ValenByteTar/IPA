@@ -181,7 +181,35 @@ def test_get_by_ids_preserves_rank_order(store):
 def test_indexer_syncs_unit_summaries(tmp_path):
     memory_store = MemoryStore(tmp_path / "memory.db")
     tutor = TutorStore(tmp_path / "tutor.db")
-    tutor.save_unit_summary("roadmap:abc", 2, "Explicamos tokens y predicción one-at-a-time")
+    now = datetime.now(timezone.utc).isoformat()
+    from ipa.tutor.tutor_contracts import (
+        AssessmentType, HumanApproval, HumanApprovalDecision, Roadmap,
+        RoadmapStatus, RoadmapUnit, SourceRef, SourceType,
+    )
+    gen = GenerationProvenance(
+        generator="test", generated_at=now,
+        input_hash="sha256:" + "0" * 64, model_fingerprint="test")
+    units = [
+        RoadmapUnit(
+            unit_id=f"roadmap_unit:u{i}", order=i, concept_id=f"doc:c{i}",
+            reason=f"razón {i}", estimated_effort_minutes=30,
+            source_refs=[SourceRef(source_id=f"doc:c{i}", source_type=SourceType.CHUNK)],
+            assessment_types=[AssessmentType.EXPLANATION],
+        )
+        for i in (1, 2, 3)
+    ]
+    tutor.save_roadmap(Roadmap(
+        roadmap_id="roadmap:abc", goal_id="goal:abc", version=1,
+        status=RoadmapStatus.ACTIVE, units=units, assumptions=[], uncertainties=[],
+        change_reason=None, previous_roadmap_id=None, created_at=now,
+        approval=HumanApproval(decision=HumanApprovalDecision.APPROVED,
+                               decided_at=now, decided_by="test"),
+        generation=gen,
+        field_origins={"goal_id": "user", "units": "generated",
+                       "assumptions": "generated", "uncertainties": "generated",
+                       "change_reason": "user_or_generated"},
+    ))
+    tutor.save_unit_summary("roadmap:abc", "roadmap_unit:u2", "Explicamos tokens y predicción one-at-a-time")
     indexer = MemoryIndexer(memory_store)
     n = indexer._sync_tutor(tutor)
     items = [i for i in memory_store.recall("tokens predicción") if i.kind == "lesson_unit"]
@@ -189,7 +217,7 @@ def test_indexer_syncs_unit_summaries(tmp_path):
     assert len(items) == 1
     assert "unidad 2" in items[0].text
     assert items[0].scope == "episodic"
-    assert items[0].source_ref == "roadmap:abc:2"
+    assert items[0].source_ref == "roadmap:abc:roadmap_unit:u2"
     # Idempotente
     n2 = indexer._sync_tutor(tutor)
     assert memory_store.count("episodic") == memory_store.count("episodic")
