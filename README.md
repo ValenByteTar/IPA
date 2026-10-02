@@ -22,10 +22,11 @@ sources
 
 ## Current status
 
-**v0.2.1.** IPA is a functional local-first personal
+**v0.2.3.** IPA is a functional local-first personal
 agent platform: contract-first Hybrid RAG, a shared agent core (CLI + dashboard),
-a Tutor role with human approval gates, bounded web research, an idle cognitive
-layer, and an idle scheduler with an explicit resource model. It is intentionally
+a Tutor role with human approval gates and a deterministic roadmap workbench,
+bounded web research, an idle cognitive layer, own push notifications to mobile,
+and an idle scheduler with an explicit resource model. It is intentionally
 bounded: single user, single machine, bounded tools per turn. See `CHANGELOG.md`
 for what ships in this version.
 
